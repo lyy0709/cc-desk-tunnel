@@ -64,7 +64,7 @@ test('repository-wide discovery handles renames, deletions and literal special p
   rmSync(join(root, 'delete.txt'));
   write(name, 'after\n');
   const staged = await gitChanges(join(root, 'sub'), 'staged');
-  assert.equal(staged.root, root);
+  assert.equal(realpathSync.native(staged.root), realpathSync.native(root));
   assert.equal(staged.files[0].status, 'R');
   assert.equal(staged.files[0].previousPath, 'old.txt');
   assert.match((await gitDiff(root, 'staged', 'renamed.txt')).patch, /rename from old.txt/);

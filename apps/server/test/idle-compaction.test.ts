@@ -202,7 +202,7 @@ test('a deferred compaction is dropped at the cache margin, for an unknown reset
 
 test('restart restores quota scheduling even after a context-only reading', (t) => {
   t.mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
-  const path = directory(t);
+  const path = mkdtempSync(join(tmpdir(), 'idle-compaction-'));
   let store = new SessionStore(path);
   const session = store.create(randomUUID(), '限额会话', '/tmp/project', {
     id: randomUUID(),
@@ -237,6 +237,7 @@ test('restart restores quota scheduling even after a context-only reading', (t) 
   t.after(() => {
     compactions.clear();
     store.close();
+    rmSync(path, { recursive: true, force: true });
   });
   compactions.update({ enabled: true });
   const turn = store.lastCachedTurn(session.id)!;
