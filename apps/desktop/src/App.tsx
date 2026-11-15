@@ -83,6 +83,7 @@ import TitleBar from './TitleBar.tsx';
 import type { BarMenu } from './TitleBar.tsx';
 import IdleReminder from './IdleReminder.tsx';
 import { CcdtDialog } from './CcdtDialog.tsx';
+import { SetupTokenDialog } from './SetupTokenDialog.tsx';
 import { IconButton, Menu } from './ui.tsx';
 import type { MenuItem, MenuPosition } from './ui.tsx';
 
@@ -2107,6 +2108,12 @@ export function App({
         />
       )}
       {notesDialog}
+      {state.setupToken && (
+        <SetupTokenDialog
+          result={state.setupToken}
+          close={() => client.update({ setupToken: null })}
+        />
+      )}
     </div>
   );
 }
