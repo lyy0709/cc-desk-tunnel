@@ -8,6 +8,7 @@ export type GitFile = {
   path: string;
   absolutePath: string;
   previousPath?: string;
+  workingTreeChanged?: boolean;
   status: string;
   kind: 'file' | 'binary' | 'symlink' | 'submodule' | 'conflict';
   added: number | null;
@@ -16,6 +17,7 @@ export type GitFile = {
 export type GitChanges = {
   root: string;
   branch: string | null;
+  rawContent?: boolean;
   counts: Record<GitScope, number>;
   files: GitFile[];
 };
@@ -41,7 +43,15 @@ const unavailable: Record<Exclude<GitDiff['kind'], 'text'>, string> = {
   too_large: '改动超过 1 MiB 或 10,000 行，请在本机编辑器中查看。',
 };
 
-function DiffContent({ diff, open }: { diff: GitDiff; open: (line?: number) => void }) {
+function DiffContent({
+  diff,
+  open,
+  locateLines,
+}: {
+  diff: GitDiff;
+  open: (line?: number) => void;
+  locateLines: boolean;
+}) {
   if (diff.kind !== 'text') return <p className="changes-note">{unavailable[diff.kind]}</p>;
   if (!diff.patch) return <p className="changes-note">没有文本差异。</p>;
   let oldLine = 0;
@@ -79,9 +89,11 @@ function DiffContent({ diff, open }: { diff: GitDiff; open: (line?: number) => v
             type="button"
             className="diff-number"
             disabled={kind === 'meta'}
-            aria-label={after ? `在编辑器中打开第 ${after} 行` : '在编辑器中打开文件'}
-            title={after ? `在编辑器中打开第 ${after} 行` : '在编辑器中打开文件'}
-            onClick={() => open(after)}
+            aria-label={
+              after && locateLines ? `在编辑器中打开第 ${after} 行` : '在编辑器中打开文件'
+            }
+            title={after && locateLines ? `在编辑器中打开第 ${after} 行` : '在编辑器中打开文件'}
+            onClick={() => open(locateLines ? after : undefined)}
           >
             {after ?? (before ? '−' : '')}
           </button>
@@ -224,6 +236,9 @@ function FileChange({
         <div aria-busy={loading}>
           {file.previousPath && <p className="changes-note">原路径：{file.previousPath}</p>}
           {file.kind === 'symlink' && <p className="changes-note">符号链接 · 仅展示链接本身</p>}
+          {file.workingTreeChanged && (
+            <p className="changes-note">存在未暂存修改，点击行号仅打开文件。</p>
+          )}
           {file.status === 'D' && <p className="changes-note">文件已删除，无法在编辑器中打开。</p>}
           {loading && !diff && (
             <p className="changes-note" role="status">
@@ -233,11 +248,13 @@ function FileChange({
           {failure && (
             <p className="changes-note error-text" role="alert">
               {failure}
+              {diff && ' 当前显示上次读取的内容。'}
             </p>
           )}
           {diff && (
             <DiffContent
               diff={diff}
+              locateLines={!file.workingTreeChanged}
               open={(line) => {
                 if (file.status !== 'D') void open(line);
               }}
@@ -354,6 +371,9 @@ function ChangesView({
         role="tabpanel"
         aria-label={scope === 'unstaged' ? '未暂存改动' : '已暂存改动'}
       >
+        {data?.rawContent && (
+          <p className="changes-note">按原始内容比较，未运行 Git 内容过滤器。</p>
+        )}
         {failure && (
           <p className="changes-note error-text" role="alert">
             {failure}
@@ -388,7 +408,6 @@ function ChangesView({
           />
         ))}
       </div>
-      <p className="changes-footnote">当前仓库的未提交改动，包含你和 Claude 的修改。</p>
     </>
   );
 }

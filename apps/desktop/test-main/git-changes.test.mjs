@@ -43,6 +43,7 @@ test('staged and unstaged changes use different bases, including a first commit'
   const staged = await gitChanges(root, 'staged');
   assert.deepEqual(staged.counts, { staged: 1, unstaged: 2 });
   assert.equal(staged.files[0].status, 'A');
+  assert.equal(staged.files[0].workingTreeChanged, true);
   assert.match((await gitDiff(root, 'staged', 'code.txt')).patch, /\+first/);
   assert.match((await gitDiff(root, 'unstaged', 'code.txt')).patch, /-first\n\+second/);
   assert.match((await gitDiff(root, 'unstaged', 'new.txt')).patch, /\+new/);
@@ -141,6 +142,31 @@ test('missing directories and non-repositories are distinct errors', async (t) =
   t.after(() => rmSync(root, { recursive: true, force: true }));
   await assert.rejects(gitChanges(join(root, 'missing'), 'unstaged'), /目录已不存在/);
   await assert.rejects(gitChanges(root, 'unstaged'), /不在 Git 仓库/);
+});
+
+test('status and diff never execute clean/process filters and disclose raw-content comparison', async (t) => {
+  const { root, git, write, commit } = repository(t);
+  write('file.txt', 'before\n');
+  commit();
+  const marker = join(root, 'filter-called');
+  const helper = join(root, 'filter.cjs');
+  writeFileSync(
+    helper,
+    `const fs=require('node:fs');fs.writeFileSync(${JSON.stringify(marker)},'called');process.stdin.pipe(process.stdout);`,
+  );
+  // A subsection may contain '='; the override must preserve the entire key.
+  const command = `"${process.execPath}" "${helper}"`;
+  git('config', 'filter.probe=local.clean', command);
+  git('config', 'filter.probe=local.required', 'true');
+  write('.gitattributes', '*.txt filter=probe=local\n');
+  write('file.txt', 'after\n');
+  assert.equal((await gitChanges(root, 'unstaged')).rawContent, true);
+  assert.match((await gitDiff(root, 'unstaged', 'file.txt')).patch, /\+after/);
+  assert.equal(existsSync(marker), false);
+  git('config', 'filter.probe=local.process', command);
+  assert.equal((await gitChanges(root, 'unstaged')).rawContent, true);
+  assert.match((await gitDiff(root, 'unstaged', 'file.txt')).patch, /\+after/);
+  assert.equal(existsSync(marker), false);
 });
 
 test('a missing Git installation is reported without attempting to install anything', async (t) => {

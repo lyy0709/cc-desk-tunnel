@@ -8,7 +8,14 @@ const previewBytes = 1024 * 1024;
 const previewLines = 10000;
 
 // Viewing a repository never runs its external diff, text conversions or filesystem monitor.
-function git(directory, args, maxBuffer = 8 * previewBytes) {
+function git(directory, args, maxBuffer = 8 * previewBytes, config = []) {
+  const env = { ...process.env, LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0' };
+  const count = Number(env.GIT_CONFIG_COUNT ?? 0);
+  config.forEach(([key, value], index) => {
+    env[`GIT_CONFIG_KEY_${count + index}`] = key;
+    env[`GIT_CONFIG_VALUE_${count + index}`] = value;
+  });
+  env.GIT_CONFIG_COUNT = String(count + config.length);
   return new Promise((resolve, reject) => {
     execFile(
       'git',
@@ -25,7 +32,7 @@ function git(directory, args, maxBuffer = 8 * previewBytes) {
         windowsHide: true,
         timeout: 15000,
         maxBuffer,
-        env: { ...process.env, LC_ALL: 'C', GIT_TERMINAL_PROMPT: '0' },
+        env,
       },
       (error, stdout, stderr) => {
         if (!error) return resolve(stdout);
@@ -37,6 +44,36 @@ function git(directory, args, maxBuffer = 8 * previewBytes) {
       },
     );
   });
+}
+
+// Git can execute clean/process filters even for status and diff. Disable those subprocesses only
+// for this read; tell the reader that filtered files are compared as raw worktree contents.
+async function filterOverrides(root) {
+  let output;
+  try {
+    output = await git(root, [
+      'config',
+      '--null',
+      '--get-regexp',
+      '^filter\\..*\\.(clean|process)$',
+    ]);
+  } catch (error) {
+    if (error.code === 1) return []; // No matching configuration.
+    throw error;
+  }
+  const names = new Set(
+    output.split('\0').flatMap((entry) => {
+      const at = entry.indexOf('\n');
+      return at >= 0 && entry.slice(at + 1).trim()
+        ? [entry.slice(0, at).replace(/\.(clean|process)$/, '')]
+        : [];
+    }),
+  );
+  return [...names].flatMap((name) => [
+    [`${name}.clean`, ''],
+    [`${name}.process`, ''],
+    [`${name}.required`, 'false'],
+  ]);
 }
 
 function checkScope(scope) {
@@ -130,15 +167,15 @@ function statistics(output) {
 async function gitChanges(directory, scope) {
   checkScope(scope);
   const root = await repository(directory);
+  const filters = await filterOverrides(root);
   const [status, numbers, branch] = await Promise.all([
-    git(root, [
-      'status',
-      '--porcelain=v2',
-      '-z',
-      '--untracked-files=all',
-      '--ignore-submodules=none',
-    ]),
-    git(root, [...diffArgs(scope), '--numstat', '-z']),
+    git(
+      root,
+      ['status', '--porcelain=v2', '-z', '--untracked-files=all', '--ignore-submodules=none'],
+      undefined,
+      filters,
+    ),
+    git(root, [...diffArgs(scope), '--numstat', '-z'], undefined, filters),
     gitBranch(root),
   ]);
   const all = entries(status, root);
@@ -146,6 +183,7 @@ async function gitChanges(directory, scope) {
   return {
     root,
     branch,
+    ...(filters.length ? { rawContent: true } : {}),
     counts: {
       unstaged: all.filter((file) => file.unstaged).length,
       staged: all.filter((file) => file.staged).length,
@@ -168,6 +206,7 @@ async function gitChanges(directory, scope) {
           return {
             ...file,
             status,
+            ...(scope === 'staged' && unstaged ? { workingTreeChanged: true } : {}),
             added: number?.added ?? null,
             removed: number?.removed ?? null,
             kind: file.kind === 'file' && number?.added === null ? 'binary' : file.kind,
@@ -215,6 +254,7 @@ async function gitDiff(directory, scope, name) {
           ),
         ],
         previewBytes,
+        await filterOverrides(changes.root),
       );
     } catch (error) {
       if (error.code === 'ERR_CHILD_PROCESS_STDIO_MAXBUFFER')

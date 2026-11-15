@@ -98,7 +98,7 @@ async function open(
             counts: { unstaged: 3, staged: 1 },
             files:
               scope === 'staged'
-                ? [file(directory, 'staged.ts', 'A')]
+                ? [{ ...file(directory, 'staged.ts', 'A'), workingTreeChanged: true }]
                 : [
                     file(directory, 'src/中文 文件.ts'),
                     file(directory, 'removed.ts', 'D'),
@@ -311,6 +311,15 @@ test('local changes are readable, stay local, preserve conversation scroll, and 
   await page.screenshot({ path: resolve(screenshots, 'changes-dark.png') });
   await panel.getByRole('tab', { name: '已暂存1' }).click();
   await expect(panel).toContainText('staged.ts');
+  await expect(panel).toContainText('存在未暂存修改，点击行号仅打开文件');
+  await panel.locator('.diff-line.added button').first().click();
+  await expect
+    .poll(() =>
+      page.evaluate(() =>
+        (window as any).localCalls.filter((call: any[]) => call[0] === 'open').at(-1),
+      ),
+    )
+    .toEqual(['open', 'editor', '/fixtures/项目/staged.ts', { editor: 'vscode' }]);
   await page.keyboard.press('Escape');
   await expect(panel).toHaveCount(0);
   await expect(page.locator('.changes-trigger')).toBeFocused();
