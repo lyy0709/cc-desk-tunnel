@@ -38,6 +38,15 @@ declare global {
       saveImage: (type: string, bytes: Uint8Array) => Promise<string>;
       // The branch a project's working tree is on, or null outside a repository.
       gitBranch: (path: string) => Promise<string | null>;
+      gitChanges: (
+        directory: string,
+        scope: import('./ChangesPanel.tsx').GitScope,
+      ) => Promise<import('./ChangesPanel.tsx').GitChanges>;
+      gitDiff: (
+        directory: string,
+        scope: import('./ChangesPanel.tsx').GitScope,
+        file: string,
+      ) => Promise<import('./ChangesPanel.tsx').GitDiff>;
       copyText: (text: string) => Promise<void>;
       openExternal: (url: string) => Promise<void>;
       openWeb: (url: string) => Promise<void>;

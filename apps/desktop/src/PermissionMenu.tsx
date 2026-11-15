@@ -37,17 +37,22 @@ const bypass: Mode = {
   icon: ShieldOff,
 };
 
+export const permissionLabel = (value?: string) =>
+  [...modes, bypass].find((mode) => mode.value === value)?.name ?? value ?? '未知';
+
 export default function PermissionMenu({
   mode,
   disabled,
   change,
   executionOnly = false,
+  display,
 }: {
   mode: PermissionMode;
   disabled: boolean;
   change: (mode: PermissionMode) => void;
   // Approving a plan offers only modes that can execute, without enabling bypass at startup.
   executionOnly?: boolean;
+  display?: { label: string; detail: string };
 }) {
   const [open, setOpen] = useState(false);
   const [confirming, setConfirming] = useState(false);
@@ -75,6 +80,7 @@ export default function PermissionMenu({
     };
   }, [open]);
   const current = offered.find((item) => item.value === mode)!;
+  const visual = offered.find((item) => item.name === display?.label) ?? current;
   return (
     <div
       className="permission-control"
@@ -89,16 +95,16 @@ export default function PermissionMenu({
     >
       <button
         type="button"
-        className={mode === bypass.value ? 'chip danger' : 'chip'}
+        className={visual.value === bypass.value ? 'chip danger' : 'chip'}
         aria-label={label}
-        title={current.name}
+        title={display?.detail ?? current.name}
         aria-haspopup="menu"
         aria-expanded={open}
         disabled={disabled}
         onClick={() => setOpen((value) => !value)}
       >
-        <current.icon />
-        <span>{current.name}</span>
+        <visual.icon />
+        <span>{display?.label ?? current.name}</span>
         <ChevronDown />
       </button>
       {open && confirming && (

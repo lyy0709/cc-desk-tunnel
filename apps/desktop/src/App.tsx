@@ -12,6 +12,7 @@ import {
   CircleHelp,
   Download,
   FileDown,
+  Files,
   FolderInput,
   FolderOpen,
   FolderSymlink,
@@ -46,6 +47,9 @@ import { hostCapabilities } from './host-capabilities.ts';
 import AccountPanel from './AccountPanel.tsx';
 import { ProxyClient, RequestInterruptedError } from './client.ts';
 import Composer from './Composer.tsx';
+import ChangesPanel from './ChangesPanel.tsx';
+import { localCommand } from './commands.ts';
+import { sessionRuntime } from './RunStatus.tsx';
 import SessionBar from './SessionBar.tsx';
 import { isHere, thisDevice } from './device.ts';
 import { isMac, selfUpdating } from './platform.ts';
@@ -164,6 +168,15 @@ export function App({
   const [busy, setBusy] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [findRequest, setFindRequest] = useState(0);
+  const [statusRequest, setStatusRequest] = useState(0);
+  const [changesProject, setChangesProject] = useState<string | null>(null);
+  const workspace = useRef<HTMLElement>(null);
+  const closeChanges = useCallback(() => {
+    setChangesProject(null);
+    requestAnimationFrame(() =>
+      document.querySelector<HTMLButtonElement>('.changes-trigger')?.focus(),
+    );
+  }, []);
   // Which of this computer's settings is open on the login page.
   const [localSettings, setLocalSettings] = useState<Section | null>(null);
   useEffect(() => {
@@ -243,6 +256,33 @@ export function App({
     };
   }, [unplaced]);
   const onThis = (session: Session) => !browser && isHere(session, state.device, absent);
+  const localProject = window.desktop && selected && onThis(selected) ? selected.projectPath : null;
+  const [existingProject, setExistingProject] = useState<string | null>(null);
+  useEffect(() => {
+    setChangesProject(null);
+    setExistingProject(null);
+    if (!localProject) return;
+    let current = true;
+    const check = () =>
+      void window.desktop!.foldersExist([localProject]).then(
+        ([exists]) => {
+          if (current) setExistingProject(exists ? localProject : null);
+        },
+        () => {
+          if (current) setExistingProject(null);
+        },
+      );
+    check();
+    window.addEventListener('focus', check);
+    return () => {
+      current = false;
+      window.removeEventListener('focus', check);
+    };
+  }, [localProject]);
+  const canReadProject = !!localProject && existingProject === localProject;
+  const showChanges = () => {
+    if (canReadProject) setChangesProject(localProject);
+  };
   const sessions = state.sessions.filter((session) => onThis(session));
   const elsewhere = state.sessions.filter((session) => !onThis(session));
   const away = !!selected && !onThis(selected);
@@ -286,7 +326,10 @@ export function App({
     [selected?.id, recorded, unfinished],
   );
   const history = selected ? state.history[selected.id] : undefined;
-  const nativeSession = latest(events, 'native.session');
+  const runtime = sessionRuntime(selected, events, connected, nativeMode);
+  const nativeSession = selected?.activeRun
+    ? runtime.nativeSession
+    : latest(events, 'native.session');
   // Each turn's report is a reason to ask for the session's figures again.
   const turnReports = useMemo(
     () => events.filter((event) => event.payload.type === 'turn.stats').length,
@@ -322,6 +365,48 @@ export function App({
     selected?.activeRun?.surface === 'terminal' ||
     (!!selected?.activeRun && (!nativeMode || !ownsRun)) ||
     refreshing;
+  const controlReason = !connected
+    ? '等待服务连接恢复'
+    : busy
+      ? '正在提交请求'
+      : refreshing
+        ? '正在刷新原生状态'
+        : history?.loading
+          ? '正在加载会话'
+          : selected?.activeRun?.surface === 'terminal'
+            ? '请先退出当前会话的终端'
+            : selected?.activeRun
+              ? '请先结束当前运行'
+              : '';
+  const localActions = [
+    {
+      name: 'plan',
+      title: '进入计划模式',
+      detail:
+        selected?.permissionMode === 'plan'
+          ? '已选择计划模式，重复输入不会退出'
+          : '只调研和制定计划',
+      reason: controlReason,
+    },
+    ...(window.desktop && !browser
+      ? [
+          {
+            name: 'changes',
+            title: '查看改动',
+            detail: '本机仓库的未提交改动',
+            reason: canReadProject ? '' : '仅可查看本机已存在的项目',
+          },
+        ]
+      : []),
+    { name: 'status', title: '查看会话状态', detail: '连接、执行设备与原生模式', reason: '' },
+    {
+      name: 'compact',
+      title: '压缩上下文',
+      detail: metrics?.context ? `已使用 ${metrics.context.percentage}%` : '/compact',
+      reason: controlReason || (!canCompact ? '当前没有可压缩的原生上下文' : ''),
+    },
+    { name: 'refresh', title: '刷新原生状态', detail: '上下文与订阅额度', reason: controlReason },
+  ];
   const draft = selected ? (drafts[selected.id] ?? '') : '';
   // The last turn of the session did not reach its end: it can be taken up again from the message box.
   const lastStatus = selected
@@ -880,11 +965,52 @@ export function App({
     });
   }
   async function send(text = draft) {
-    if (!selected || !text.trim() || inputDisabled) return;
+    if (!selected || !text.trim()) return;
+    const command = nativeMode ? localCommand(text) : null;
+    if (command) {
+      const action = localActions.find((item) => item.name === command.name);
+      if (!action || action.reason) {
+        setError(action?.reason || '当前环境不支持这个操作。');
+        return;
+      }
+      if (command.name !== 'plan' && command.body) {
+        setError(`/${command.name} 不接受参数，请单独输入这个命令。`);
+        return;
+      }
+      if (command.name === 'changes' || command.name === 'status') {
+        setSlashOpen(false);
+        setDraft(selected.id, '');
+        if (command.name === 'changes') showChanges();
+        else setStatusRequest((value) => value + 1);
+        return;
+      }
+      if (command.name === 'compact') {
+        await compact();
+        return;
+      }
+      if (command.name === 'refresh') {
+        setSlashOpen(false);
+        setDraft(selected.id, '');
+        await refreshStatus();
+        return;
+      }
+    }
+    if (inputDisabled) return;
     const sessionId = selected.id;
     setSlashOpen(false);
     await act(async () => {
-      await client.request({ type: 'message.send', sessionId, text, scenario });
+      if (command?.name === 'plan') {
+        if (selected.permissionMode !== 'plan')
+          await client.request({ type: 'session.configure', sessionId, permissionMode: 'plan' });
+        setDraft(sessionId, command.body);
+        if (!command.body) return;
+      }
+      await client.request({
+        type: 'message.send',
+        sessionId,
+        text: command?.body ?? text,
+        scenario,
+      });
       setDraft(sessionId, '');
     });
   }
@@ -1244,6 +1370,17 @@ export function App({
     {
       label: '视图',
       items: [
+        ...(window.desktop && !browser
+          ? [
+              {
+                label: '查看改动',
+                icon: <Files />,
+                disabled: !canReadProject || place.page !== 'chat',
+                run: showChanges,
+              },
+            ]
+          : []),
+        { label: '查看会话状态', run: () => setStatusRequest((value) => value + 1) },
         {
           label: '查找对话内容',
           hint: hint('find'),
@@ -1486,6 +1623,35 @@ export function App({
         openMenu={(item, position) => setMenu({ kind: 'bar', label: item.label, ...position })}
         connected={connected}
         adapterName={adapterName}
+        statusRequest={statusRequest}
+        statusLabel={
+          {
+            connected: '已连接',
+            connecting: '连接中',
+            reconnecting: '重连中',
+            disconnected: '未连接',
+          }[state.status]
+        }
+        details={[
+          {
+            label: '服务连接',
+            value: {
+              connected: '已连接',
+              connecting: '连接中',
+              reconnecting: '重连中',
+              disconnected: '未连接',
+            }[state.status],
+          },
+          {
+            label: '执行设备',
+            value: selected
+              ? `${selected.device?.name ?? '本机'} · ${!connected ? '可达性待确认' : reachable(selected) ? '执行通道就绪' : '执行通道未就绪'}`
+              : '未选择项目',
+          },
+          { label: '当前任务', value: runtime.task },
+          { label: selected?.activeRun ? '运行模式' : '下次运行模式', value: runtime.modeLabel },
+          { label: '模式说明', value: runtime.modeDetail },
+        ]}
       />
       <Rail
         page={place.page}
@@ -1574,244 +1740,264 @@ export function App({
             }
             projectMenu={(path, position) => setMenu({ kind: 'project', path, ...position })}
           />
-          <main className="workspace">
-            {currentError && (
-              <div className="error-banner" role="alert">
-                <span>{currentError}</span>
-                <IconButton
-                  title="关闭错误提示"
-                  onClick={() => {
-                    setError(null);
-                    client.update({ error: null });
-                  }}
-                >
-                  <X />
-                </IconButton>
-              </div>
-            )}
-            {!connected && (
-              <div className="connection-banner" role="status">
-                <Unplug />
-                连接中断，等待恢复
-              </div>
-            )}
-            <Conversation
-              findRequest={findRequest}
-              session={selected}
-              here={!!selected && onThis(selected)}
-              events={events}
-              history={history}
-              connected={connected}
-              native={nativeMode}
-              ownsRun={ownsRun}
-              clock={clock}
-              progress={selected ? state.progress[selected.id] : undefined}
-              busy={busy}
-              newSession={() => {
-                void newSession();
-              }}
-              loadEarlier={() => client.loadEarlier(selected!.id)}
-              edit={
-                controlsDisabled || away
-                  ? undefined
-                  : (id, text, deliveryStatus) => {
-                      // Only a confirmed non-delivery can be resent in place. A missing receipt is not proof.
-                      if (deliveryStatus === 'not_sent') {
-                        if (draft && draft !== text) {
-                          setError('输入框里还有草稿，请先发送或清空，再编辑这条未送达的消息。');
-                          return;
-                        }
+          <main className="workspace" ref={workspace}>
+            <div className="chat-layout">
+              <div className="chat-column">
+                {currentError && (
+                  <div className="error-banner" role="alert">
+                    <span>{currentError}</span>
+                    <IconButton
+                      title="关闭错误提示"
+                      onClick={() => {
                         setError(null);
-                        setDraft(selected!.id, text);
-                        return;
-                      }
-                      void fork(selected!, { id, text });
-                    }
-              }
-              stopTask={(taskId) => {
-                void act(async () => {
-                  await client.request({
-                    type: 'run.task.stop',
-                    sessionId: selected!.id,
-                    runId: selected!.activeRun!.id,
-                    taskId,
-                  });
-                });
-              }}
-              backgroundTask={(toolId) => {
-                void act(async () => {
-                  await client.request({
-                    type: 'run.task.background',
-                    sessionId: selected!.id,
-                    runId: selected!.activeRun!.id,
-                    toolId,
-                  });
-                });
-              }}
-              stop={stopRun}
-              replyApproval={async (runId, approvalId, allowed, answers, executionMode) => {
-                let sent = false;
-                await act(async () => {
-                  await client.request({
-                    type: 'approval.reply',
-                    sessionId: selected!.id,
-                    runId,
-                    approvalId,
-                    allowed,
-                    ...(executionMode ? { executionMode } : {}),
-                    ...(answers ? { answers } : {}),
-                  });
-                  sent = true;
-                });
-                return sent;
-              }}
-            />
-            {state.status === 'reconnecting' && (
-              <div className="elsewhere-bar" role="status">
-                <Unplug />
-                <p>
-                  与服务端的连接断开了，正在重新连接。运行中的任务仍在服务端继续，连上之后这里会补上期间的内容；
-                  {state.error ? `原因：${state.error.split('\n')[0]}` : '不需要做什么。'}
-                </p>
-                <button type="button" className="button" onClick={disconnect}>
-                  断开并回到登录页
-                </button>
-              </div>
-            )}
-            {beside.length > 0 && (
-              <div className="elsewhere-bar" role="status">
-                <Laptop />
-                <p>
-                  连接{beside.join('、')}
-                  里有会话正在这个文件夹里运行。两边同时改动文件可能互相覆盖，建议等一边做完，或让它们在不同的文件夹里工作。
-                </p>
-              </div>
-            )}
-            {selected && away && host.localProjects && (
-              <div className="elsewhere-bar" role="status">
-                <Laptop />
-                {remote ? (
-                  <p>
-                    这个会话在设备“{selected.device?.name}”上，项目目录是{' '}
-                    <code>{selected.projectPath}</code>
-                    。在这里发的消息、审批和停止都作用于那台电脑上的会话，命令也在那里执行。要换到这台电脑上做，选它在这里的项目目录或分叉到本机。
-                  </p>
-                ) : (
-                  <p>
-                    这个会话在设备“{selected.device?.name ?? '未知设备'}”上，项目目录是{' '}
-                    <code>{selected.projectPath}</code>
-                    。那台电脑目前不在线，这里只能查看；它连上服务后可以直接在这里操作。要在这台电脑上接着做，先选它在这里的项目目录；下一条消息会告诉
-                    Claude 换了电脑。
-                  </p>
+                        client.update({ error: null });
+                      }}
+                    >
+                      <X />
+                    </IconButton>
+                  </div>
                 )}
-                <button
-                  type="button"
-                  className="button primary"
-                  disabled={controlsDisabled}
-                  onClick={(event) => {
-                    // With projects here the session goes into one of them, or into a folder chosen there.
-                    if (!herePaths().length) return void takeOver(selected);
-                    const box = event.currentTarget.getBoundingClientRect();
-                    setMenu({
-                      kind: 'move',
-                      sessionId: selected.id,
-                      x: box.left,
-                      y: box.top - 6,
-                      above: true,
+                {!connected && state.status !== 'reconnecting' && (
+                  <div className="connection-banner" role="status">
+                    <Unplug />
+                    连接中断，等待恢复
+                  </div>
+                )}
+                <Conversation
+                  reviewing={!!changesProject && changesProject === localProject && canReadProject}
+                  findRequest={findRequest}
+                  session={selected}
+                  here={!!selected && onThis(selected)}
+                  events={events}
+                  history={history}
+                  connected={connected}
+                  native={nativeMode}
+                  ownsRun={ownsRun}
+                  clock={clock}
+                  progress={selected ? state.progress[selected.id] : undefined}
+                  busy={busy}
+                  newSession={() => {
+                    void newSession();
+                  }}
+                  loadEarlier={() => client.loadEarlier(selected!.id)}
+                  edit={
+                    controlsDisabled || away
+                      ? undefined
+                      : (id, text, deliveryStatus) => {
+                          // Only a confirmed non-delivery can be resent in place. A missing receipt is not proof.
+                          if (deliveryStatus === 'not_sent') {
+                            if (draft && draft !== text) {
+                              setError(
+                                '输入框里还有草稿，请先发送或清空，再编辑这条未送达的消息。',
+                              );
+                              return;
+                            }
+                            setError(null);
+                            setDraft(selected!.id, text);
+                            return;
+                          }
+                          void fork(selected!, { id, text });
+                        }
+                  }
+                  stopTask={(taskId) => {
+                    void act(async () => {
+                      await client.request({
+                        type: 'run.task.stop',
+                        sessionId: selected!.id,
+                        runId: selected!.activeRun!.id,
+                        taskId,
+                      });
                     });
                   }}
-                >
-                  在本机继续…
-                </button>
-                <button
-                  type="button"
-                  className="button secondary"
-                  disabled={controlsDisabled}
-                  onClick={() => {
-                    void fork(selected);
+                  backgroundTask={(toolId) => {
+                    void act(async () => {
+                      await client.request({
+                        type: 'run.task.background',
+                        sessionId: selected!.id,
+                        runId: selected!.activeRun!.id,
+                        toolId,
+                      });
+                    });
                   }}
-                >
-                  分叉到本机…
-                </button>
+                  stop={stopRun}
+                  replyApproval={async (runId, approvalId, allowed, answers, executionMode) => {
+                    let sent = false;
+                    await act(async () => {
+                      await client.request({
+                        type: 'approval.reply',
+                        sessionId: selected!.id,
+                        runId,
+                        approvalId,
+                        allowed,
+                        ...(executionMode ? { executionMode } : {}),
+                        ...(answers ? { answers } : {}),
+                      });
+                      sent = true;
+                    });
+                    return sent;
+                  }}
+                />
+                {state.status === 'reconnecting' && (
+                  <div className="elsewhere-bar" role="status">
+                    <Unplug />
+                    <p>
+                      与服务端的连接断开了，正在重新连接。任务状态待确认，连上之后会更新状态并补上期间的内容；
+                      {state.error ? `原因：${state.error.split('\n')[0]}` : '不需要做什么。'}
+                    </p>
+                    <button type="button" className="button" onClick={disconnect}>
+                      断开并回到登录页
+                    </button>
+                  </div>
+                )}
+                {beside.length > 0 && (
+                  <div className="elsewhere-bar" role="status">
+                    <Laptop />
+                    <p>
+                      连接{beside.join('、')}
+                      里有会话正在这个文件夹里运行。两边同时改动文件可能互相覆盖，建议等一边做完，或让它们在不同的文件夹里工作。
+                    </p>
+                  </div>
+                )}
+                {selected && away && host.localProjects && (
+                  <div className="elsewhere-bar" role="status">
+                    <Laptop />
+                    {remote ? (
+                      <p>
+                        这个会话在设备“{selected.device?.name}”上，项目目录是{' '}
+                        <code>{selected.projectPath}</code>
+                        。在这里发的消息、审批和停止都作用于那台电脑上的会话，命令也在那里执行。要换到这台电脑上做，选它在这里的项目目录或分叉到本机。
+                      </p>
+                    ) : (
+                      <p>
+                        这个会话在设备“{selected.device?.name ?? '未知设备'}”上，项目目录是{' '}
+                        <code>{selected.projectPath}</code>
+                        。那台电脑目前不在线，这里只能查看；它连上服务后可以直接在这里操作。要在这台电脑上接着做，先选它在这里的项目目录；下一条消息会告诉
+                        Claude 换了电脑。
+                      </p>
+                    )}
+                    <button
+                      type="button"
+                      className="button primary"
+                      disabled={controlsDisabled}
+                      onClick={(event) => {
+                        // With projects here the session goes into one of them, or into a folder chosen there.
+                        if (!herePaths().length) return void takeOver(selected);
+                        const box = event.currentTarget.getBoundingClientRect();
+                        setMenu({
+                          kind: 'move',
+                          sessionId: selected.id,
+                          x: box.left,
+                          y: box.top - 6,
+                          above: true,
+                        });
+                      }}
+                    >
+                      在本机继续…
+                    </button>
+                    <button
+                      type="button"
+                      className="button secondary"
+                      disabled={controlsDisabled}
+                      onClick={() => {
+                        void fork(selected);
+                      }}
+                    >
+                      分叉到本机…
+                    </button>
+                  </div>
+                )}
+                {browser && selected && away && !remote && (
+                  <div className="elsewhere-bar" role="status">
+                    <Laptop />
+                    <p>设备“{selected.device?.name ?? '未知设备'}”未连接，当前只能查看会话。</p>
+                  </div>
+                )}
+                {nativeMode && selected && !selected.activeRun && (!away || remote) && (
+                  <IdleReminder
+                    events={events}
+                    settings={state.compaction}
+                    canCompact={canCompact && !controlsDisabled}
+                    compact={() => {
+                      void compact();
+                    }}
+                    startFresh={() => {
+                      if (onThis(selected)) void createInProject(selected.projectPath);
+                      else void newSession();
+                    }}
+                  />
+                )}
+                {selected && (!away || remote) && (
+                  <Composer
+                    openAccount={() => open('settings', 'account')}
+                    session={selected}
+                    projectName={
+                      state.devices.some(
+                        (device) => device.server && device.id === selected.device?.id,
+                      ) || isInside(selected.projectPath, workspaceRoots)
+                        ? null
+                        : projectLabel(selected.projectPath)
+                    }
+                    chooseProject={
+                      controlsDisabled || away
+                        ? undefined
+                        : (position) =>
+                            setMenu({ kind: 'move', sessionId: selected.id, ...position })
+                    }
+                    draft={draft}
+                    setDraft={(text) => setDraft(selected.id, text)}
+                    native={nativeMode}
+                    localProject={canReadProject}
+                    showChanges={showChanges}
+                    localActions={localActions}
+                    modeDisplay={{ label: runtime.modeLabel, detail: runtime.modeDetail }}
+                    connected={connected}
+                    busy={busy}
+                    refreshing={refreshing}
+                    canRefreshModels={!state.sessions.some((session) => session.activeRun)}
+                    ownsRun={ownsRun}
+                    inputDisabled={inputDisabled}
+                    controlsDisabled={controlsDisabled}
+                    slashOpen={slashOpen}
+                    setSlashOpen={setSlashOpen}
+                    scenario={scenario}
+                    setScenario={setScenario}
+                    capabilities={capabilities}
+                    nativeSession={nativeSession}
+                    metrics={metrics}
+                    send={(text) => {
+                      void send(text);
+                    }}
+                    resume={stopped && !inputDisabled ? resume : undefined}
+                    refresh={() => {
+                      void refreshStatus();
+                    }}
+                    configure={configure}
+                    stop={stopRun}
+                  />
+                )}
+                {selected && (!away || (browser && remote)) && (
+                  <SessionBar
+                    client={client}
+                    sessionId={selected.id}
+                    refresh={turnReports}
+                    metrics={metrics}
+                    native={nativeMode}
+                  />
+                )}
               </div>
-            )}
-            {browser && selected && away && !remote && (
-              <div className="elsewhere-bar" role="status">
-                <Laptop />
-                <p>设备“{selected.device?.name ?? '未知设备'}”未连接，当前只能查看会话。</p>
-              </div>
-            )}
-            {nativeMode && selected && !selected.activeRun && (!away || remote) && (
-              <IdleReminder
-                events={events}
-                settings={state.compaction}
-                canCompact={canCompact && !controlsDisabled}
-                compact={() => {
-                  void compact();
-                }}
-                startFresh={() => {
-                  if (onThis(selected)) void createInProject(selected.projectPath);
-                  else void newSession();
-                }}
-              />
-            )}
-            {selected && (!away || remote) && (
-              <Composer
-                openAccount={() => open('settings', 'account')}
-                session={selected}
-                projectName={
-                  state.devices.some(
-                    (device) => device.server && device.id === selected.device?.id,
-                  ) || isInside(selected.projectPath, workspaceRoots)
-                    ? null
-                    : projectLabel(selected.projectPath)
-                }
-                chooseProject={
-                  controlsDisabled || away
-                    ? undefined
-                    : (position) => setMenu({ kind: 'move', sessionId: selected.id, ...position })
-                }
-                draft={draft}
-                setDraft={(text) => setDraft(selected.id, text)}
-                native={nativeMode}
-                connected={connected}
-                busy={busy}
-                refreshing={refreshing}
-                canRefreshModels={!state.sessions.some((session) => session.activeRun)}
-                ownsRun={ownsRun}
-                inputDisabled={inputDisabled}
-                controlsDisabled={controlsDisabled}
-                slashOpen={slashOpen}
-                setSlashOpen={setSlashOpen}
-                canCompact={canCompact}
-                scenario={scenario}
-                setScenario={setScenario}
-                capabilities={capabilities}
-                nativeSession={nativeSession}
-                metrics={metrics}
-                send={(text) => {
-                  void send(text);
-                }}
-                resume={stopped && !inputDisabled ? resume : undefined}
-                compact={() => {
-                  void compact();
-                }}
-                refresh={() => {
-                  void refreshStatus();
-                }}
-                configure={configure}
-                stop={stopRun}
-              />
-            )}
-            {selected && (!away || (browser && remote)) && (
-              <SessionBar
-                client={client}
-                sessionId={selected.id}
-                refresh={turnReports}
-                metrics={metrics}
-                native={nativeMode}
-              />
-            )}
+              {changesProject &&
+                changesProject === localProject &&
+                canReadProject &&
+                workspace.current && (
+                  <ChangesPanel
+                    key={localProject}
+                    directory={localProject}
+                    workspace={workspace.current}
+                    running={!!selected?.activeRun}
+                    close={closeChanges}
+                  />
+                )}
+            </div>
           </main>
         </>
       )}

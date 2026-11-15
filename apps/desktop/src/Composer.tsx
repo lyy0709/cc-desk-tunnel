@@ -2,8 +2,11 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import {
   ArrowUp,
+  Activity,
+  Files,
   Folder,
   GitBranch,
+  ListChecks,
   Play,
   Plus,
   RefreshCw,
@@ -31,14 +34,14 @@ const slashDraft = /^[/\\][^ \n]*$/;
 
 // The branch the project's working tree is on, read from the project by the desktop; it is looked at again
 // whenever the window comes back to the front or a run ends, the moments it may have changed.
-function useBranch(path: string, running: boolean) {
-  const [branch, setBranch] = useState<string | null>(null);
+function useBranch(path: string | null, running: boolean) {
+  const [branch, setBranch] = useState<{ path: string; value: string | null } | null>(null);
   useEffect(() => {
-    if (!window.desktop) return;
+    if (!window.desktop || !path) return;
     let current = true;
     const read = () =>
       void window.desktop!.gitBranch(path).then(
-        (value) => current && setBranch(value),
+        (value) => current && setBranch({ path, value }),
         () => current && setBranch(null),
       );
     read();
@@ -48,7 +51,7 @@ function useBranch(path: string, running: boolean) {
       window.removeEventListener('focus', read);
     };
   }, [path, running]);
-  return branch;
+  return branch?.path === path ? branch?.value : null;
 }
 
 export default function Composer({
@@ -58,6 +61,10 @@ export default function Composer({
   draft,
   setDraft,
   native,
+  localProject,
+  showChanges,
+  localActions,
+  modeDisplay,
   connected,
   busy,
   refreshing,
@@ -67,7 +74,6 @@ export default function Composer({
   controlsDisabled,
   slashOpen,
   setSlashOpen,
-  canCompact,
   scenario,
   setScenario,
   capabilities,
@@ -76,7 +82,6 @@ export default function Composer({
   openAccount,
   send,
   resume,
-  compact,
   refresh,
   configure,
   stop,
@@ -89,6 +94,10 @@ export default function Composer({
   draft: string;
   setDraft: (text: string) => void;
   native: boolean;
+  localProject: boolean;
+  showChanges: () => void;
+  localActions: { name: string; title: string; detail: string; reason: string }[];
+  modeDisplay: { label: string; detail: string };
   connected: boolean;
   busy: boolean;
   refreshing: boolean;
@@ -98,7 +107,6 @@ export default function Composer({
   controlsDisabled: boolean;
   slashOpen: boolean;
   setSlashOpen: (open: boolean) => void;
-  canCompact: boolean;
   scenario: Scenario;
   setScenario: (scenario: Scenario) => void;
   capabilities: NativeCapabilities | null;
@@ -109,7 +117,6 @@ export default function Composer({
   send: (text?: string) => void;
   // Present when the session's last turn was stopped or cut off: takes it up again without a message.
   resume?: () => void;
-  compact: () => void;
   refresh: () => void;
   configure: (values: {
     model?: string | null;
@@ -119,7 +126,7 @@ export default function Composer({
   stop: () => void;
 }) {
   const input = useRef<HTMLTextAreaElement>(null);
-  const branch = useBranch(session.projectPath, !!session.activeRun);
+  const branch = useBranch(localProject ? session.projectPath : null, !!session.activeRun);
   const [dropping, setDropping] = useState(false);
   // The command menu: this window's own actions, then Claude Code's commands that fit what follows the slash. Enter
   // runs the one picked; Tab or a click puts a command in the box, to be given its arguments.
@@ -136,34 +143,27 @@ export default function Composer({
     run: () => void;
     fill?: string;
   }[] = [
-    ...('compact'.startsWith(typed)
-      ? [
-          {
-            key: 'compact',
-            icon: <Shrink />,
-            title: '压缩上下文',
-            detail: metrics?.context ? `已使用 ${metrics.context.percentage}%` : '/compact',
-            disabled: controlsDisabled || !canCompact,
-            run: compact,
-          },
-        ]
-      : []),
-    ...('refresh'.startsWith(typed)
-      ? [
-          {
-            key: 'refresh',
-            icon: <RefreshCw />,
-            title: '刷新原生状态',
-            detail: '上下文与订阅额度',
-            disabled: controlsDisabled || refreshing,
-            run: () => {
-              setSlashOpen(false);
-              setDraft('');
-              refresh();
-            },
-          },
-        ]
-      : []),
+    ...localActions
+      .filter((action) => action.name.startsWith(typed))
+      .map((action) => ({
+        key: action.name,
+        icon:
+          action.name === 'plan' ? (
+            <ListChecks />
+          ) : action.name === 'changes' ? (
+            <Files />
+          ) : action.name === 'status' ? (
+            <Activity />
+          ) : action.name === 'compact' ? (
+            <Shrink />
+          ) : (
+            <RefreshCw />
+          ),
+        title: action.title,
+        detail: action.reason || action.detail,
+        disabled: !!action.reason,
+        run: () => send(`/${action.name}`),
+      })),
     ...(slashOpen ? slashCommands(capabilities, typed) : []).map((command) => ({
       key: `/${command.name}`,
       icon: <SquareSlash />,
@@ -283,6 +283,12 @@ export default function Composer({
             <span>{branch}</span>
           </span>
         )}
+        {localProject && (
+          <button type="button" className="chip quiet changes-trigger" onClick={showChanges}>
+            <Files />
+            <span>查看改动</span>
+          </button>
+        )}
       </div>
       <form
         className={`composer ${dropping ? 'dropping' : ''}`}
@@ -386,6 +392,7 @@ export default function Composer({
           ) : (
             <PermissionMenu
               mode={session.permissionMode}
+              display={modeDisplay}
               disabled={controlsDisabled}
               change={(permissionMode) => void configure({ permissionMode })}
             />

@@ -122,6 +122,8 @@ test('a slash lists this window’s actions, then the everyday commands, then th
   await expect(menu(page)).toBeVisible();
   // Commands with a control of their own here, or that would change the CLI's session, are left to its terminal.
   expect(await names(page)).toEqual([
+    '进入计划模式',
+    '查看会话状态',
     '压缩上下文',
     '刷新原生状态',
     '/review',
@@ -165,12 +167,11 @@ test('Enter sends the picked command; the arrow keys pick another', async ({ pag
   await expect.poll(() => sent).toEqual(['/context']);
   await expect(box(page)).toHaveValue('');
   await box(page).fill('/');
-  // Compacting needs a context to compact, which this session has none of yet: the first usable one is picked.
+  // The first usable local action is selected; disabled actions remain in the list with a reason.
   await expect(menu(page).getByRole('option', { name: '压缩上下文' })).toBeDisabled();
-  await expect(menu(page).getByRole('option', { selected: true })).toContainText('刷新原生状态');
+  await expect(menu(page).getByRole('option', { selected: true })).toContainText('进入计划模式');
   await box(page).press('ArrowDown');
-  await expect(menu(page).getByRole('option', { selected: true })).toContainText('/review');
-  await box(page).press('ArrowUp');
+  await expect(menu(page).getByRole('option', { selected: true })).toContainText('查看会话状态');
   await box(page).press('ArrowUp');
   await box(page).press('ArrowUp');
   await expect(menu(page).getByRole('option', { selected: true })).toContainText('/my-skill');

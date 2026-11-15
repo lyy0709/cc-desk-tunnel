@@ -591,7 +591,7 @@ function General({
 function Appearance({ browser }: { browser: boolean }) {
   const { quota } = usePrefs();
   return (
-    <Page title="外观" intro={here(browser)}>
+    <Page title="外观" intro={`${here(browser)} 外观修改立即生效。`}>
       <ThemeSettings />
       {window.desktop && (
         <>
@@ -684,7 +684,7 @@ function Notices() {
   return (
     <Page
       title="通知"
-      intro="窗口收在托盘或不在前台时，用系统通知提醒需要你知道的事；点通知回到对应的会话。正在看的会话不会重复提醒。"
+      intro="通知偏好只影响当前客户端，修改后立即生效。窗口收在托盘或不在前台时，用系统通知提醒需要你知道的事；点通知回到对应的会话。正在看的会话不会重复提醒。"
     >
       <div className="card">
         <Row title="开启通知" detail="关闭后既不弹出系统通知，也不记入通知列表">

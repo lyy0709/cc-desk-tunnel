@@ -27,6 +27,8 @@ contextBridge.exposeInMainWorld('desktop', {
   openLogs: () => ipcRenderer.invoke('log:open'),
   openDevTools: () => ipcRenderer.invoke('devtools:open'),
   gitBranch: (directory) => ipcRenderer.invoke('git:branch', directory),
+  gitChanges: (directory, scope) => ipcRenderer.invoke('git:changes', directory, scope),
+  gitDiff: (directory, scope, file) => ipcRenderer.invoke('git:diff', directory, scope, file),
   copyText: (text) => ipcRenderer.invoke('clipboard:write', text),
   openExternal: (url) => ipcRenderer.invoke('external:open', url),
   openWeb: (url) => ipcRenderer.invoke('web:open', url),

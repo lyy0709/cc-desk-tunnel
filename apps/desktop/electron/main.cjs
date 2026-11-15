@@ -30,6 +30,7 @@ const {
 } = require('node:fs');
 const { copyFile, mkdtemp, readFile, stat, writeFile } = require('node:fs/promises');
 const { gitBranch } = require('./git-branch.cjs');
+const { gitChanges, gitDiff } = require('./git-changes.cjs');
 const fileLinks = require('./file-links.cjs');
 const { asOnDisk } = require('./disk-path.cjs');
 const { openLog } = require('./client-log.cjs');
@@ -203,6 +204,8 @@ handle('devtools:open', (event) => {
   event.sender.openDevTools({ mode: 'detach' });
 });
 handle('git:branch', (_event, directory) => gitBranch(directory));
+handle('git:changes', (_event, directory, scope) => gitChanges(directory, scope));
+handle('git:diff', (_event, directory, scope, file) => gitDiff(directory, scope, file));
 handle('clipboard:write', (_event, text) => {
   if (typeof text !== 'string') throw new Error('Expected clipboard text');
   clipboard.writeText(text);

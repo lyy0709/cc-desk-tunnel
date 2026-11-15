@@ -1,6 +1,8 @@
 import { ArrowLeft, ArrowRight, PanelLeft } from 'lucide-react';
 import { IconButton } from './ui.tsx';
 import type { MenuItem, MenuPosition } from './ui.tsx';
+import { useEffect } from 'react';
+import { usePopover } from './usePopover.ts';
 
 export type BarMenu = { label: string; items: MenuItem[] };
 
@@ -16,6 +18,9 @@ export default function TitleBar({
   openMenu,
   connected,
   adapterName,
+  statusRequest = 0,
+  statusLabel,
+  details = [],
 }: {
   title: string;
   // Absent while there is nowhere to go.
@@ -27,7 +32,14 @@ export default function TitleBar({
   openMenu: (menu: BarMenu, position: MenuPosition) => void;
   connected: boolean;
   adapterName: string;
+  statusRequest?: number;
+  statusLabel?: string;
+  details?: { label: string; value: string }[];
 }) {
+  const { open, setOpen, container, card } = usePopover();
+  useEffect(() => {
+    if (statusRequest) setOpen(true);
+  }, [statusRequest]);
   return (
     <header className="titlebar">
       <IconButton title="后退" disabled={!back} onClick={back}>
@@ -55,11 +67,33 @@ export default function TitleBar({
         ))}
       </nav>
       <h1>{title}</h1>
-      <span className="connection-status" title={adapterName}>
-        <span className={`connection-dot ${connected ? 'online' : ''}`} />
-        <span>{connected ? '已连接' : '重连中'}</span>
-        <small>{adapterName}</small>
-      </span>
+      <div className="connection-detail" ref={container}>
+        <button
+          type="button"
+          className="connection-status"
+          title="查看会话状态"
+          aria-label="查看会话状态"
+          aria-expanded={open}
+          onClick={() => setOpen(!open)}
+        >
+          <span className={`connection-dot ${connected ? 'online' : ''}`} />
+          <span>{statusLabel ?? (connected ? '已连接' : '重连中')}</span>
+          <small>{adapterName}</small>
+        </button>
+        {open && (
+          <div className="connection-card" role="dialog" aria-label="会话状态" ref={card}>
+            <strong>会话状态</strong>
+            <dl>
+              {details.map((item) => (
+                <div key={item.label}>
+                  <dt>{item.label}</dt>
+                  <dd>{item.value}</dd>
+                </div>
+              ))}
+            </dl>
+          </div>
+        )}
+      </div>
     </header>
   );
 }

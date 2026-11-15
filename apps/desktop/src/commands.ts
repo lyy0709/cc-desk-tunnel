@@ -8,6 +8,10 @@ export type SlashCommand = { name: string; description: string; argumentHint: st
 // sessions its servers launch. They are for Claude Code's own terminal; the CLI also names the commands bound to
 // its terminal, which the service leaves out already. Names starting with "__" are the CLI's internal ones.
 const hidden = new Set([
+  'plan',
+  'changes',
+  'status',
+  'refresh',
   'compact',
   'model',
   'effort',
@@ -24,6 +28,12 @@ const hidden = new Set([
   'quit',
   'workflow-launch-exec',
 ]);
+
+export type LocalCommand = 'plan' | 'changes' | 'status' | 'compact' | 'refresh';
+export function localCommand(text: string): { name: LocalCommand; body: string } | null {
+  const match = /^[/\\](plan|changes|status|compact|refresh)(?:\s+([\s\S]*))?$/.exec(text);
+  return match ? { name: match[1] as LocalCommand, body: (match[2] ?? '').trim() } : null;
+}
 // The everyday ones come first and are said in Chinese; the rest keep Claude Code's own words.
 const everyday: Record<string, string> = {
   review: '审查代码改动',

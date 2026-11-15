@@ -1,6 +1,74 @@
 import { useEffect, useState } from 'react';
-import type { TerminalActivity } from '@cc-desk-tunnel/protocol';
+import type { TerminalActivity, Session, SessionEvent } from '@cc-desk-tunnel/protocol';
+import { permissionLabel } from './PermissionMenu.tsx';
 import type { TaskProgress } from './client.ts';
+
+// Both the composer and the connection card use this run's native facts, never an earlier run's mode.
+export function sessionRuntime(
+  session: Session | undefined,
+  events: SessionEvent[],
+  connected: boolean,
+  native: boolean,
+) {
+  const run = session?.activeRun;
+  const current = run ? events.filter((event) => event.runId === run.id) : [];
+  const initialized = current.findLast((event) => event.payload.type === 'native.session')?.payload;
+  const nativeSession = initialized?.type === 'native.session' ? initialized : null;
+  const reported = current.findLast(
+    (event) =>
+      event.payload.type === 'native.permission' ||
+      (event.payload.type === 'native.session' && event.payload.permissionMode !== undefined),
+  )?.payload;
+  const mode =
+    reported?.type === 'native.permission' || reported?.type === 'native.session'
+      ? reported.permissionMode
+      : undefined;
+  const requested = nativeSession?.requestedPermissionMode ?? session?.permissionMode;
+  const last = events.findLast((event) => event.payload.type === 'run.status')?.payload;
+  const ended =
+    last?.type === 'run.status'
+      ? ({ completed: '已完成', failed: '失败', cancelled: '已停止' } as Record<string, string>)[
+          last.status
+        ]
+      : undefined;
+  const started =
+    !!nativeSession ||
+    current.some((event) =>
+      ['text.delta', 'thinking.delta', 'tool.requested'].includes(event.payload.type),
+    );
+  const task =
+    run?.surface === 'terminal'
+      ? terminalState(run.activity)
+      : run?.waiting === 'approval'
+        ? '等待审批'
+        : run?.waiting === 'question'
+          ? '等待回答'
+          : run?.waiting === 'background'
+            ? '后台等待'
+            : run?.status === 'awaiting_approval'
+              ? '等待审批'
+              : run
+                ? native && !started
+                  ? '启动中'
+                  : '运行中'
+                : session
+                  ? (ended ?? '待命')
+                  : '未选择会话';
+  return {
+    nativeSession,
+    task: connected ? task : `最后已知：${task}`,
+    modeLabel: run
+      ? mode
+        ? permissionLabel(mode)
+        : task === '启动中'
+          ? '启动中'
+          : '模式待确认'
+      : permissionLabel(session?.permissionMode),
+    modeDetail: run
+      ? `请求模式：${permissionLabel(requested)}；原生模式：${mode ? permissionLabel(mode) : '等待确认'}`
+      : `下次运行：${permissionLabel(session?.permissionMode)}`,
+  };
+}
 
 // A session a terminal of `ccdt` holds, as its CLI's hooks report what it is doing.
 export function terminalState(activity?: TerminalActivity) {
@@ -39,6 +107,7 @@ export function RunStatus({
   clock,
   connected,
   suffix,
+  label = '运行中',
 }: {
   // A tool is at work now.
   tool: boolean;
@@ -46,14 +115,15 @@ export function RunStatus({
   clock: Clock;
   connected: boolean;
   suffix: string;
+  label?: string;
 }) {
   useTick(!tool, 5000);
   const quiet = (clock.now() - since) / 1000;
-  const silent = !tool && quiet >= 60;
+  const silent = label === '运行中' && !tool && quiet >= 60;
   return (
     <div className="run-indicator" role="status">
       <span className={`running-dot${connected && !silent ? ' breathing' : ''}`} />
-      {silent ? `仍在运行 · 已 ${Math.floor(quiet / 60)} 分钟没有新输出` : '运行中'}
+      {silent ? `仍在运行 · 已 ${Math.floor(quiet / 60)} 分钟没有新输出` : label}
       {suffix}
     </div>
   );

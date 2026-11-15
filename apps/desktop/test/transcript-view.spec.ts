@@ -79,6 +79,14 @@ async function openPlan(
   });
   const events = [
     event({
+      type: 'native.session',
+      nativeSessionId: session.id,
+      model: 'fixture',
+      version: 'fixture',
+      requestedPermissionMode: 'plan',
+      permissionMode: 'plan',
+    }),
+    event({
       type: 'message.user',
       messageId: randomUUID(),
       text: '给出执行计划',

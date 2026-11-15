@@ -65,6 +65,279 @@
 :root[data-theme='light'] {
   color-scheme: light;
 }
+
+/* The review is another surface of the same workbench, beside the conversation when it fits. */
+.chat-layout {
+  display: flex;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.chat-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  min-width: 0;
+}
+.changes-panel {
+  display: flex;
+  flex-direction: column;
+  flex: 0 0 clamp(380px, 44%, 560px);
+  min-width: 0;
+  min-height: 0;
+  border-left: 1px solid var(--line);
+  background: var(--surface);
+}
+.changes-heading,
+.changes-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 16px 4px;
+  min-width: 0;
+}
+.changes-heading {
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--line-soft);
+  justify-content: space-between;
+}
+.changes-summary > strong {
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.changes-summary > span:not(.toolbar-space) {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+.changes-summary svg {
+  width: 15px;
+  height: 15px;
+}
+.changes-root {
+  padding: 0 16px;
+  margin: 0 0 8px;
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.changes-tabs {
+  display: flex;
+  gap: 16px;
+  padding: 0 16px;
+  border-bottom: 1px solid var(--line);
+}
+.changes-tabs button {
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  padding: 8px 0;
+  color: var(--muted);
+}
+.changes-tabs button[aria-selected='true'] {
+  border-bottom-color: var(--text);
+  color: var(--text);
+}
+.changes-tabs small {
+  margin-left: 6px;
+  color: var(--muted);
+}
+.changes-files {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  overflow-anchor: none;
+}
+.change-file {
+  border-bottom: 1px solid var(--line-soft);
+}
+.change-file > header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 7px 10px;
+  background: var(--surface-2);
+}
+.change-file .icon-button {
+  width: 26px;
+  height: 26px;
+  flex-shrink: 0;
+}
+.change-expand,
+.change-path {
+  background: none;
+  border: 0;
+  padding: 2px;
+}
+.change-expand {
+  display: flex;
+  color: var(--muted);
+}
+.change-expand[aria-expanded='false'] svg {
+  transform: rotate(-90deg);
+}
+.change-path {
+  min-width: 0;
+  flex: 1;
+  font-size: 12px;
+  text-align: left;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.change-path:hover {
+  text-decoration: underline;
+}
+.change-kind {
+  color: var(--muted);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.changes-note,
+.changes-footnote {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 0;
+  padding: 12px 16px;
+  overflow-wrap: anywhere;
+}
+.changes-note.error-text {
+  color: var(--danger-text);
+}
+.changes-footnote {
+  border-top: 1px solid var(--line-soft);
+  font-size: 11px;
+}
+.diff-lines {
+  font-family: Consolas, 'Cascadia Code', monospace;
+  font-size: 12px;
+  line-height: 1.65;
+  padding: 4px 0 8px;
+}
+.diff-line {
+  display: grid;
+  grid-template-columns: 36px 36px minmax(max-content, 1fr);
+  min-width: 100%;
+  width: max-content;
+}
+.wrap .diff-line {
+  grid-template-columns: 36px 36px minmax(0, 1fr);
+  width: 100%;
+}
+.diff-line code {
+  padding: 0 10px 0 6px;
+  white-space: pre;
+  font: inherit;
+}
+.wrap .diff-line code {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.diff-number {
+  color: var(--muted);
+  text-align: right;
+  padding: 0 5px;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  user-select: none;
+}
+button.diff-number:enabled:hover {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.diff-line.added {
+  background: var(--ok-soft);
+}
+.diff-line.added code {
+  color: var(--added);
+}
+.diff-line.removed {
+  background: var(--danger-soft);
+}
+.diff-line.removed code {
+  color: var(--danger-text);
+}
+.diff-line.meta,
+.diff-hunk {
+  color: var(--muted);
+}
+.diff-hunk {
+  background: var(--surface-2);
+  padding: 5px 12px;
+  overflow-wrap: anywhere;
+}
+dialog:has(.changes-dialog) {
+  width: min(960px, calc(100vw - 32px));
+  max-width: none;
+  height: min(850px, 90dvh);
+}
+.changes-dialog {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow: hidden;
+}
+dialog:has(.changes-dialog) {
+  padding: 0;
+}
+dialog:has(.changes-dialog) > .dialog-heading {
+  padding: 12px 18px;
+  margin: 0;
+  border-bottom: 1px solid var(--line-soft);
+}
+dialog:has(.changes-dialog)[open] {
+  display: flex;
+  flex-direction: column;
+}
+.connection-detail {
+  position: relative;
+  -webkit-app-region: no-drag;
+}
+button.connection-status {
+  border: 0;
+  background: transparent;
+  border-radius: var(--radius-s);
+}
+.connection-card {
+  position: absolute;
+  top: calc(100% + 8px);
+  right: 0;
+  width: min(360px, calc(100vw - 24px));
+  padding: 16px;
+  background: var(--raised);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  z-index: 30;
+  font-size: 13px;
+}
+.connection-card dl {
+  margin: 12px 0 0;
+}
+.connection-card dl > div {
+  display: grid;
+  grid-template-columns: 90px minmax(0, 1fr);
+  gap: 12px;
+  margin-top: 9px;
+}
+.connection-card dt {
+  color: var(--muted);
+}
+.connection-card dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
 :root[data-theme='dark'] {
   color-scheme: dark;
 }

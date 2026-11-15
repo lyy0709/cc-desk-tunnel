@@ -34,7 +34,7 @@ import type { PlanExecutionMode, Session, SessionEvent } from '@cc-desk-tunnel/p
 import { describe, duration, summarize } from './activity.ts';
 import type { Category } from './activity.ts';
 import type { HistoryState, TaskProgress } from './client.ts';
-import { RunStatus, TaskLine, terminalState } from './RunStatus.tsx';
+import { RunStatus, TaskLine, sessionRuntime } from './RunStatus.tsx';
 import type { Clock } from './RunStatus.tsx';
 import QuestionCard, { questionsOf } from './QuestionCard.tsx';
 import PermissionMenu from './PermissionMenu.tsx';
@@ -830,10 +830,12 @@ export default function Conversation({
   edit,
   findRequest,
   here,
+  reviewing = false,
 }: {
   session: Session | undefined;
   // This window can open the files of the session's project: a desktop on the computer they are on.
   here: boolean;
+  reviewing?: boolean;
   events: SessionEvent[];
   history: HistoryState | undefined;
   connected: boolean;
@@ -862,6 +864,7 @@ export default function Conversation({
   progress: Record<string, TaskProgress> | undefined;
 }) {
   const turns = useMemo(() => conversation(events), [events]);
+  const runtime = sessionRuntime(session, events, connected, native);
   // A compaction under way counts its time in its own line, as a tool does.
   const steps = turns.at(-1)?.steps ?? [];
   const toolAtWork =
@@ -1046,6 +1049,10 @@ export default function Conversation({
     follow.current = true;
     setAway(false);
   };
+  // Opening the review changes the transcript's width; that is reading, not a request to follow output.
+  useLayoutEffect(() => {
+    if (reviewing) leave();
+  }, [reviewing]);
   const loadMore = () => {
     if (!session || !connected || !history?.hasEarlier || history.loadingEarlier || history.loading)
       return;
@@ -1203,7 +1210,7 @@ export default function Conversation({
           // Coming down to the end follows again; only moving down does, so a slow wheel or a flick upwards is not
           // pulled back while output comes in fast. Moving up away from it leaves, by touch as well: heights that
           // settle or shrink keep the view at the end, where the reader never is after scrolling up.
-          if (end && top > lastTop.current) rejoin();
+          if (!reviewing && end && top > lastTop.current) rejoin();
           else if (!end && top < lastTop.current && follow.current) leave();
           // Reading on upwards past what is loaded brings the page before it; a failed load waits for the button.
           if (top < lastTop.current && top < 240 && !loadError) loadMore();
@@ -1308,8 +1315,8 @@ export default function Conversation({
               <div className="background-tasks">
                 <div className="run-indicator" role="status">
                   <span className={`running-dot${connected ? ' breathing' : ''}`} />
-                  后台任务{tasks.length ? ` ${tasks.length} 个` : ''} · Claude
-                  已答完，任务结束后会接着处理
+                  {!connected && '最后已知：'}后台任务{tasks.length ? ` ${tasks.length} 个` : ''} ·
+                  Claude 已答完，任务结束后会接着处理
                   {!ownsRun && ' · 所在设备不在线'}
                 </div>
                 {/* The run is still on, so the controls that need it over are greyed out; this says why. */}
@@ -1358,7 +1365,7 @@ export default function Conversation({
                 <span
                   className={`running-dot${session.activeRun.activity === 'working' && connected ? ' breathing' : ''}`}
                 />
-                {`${terminalState(session.activeRun.activity)} · 进展随后显示在这里，关闭终端后可以在这里接着聊`}
+                {`${runtime.task} · 进展随后显示在这里，关闭终端后可以在这里接着聊`}
               </div>
             )}
             {session.activeRun &&
@@ -1366,6 +1373,7 @@ export default function Conversation({
               !background &&
               (session.activeRun.status !== 'awaiting_approval' ? (
                 <RunStatus
+                  label={runtime.task}
                   tool={toolAtWork}
                   since={Math.max(
                     clock.activityAt(session.id),
@@ -1378,7 +1386,7 @@ export default function Conversation({
               ) : (
                 <div className="run-indicator" role="status">
                   <span className="running-dot" />
-                  {session.activeRun.waiting === 'question' ? '等待回答' : '等待审批'}
+                  {runtime.task}
                   {!ownsRun && ' · 所在设备不在线'}
                 </div>
               ))}
