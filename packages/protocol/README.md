@@ -2,7 +2,9 @@
 
 当前版本见 `src/index.ts` 的 `PROTOCOL_VERSION`，导出 TypeScript 类型和 Zod 运行时校验。两端需一起升级。服务适配原生公开事件，不复制 CLI 私有控制协议；该部分由官方 SDK 管理。
 
-协议 26 增加 `approval.reply.executionMode`（仅允许批准 `ExitPlanMode` 时选择 `auto/default/acceptEdits`），`approval.resolved` 记录这一选择。`native.permission.permissionMode` 记录 SDK 报告的运行中模式变更，并同步会话元数据与 `session.updated`；用户提交审批不会提前更改保存的模式。
+协议 27 合并 fork 的计划审批扩展与上游 #198（含 #196）的历史分批传输。两条开发线曾分别使用协议 26，因此本版提升协议号，避免把消息不同的客户端与服务端当成兼容版本。
+
+`approval.reply.executionMode` 仅允许批准 `ExitPlanMode` 时选择 `auto/default/acceptEdits`，`approval.resolved` 记录这一选择。`native.permission.permissionMode` 记录 SDK 报告的运行中模式变更，并同步会话元数据与 `session.updated`；用户提交审批不会提前更改保存的模式。
 
 ## 连接与消息
 
@@ -42,4 +44,8 @@
 
 同一连接的相同 requestId 返回已缓存响应；不同内容返回冲突。`session.create` 和同一会话内 `message.send` 的 requestId 在记录存续期间持久去重，即使跨连接或服务重启也不重复创建/发送；删除记录后该去重信息也删除。其他请求不跨连接自动重试。超时/断连可能发生在服务已接纳请求之后，客户端以恢复历史确认结果，不自动重发。
 
-入站控制请求上限 256 KiB，用户输入最多 16000 字符；历史快照不套用入站命令上限，桌面接收使用 `ws` 的默认上限。分页软预算为 1000 原始事件 / 512 KiB，单个过大轮次仍完整返回，极长单轮仍需后续优化。上游特有内容由服务适配层处理，不复制上游私有控制协议。
+入站控制请求上限 256 KiB，用户输入最多 16000 字符。历史分页软预算为 1000 原始事件 / 512 KiB，单个过大轮次仍完整返回；较大的历史通过 `session.history.part` 交付，`data` 是原快照及捕获的未完成片段组成的 JSON 数组的一段文本。每块最多 32 Ki UTF-16 code units，UTF-8 和 JSON 转义后的消息大小不同；接收端拼接全部文本后解析，不能逐块解析正文。`last` 标记末块。
+
+每个已认证连接同时保留一页历史，最多 4 块在途；接收端以同一 `requestId` 发送 `session.history.next` 确认每块，或以 `session.history.cancel` 取消。它们只作用于本连接的该次读取，不创建普通请求响应。末块确认后才发送原请求的成功 `response`；连续 30 秒没有确认则返回 `history_stalled`。客户端仅由该读取的新块续期，不以无关消息续期。订阅快照组装期间保留同会话的后续事件，应用快照和捕获片段后再按顺序处理；切换时取消旧读取，迟到消息不进入新请求。翻页使用原有 prepend 合并，不改变轮次显示、复制、搜索或全文内容。
+
+历史快照不套用入站命令上限，桌面接收使用 `ws` 的默认上限。实时工具结果等其他出站消息仍按原契约发送。上游特有内容由服务适配层处理，不复制上游私有控制协议。

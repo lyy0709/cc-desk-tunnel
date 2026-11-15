@@ -865,6 +865,8 @@ export default function Conversation({
 }) {
   const turns = useMemo(() => conversation(events), [events]);
   const runtime = sessionRuntime(session, events, connected, native);
+  const shownSession = useRef(session?.id);
+  shownSession.current = session?.id;
   // A compaction under way counts its time in its own line, as a tool does.
   const steps = turns.at(-1)?.steps ?? [];
   const toolAtWork =
@@ -1063,10 +1065,15 @@ export default function Conversation({
         height: scroll.current.scrollHeight,
         top: scroll.current.scrollTop,
       };
-    void loadEarlier().catch(() => setLoadError('更早记录加载失败，请重试'));
+    void loadEarlier().catch((error: unknown) => {
+      if (shownSession.current !== session.id) return;
+      if (error instanceof Error && error.name === 'AbortError') return;
+      setLoadError(error instanceof Error ? error.message : '更早记录加载失败，请重试');
+    });
   };
   useLayoutEffect(() => {
     prependAnchor.current = null;
+    setLoadError('');
     rejoin();
     toEnd();
   }, [session?.id]);
