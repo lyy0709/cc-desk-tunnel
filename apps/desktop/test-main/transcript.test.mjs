@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { conversation } from '../src/transcript.ts';
+import { markdown } from '../src/exportSession.ts';
 
 let sequence = 0;
 const at = (second) => new Date(Date.UTC(2026, 9, 26, 12, 0, second)).toISOString();
@@ -13,6 +14,15 @@ const event = (runId, second, payload) => ({
 });
 const said = (runId, second, messageId, text) =>
   event(runId, second, { type: 'text.delta', messageId, text });
+
+test('attachment-only messages retain their metadata and export full file references', () => {
+  const attachments = [{ path: '/tmp/中文 文件.txt', name: '中文 文件.txt', deviceId: 'device' }];
+  const events = [
+    event('run', 0, { type: 'message.user', messageId: 'file', text: '', attachments }),
+  ];
+  assert.deepEqual(conversation(events)[0].question.attachments, attachments);
+  assert.match(markdown({ title: '附件', projectPath: '/tmp' }, events), /"\/tmp\/中文 文件.txt"/);
+});
 
 test('an automatic compaction is one mark among the steps, with what came after it under it', () => {
   const turns = conversation([

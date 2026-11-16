@@ -34,6 +34,7 @@ contextBridge.exposeInMainWorld('desktop', {
   openWeb: (url) => ipcRenderer.invoke('web:open', url),
   openLink: (url) => ipcRenderer.invoke('link:open', url),
   inspectPath: (path) => ipcRenderer.invoke('path:inspect', path),
+  previewText: (path) => ipcRenderer.invoke('path:preview', path),
   actOnPath: (action, path, options) => ipcRenderer.invoke('path:act', action, path, options),
   workspaceRoots: () => ipcRenderer.invoke('workspace:roots'),
   chooseWorkspace: (reset) => ipcRenderer.invoke('workspace:choose', reset),

@@ -4,6 +4,7 @@ import { test } from 'node:test';
 import {
   PROTOCOL_HISTORY,
   PROTOCOL_VERSION,
+  messageText,
   authSchema,
   runWorking,
   commandSchema,
@@ -81,6 +82,50 @@ test('protocol validates UTF-8 text, IDs and bounded input', () => {
 
 test('the protocol history ends with the current version', () => {
   assert.equal(Object.values(PROTOCOL_HISTORY).at(-1), PROTOCOL_VERSION);
+});
+
+test('file cards serialize to ordinary text and share the existing combined prompt limit', () => {
+  const deviceId = randomUUID();
+  const attachments = ['D:\\中文 空格\\a"b.ts', '/tmp/中文\\引号"换行\n.txt'].map((path) => ({
+    path,
+    name: '文件',
+    deviceId,
+    size: 12,
+  }));
+  const command = {
+    type: 'message.send',
+    requestId: randomUUID(),
+    sessionId: randomUUID(),
+    text: '',
+    attachments,
+  };
+  assert.ok(commandSchema.safeParse(command).success);
+  assert.deepEqual(
+    messageText('', attachments)
+      .split('\n')
+      .map((line) => JSON.parse(line)),
+    attachments.map((file) => file.path),
+  );
+  assert.equal(
+    messageText('正文', attachments),
+    `正文\n\n${attachments.map((file) => JSON.stringify(file.path)).join('\n')}`,
+  );
+  assert.equal(messageText('老消息\n'), '老消息\n');
+  const references = messageText('', attachments).length;
+  assert.ok(
+    commandSchema.safeParse({ ...command, text: 'a'.repeat(16000 - references - 2) }).success,
+  );
+  assert.equal(
+    commandSchema.safeParse({ ...command, text: 'a'.repeat(16001 - references - 2) }).success,
+    false,
+  );
+  for (const file of [
+    { ...attachments[0], deviceId: 'bad' },
+    { ...attachments[0], path: '../other' },
+    { ...attachments[0], size: -1 },
+    { ...attachments[0], content: 'must not travel' },
+  ])
+    assert.equal(commandSchema.safeParse({ ...command, attachments: [file] }).success, false);
 });
 
 test('plan execution modes are bounded independently of the session mode', () => {

@@ -1,4 +1,9 @@
-import type { PermissionMode, SessionEvent, TurnStats } from '@cc-desk-tunnel/protocol';
+import type {
+  FileAttachment,
+  PermissionMode,
+  SessionEvent,
+  TurnStats,
+} from '@cc-desk-tunnel/protocol';
 
 export type ToolState =
   | 'requested'
@@ -15,6 +20,7 @@ export type TranscriptItem =
       id: string;
       runId: string;
       text: string;
+      attachments?: FileAttachment[];
       delivery?: Extract<SessionEvent['payload'], { type: 'message.delivery' }>['status'];
       // Stands for the "continue" button: there is no message of the user's to show, edit or copy.
       continued?: boolean;
@@ -80,6 +86,7 @@ export function transcript(events: SessionEvent[]): TranscriptItem[] {
         id: payload.messageId,
         runId,
         text: payload.continued ? '继续' : payload.text,
+        ...(payload.attachments?.length ? { attachments: payload.attachments } : {}),
         ...(payload.continued ? { continued: true } : {}),
         ...(terminals.has(runId) ? { terminal: true } : {}),
         at,

@@ -258,9 +258,10 @@ async function linkedPath(target) {
   return { file, kind: directory ? 'directory' : 'file', runs, size: found.size };
 }
 handle('path:inspect', async (_event, target) => {
-  const { kind, runs } = await linkedPath(target);
-  return { kind, runs, editors: linkEditors(), openWith: process.platform === 'win32' };
+  const { kind, runs, size } = await linkedPath(target);
+  return { kind, runs, size, editors: linkEditors(), openWith: process.platform === 'win32' };
 });
+handle('path:preview', (_event, target) => fileLinks.previewText(target));
 handle('path:act', async (event, action, target, options) => {
   const { file, kind, runs, size } = await linkedPath(target);
   const { line, column, editor } = options ?? {};

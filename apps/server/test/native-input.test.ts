@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import type { SDKMessage, SDKResultMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { EventPayload } from '@cc-desk-tunnel/protocol';
+import { messageText } from '@cc-desk-tunnel/protocol';
 import { NativeInput } from '../src/native-input.ts';
 
 function fixture() {
@@ -21,6 +22,21 @@ function result(ids: string[], queued = 0) {
     queued_turn_count: queued,
   } as SDKResultMessage;
 }
+
+test('attachment presentation metadata never becomes a custom native message field', async () => {
+  const { input } = fixture();
+  const attachments = [{ name: '脚本.sh', path: '/tmp/中文 "脚本".sh', deviceId: randomUUID() }];
+  input.submit(randomUUID(), messageText('检查脚本', attachments));
+  const stream = input.stream();
+  const native = (await stream.next()).value!;
+  assert.deepEqual(native.message, {
+    role: 'user',
+    content: '检查脚本\n\n"/tmp/中文 \\"脚本\\".sh"',
+  });
+  assert.equal('attachments' in native, false);
+  input.close();
+  await stream.next();
+});
 
 test('streaming additions use the same native session and human message UUIDs', async () => {
   const { input, sessionId, events } = fixture();

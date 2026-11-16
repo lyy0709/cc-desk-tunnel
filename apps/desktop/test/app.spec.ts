@@ -687,13 +687,15 @@ test('Electron remembers the sign-in, connects on the next launch and stays in t
   // Drafts are on disk as soon as they are saved: killing the process does not lose them.
   application = await launch();
   const page = await application.firstWindow();
-  await page.evaluate(() => window.desktop!.saveDrafts({ 会话: '写了很久的草稿' }));
+  await page.evaluate(() =>
+    window.desktop!.saveDrafts({ 会话: { text: '写了很久的草稿', attachments: [] } }),
+  );
   execFileSync('taskkill', ['/pid', String(application.process().pid), '/t', '/f']);
   application = await launch();
   try {
     const page = await application.firstWindow();
     expect(await page.evaluate(() => window.desktop!.loadDrafts())).toEqual({
-      会话: '写了很久的草稿',
+      会话: { text: '写了很久的草稿', attachments: [] },
     });
     // The schedule file exists from the first launch, and an edit made outside the window reaches it,
     // byte-order mark or not.

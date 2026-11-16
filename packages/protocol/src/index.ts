@@ -4,7 +4,7 @@ import { webCertificateStateSchema } from './web-certificate.ts';
 export * from './web.ts';
 export * from './web-certificate.ts';
 
-export const PROTOCOL_VERSION = 27;
+export const PROTOCOL_VERSION = 28;
 // The release each protocol version began with, from 0.2.4 on: a client newer than its service signs in with
 // the service's number to have it upgrade (see the README). A new number adds its line here.
 export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
@@ -26,6 +26,7 @@ export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
   '0.3.14': 25,
   '0.3.15': 26,
   '0.3.17': 27,
+  '0.3.18': 28,
 };
 export const MAX_FRAME_BYTES = 256 * 1024;
 // The longest global instructions edited here, in characters; it keeps a frame of them within MAX_FRAME_BYTES.
@@ -48,6 +49,26 @@ function withoutTrailing(path: string, separator: string) {
   return path.slice(0, end);
 }
 const timestamp = z.iso.datetime();
+export const fileAttachmentSchema = z
+  .object({
+    path: z
+      .string()
+      .min(1)
+      .max(16000)
+      .refine((value) => !value.includes('\0') && (value.startsWith('/') || isWindowsPath(value))),
+    name: z.string().min(1).max(1024),
+    size: z.number().int().nonnegative().optional(),
+    deviceId: id,
+  })
+  .strict();
+export type FileAttachment = z.infer<typeof fileAttachmentSchema>;
+// Cards are presentation metadata. The native process still receives ordinary text and file references.
+export function messageText(text: string, attachments: readonly FileAttachment[] = []) {
+  if (!attachments.length) return text;
+  return [text, attachments.map((file) => JSON.stringify(file.path)).join('\n')]
+    .filter(Boolean)
+    .join('\n\n');
+}
 // `bypassPermissions` asks about nothing at all; the client offers it only once the user allowed that.
 export const permissionModeSchema = z.enum([
   'auto',
@@ -275,6 +296,7 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     type: z.literal('message.user'),
     messageId: id,
     text: z.string(),
+    attachments: z.array(fileAttachmentSchema).optional(),
     scenario: scenarioSchema,
     // Sent by the "continue" button rather than written: the page shows a mark in place of the text.
     continued: z.boolean().optional(),
@@ -767,10 +789,15 @@ export const commandSchema = z.discriminatedUnion('type', [
       type: z.literal('message.send'),
       ...request,
       sessionId: id,
-      text: z.string().trim().min(1).max(16000),
+      text: z.string().trim().max(16000),
+      attachments: z.array(fileAttachmentSchema).optional(),
       scenario: scenarioSchema.default('chat'),
     })
-    .strict(),
+    .strict()
+    .refine((value) => {
+      const length = messageText(value.text, value.attachments).length;
+      return length > 0 && length <= 16000;
+    }, '正文与文件路径合计须为 1–16000 字符'),
   z.object({ type: z.literal('run.cancel'), ...request, sessionId: id, runId: id }).strict(),
   // Takes up a session whose last turn was stopped or cut off, without the user writing a message.
   z.object({ type: z.literal('run.continue'), ...request, sessionId: id }).strict(),

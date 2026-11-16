@@ -1,30 +1,66 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { fileAttachmentSchema } from '@cc-desk-tunnel/protocol';
+import type { FileAttachment } from '@cc-desk-tunnel/protocol';
 
 // Unsent text is the user's work: it is kept per session and written to disk shortly after every edit,
 // so switching sessions, closing the window or a crash does not lose it.
-export type Drafts = Record<string, string>;
+export type Draft = {
+  text: string;
+  attachments: FileAttachment[];
+  // In-flight local reads belong to the draft's session, but do not survive a window restart.
+  adding?: number;
+  attachmentError?: string;
+};
+export type Drafts = Record<string, Draft>;
+export const emptyDraft: Draft = { text: '', attachments: [] };
 const storageKey = 'proxy-drafts';
 const delay = 300;
 
-function clean(value: unknown): Drafts {
+export function cleanDrafts(value: unknown): Drafts {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return Object.fromEntries(
-    Object.entries(value).filter((entry): entry is [string, string] => {
-      return typeof entry[1] === 'string' && entry[1] !== '';
+    Object.entries(value).flatMap(([id, saved]) => {
+      if (typeof saved === 'string') return [[id, { text: saved, attachments: [] }]];
+      if (
+        !saved ||
+        typeof saved !== 'object' ||
+        !('text' in saved) ||
+        typeof saved.text !== 'string'
+      )
+        return [];
+      const files = fileAttachmentSchema
+        .array()
+        .safeParse('attachments' in saved ? saved.attachments : []);
+      return [[id, { text: saved.text, attachments: files.success ? files.data : [] }]];
     }),
   );
 }
+export function withoutSentDraft(current: Draft, sent: Draft): Draft {
+  return {
+    ...current,
+    text: current.text === sent.text ? '' : current.text,
+    attachments: current.attachments.filter((file) => !sent.attachments.includes(file)),
+    ...(sent.attachmentError && current.attachmentError === sent.attachmentError
+      ? { attachmentError: '' }
+      : {}),
+  };
+}
 async function load(): Promise<Drafts> {
   try {
-    if (window.desktop) return clean(await window.desktop.loadDrafts());
-    return clean(JSON.parse(localStorage.getItem(storageKey) ?? '{}'));
+    if (window.desktop) return cleanDrafts(await window.desktop.loadDrafts());
+    return cleanDrafts(JSON.parse(localStorage.getItem(storageKey) ?? '{}'));
   } catch {
     return {};
   }
 }
 function store(drafts: Drafts) {
-  if (window.desktop) void window.desktop.saveDrafts(drafts).catch(() => {});
-  else localStorage.setItem(storageKey, JSON.stringify(drafts));
+  const saved = Object.fromEntries(
+    Object.entries(drafts)
+      .filter(([, draft]) => draft.text || draft.attachments.length)
+      .map(([id, { text, attachments }]) => [id, { text, attachments }]),
+  );
+  if (window.desktop) void window.desktop.saveDrafts(saved).catch(() => {});
+  else localStorage.setItem(storageKey, JSON.stringify(saved));
 }
 
 export function useDrafts() {
@@ -41,7 +77,7 @@ export function useDrafts() {
   const change = useCallback(
     (update: (drafts: Drafts) => Drafts) => {
       setDrafts((current) => {
-        const next = clean(update(current));
+        const next = update(current);
         latest.current = next;
         return next;
       });
@@ -64,9 +100,22 @@ export function useDrafts() {
       flush();
     };
   }, [change, flush]);
-  const setDraft = useCallback(
-    (sessionId: string, text: string) => change((current) => ({ ...current, [sessionId]: text })),
+  const updateDraft = useCallback(
+    (sessionId: string, update: (draft: Draft) => Draft) =>
+      change((current) => ({
+        ...current,
+        [sessionId]: update(current[sessionId] ?? emptyDraft),
+      })),
     [change],
   );
-  return [drafts, setDraft] as const;
+  const setDraft = useCallback(
+    (sessionId: string, text: string, attachments?: FileAttachment[]) =>
+      updateDraft(sessionId, (current) => ({
+        ...current,
+        text,
+        attachments: attachments ?? current.attachments,
+      })),
+    [updateDraft],
+  );
+  return [drafts, setDraft, updateDraft] as const;
 }

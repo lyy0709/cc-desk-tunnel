@@ -31,6 +31,7 @@ import {
   historyControlSchema,
   leaveSchema,
   MAX_FRAME_BYTES,
+  messageText,
   pathKey,
   platformOf,
   PROTOCOL_VERSION,
@@ -1403,13 +1404,27 @@ export function createProxyServer(options: ServerOptions) {
     const text =
       command.type === 'session.compact' ? '/compact' : continued ? CONTINUE : command.text;
     const scenario = command.type === 'message.send' ? command.scenario : 'chat';
+    const attachments = command.type === 'message.send' ? (command.attachments ?? []) : [];
     // A repeated request ID is the same message arriving again, not a second message.
     const existing = store.userMessage(command.sessionId, command.requestId);
     if (existing?.payload.type === 'message.user') {
-      if (existing.payload.text !== text || existing.payload.scenario !== scenario)
+      if (
+        existing.payload.text !== text ||
+        existing.payload.scenario !== scenario ||
+        JSON.stringify(existing.payload.attachments ?? []) !== JSON.stringify(attachments)
+      )
         throw new DomainError('request_conflict', '请求 ID 已被其他内容使用。');
       return;
     }
+    if (
+      attachments.length &&
+      (!peer?.device ||
+        peer.browser ||
+        (session.device && session.device.id !== peer.device.id) ||
+        attachments.some((file) => file.deviceId !== peer.device!.id))
+    )
+      throw new DomainError('attachment_device', '只能向本机执行的会话添加这台电脑上的文件。');
+    const prompt = messageText(text, attachments);
     if (session.activeRun) {
       const active = runs.get(command.sessionId);
       if (!options.claude || command.type !== 'message.send' || !active?.input)
@@ -1418,8 +1433,14 @@ export function createProxyServer(options: ServerOptions) {
         throw new DomainError('run_finishing', '原生运行正在停止，请稍后发送。');
       active.input.assertWritable();
       peer?.subscriptions.add(command.sessionId);
-      emit(active, { type: 'message.user', messageId: command.requestId, text, scenario });
-      active.input.submit(command.requestId, store.notice(command.sessionId) + text);
+      emit(active, {
+        type: 'message.user',
+        messageId: command.requestId,
+        text,
+        scenario,
+        ...(attachments.length ? { attachments } : {}),
+      });
+      active.input.submit(command.requestId, store.notice(command.sessionId) + prompt);
       // A message sent while Claude waits on its question is the user's answer in the chat instead.
       for (const approvalId of [...active.questions])
         answerApproval(active, approvalId, false, undefined, 'replied_in_chat', peer?.id);
@@ -1450,18 +1471,19 @@ export function createProxyServer(options: ServerOptions) {
       messageId: command.requestId,
       text,
       scenario,
+      ...(attachments.length ? { attachments } : {}),
       ...(continued ? { continued } : {}),
     });
     emit(run, { type: 'run.status', status: 'running', connectionId: run.connectionId });
     // What Claude's system prompt no longer has right is told to it with this message; the transcript shows the
     // user's own text.
-    run.input?.submit(command.requestId, store.notice(command.sessionId) + text);
+    run.input?.submit(command.requestId, store.notice(command.sessionId) + prompt);
     track(
       options.claude
         ? native(run)
         : simulate(
             run,
-            { ...command, type: 'message.send', text, scenario },
+            { ...command, type: 'message.send', text: prompt, scenario },
             {
               stepMs: options.stepMs ?? 110,
               projectPath: () => store.get(run.sessionId).session.projectPath,

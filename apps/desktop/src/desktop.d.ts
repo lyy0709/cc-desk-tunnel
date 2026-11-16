@@ -57,9 +57,13 @@ declare global {
       inspectPath: (path: string) => Promise<{
         kind: 'file' | 'directory' | 'missing';
         runs: boolean;
+        size: number;
         editors: { scheme: string; name: string }[];
         openWith: boolean;
       }>;
+      previewText: (
+        path: string,
+      ) => Promise<{ kind: 'text'; text: string; truncated: boolean } | { kind: 'unsupported' }>;
       // Does something with a linked path; what to tell the user, or ''.
       actOnPath: (
         action: 'open' | 'default' | 'editor' | 'with' | 'reveal' | 'content' | 'save',
@@ -74,8 +78,8 @@ declare global {
       removeWorkspace: (directory: string) => Promise<void>;
       loadLogin: () => Promise<import('./LoginPage.tsx').ConnectionForm | null>;
       saveLogin: (login: import('./LoginPage.tsx').ConnectionForm) => Promise<void>;
-      loadDrafts: () => Promise<Record<string, string>>;
-      saveDrafts: (drafts: Record<string, string>) => Promise<void>;
+      loadDrafts: () => Promise<unknown>;
+      saveDrafts: (drafts: import('./drafts.ts').Drafts) => Promise<void>;
       loadSchedules: (initial: string) => Promise<{ path: string; text: string }>;
       saveSchedules: (text: string) => Promise<void>;
       onSchedulesChanged: (callback: (text: string) => void) => () => void;

@@ -22,6 +22,11 @@ import type {
   PermissionMode,
   Session,
 } from '@cc-desk-tunnel/protocol';
+import { pathKey } from '@cc-desk-tunnel/protocol';
+import type { FileAttachment } from '@cc-desk-tunnel/protocol';
+import type { Draft } from './drafts.ts';
+import Attachments from './Attachments.tsx';
+import { folderName } from './paths.ts';
 import { slashCommands } from './commands.ts';
 import ComposerControls from './ComposerControls.tsx';
 import PermissionMenu from './PermissionMenu.tsx';
@@ -59,7 +64,9 @@ export default function Composer({
   projectName,
   chooseProject,
   draft,
-  setDraft,
+  updateDraft,
+  deviceId,
+  attachmentDeviceId,
   native,
   localProject,
   showChanges,
@@ -91,8 +98,10 @@ export default function Composer({
   projectName: string | null;
   // Opens the list of projects the session can be moved to; absent while it cannot be moved.
   chooseProject?: (position: MenuPosition) => void;
-  draft: string;
-  setDraft: (text: string) => void;
+  draft: Draft;
+  updateDraft: (update: (draft: Draft) => Draft) => void;
+  deviceId?: string;
+  attachmentDeviceId?: string;
   native: boolean;
   localProject: boolean;
   showChanges: () => void;
@@ -126,6 +135,8 @@ export default function Composer({
   stop: () => void;
 }) {
   const input = useRef<HTMLTextAreaElement>(null);
+  const setDraft = (text: string) => updateDraft((current) => ({ ...current, text }));
+  const canAttach = !!window.desktop && !!attachmentDeviceId && !inputDisabled;
   const branch = useBranch(localProject ? session.projectPath : null, !!session.activeRun);
   const [dropping, setDropping] = useState(false);
   // The command menu: this window's own actions, then Claude Code's commands that fit what follows the slash. Enter
@@ -133,7 +144,7 @@ export default function Composer({
   // Until the keys pick one, the first that can be used is picked.
   const [pick, setPick] = useState<number | null>(null);
   const menu = useRef<HTMLDivElement>(null);
-  const typed = slashOpen ? draft.slice(1).toLowerCase() : '';
+  const typed = slashOpen ? draft.text.slice(1).toLowerCase() : '';
   const items: {
     key: string;
     icon: ReactNode;
@@ -160,8 +171,8 @@ export default function Composer({
             <RefreshCw />
           ),
         title: action.title,
-        detail: action.reason || action.detail,
-        disabled: !!action.reason,
+        detail: draft.adding ? '正在添加文件' : action.reason || action.detail,
+        disabled: !!action.reason || !!draft.adding,
         run: () => send(`/${action.name}`),
       })),
     ...(slashOpen ? slashCommands(capabilities, typed) : []).map((command) => ({
@@ -174,7 +185,7 @@ export default function Composer({
         </>
       ),
       detail: command.description,
-      disabled: inputDisabled,
+      disabled: inputDisabled || !!draft.adding,
       run: () => send(`/${command.name}`),
       fill: `/${command.name} `,
     })),
@@ -200,41 +211,62 @@ export default function Composer({
     if (!input.current) return;
     input.current.style.height = 'auto';
     input.current.style.height = `${input.current.scrollHeight}px`;
-  }, [draft, session.id]);
-  // A file reaches Claude as its Windows path in the message: Claude reads it through the execution channel,
-  // the same way it reads the project.
-  function attach(paths: string[]) {
-    if (!paths.length) return;
-    const box = input.current;
-    // The box holds what is typed right now; a picture is attached a moment after it was pasted.
-    const current = box ? box.value : draft;
-    const at = box ? box.selectionStart : current.length;
-    const before = current.slice(0, at);
-    const text = paths.map((path) => `"${path}"`).join(' ');
-    const lead = before && !/\s$/.test(before) ? ' ' : '';
-    setDraft(`${before}${lead}${text} ${current.slice(at)}`);
-    box?.focus();
-  }
-  const shown = useRef(session.id);
-  shown.current = session.id;
-  // Files copied in Explorer have a path. A picture that is only on the clipboard (a screenshot, an image
-  // copied from a page) has none: the client saves it on this computer and its path is attached like any other.
-  async function paste(files: File[]) {
-    const pasted = session.id;
-    const found: string[] = [];
-    for (const file of files) {
-      const path = window.desktop!.pathForFile(file);
-      if (path) found.push(path);
-      else if (file.type.startsWith('image/'))
+  }, [draft.text, session.id]);
+  async function attach(source: Promise<string[]> | File[]) {
+    if (!canAttach) return;
+    const owner = attachmentDeviceId!;
+    updateDraft((current) => ({
+      ...current,
+      adding: (current.adding ?? 0) + 1,
+      attachmentError: '',
+    }));
+    try {
+      const found: FileAttachment[] = [];
+      const errors: string[] = [];
+      for (const file of await source) {
+        let path = typeof file === 'string' ? file : window.desktop!.pathForFile(file);
+        const name = typeof file === 'string' ? folderName(file) : file.name;
         try {
-          found.push(
-            await window.desktop!.saveImage(file.type, new Uint8Array(await file.arrayBuffer())),
-          );
-        } catch {
-          // A picture that could not be saved is left out; the rest is still attached.
+          if (!path && typeof file !== 'string' && file.type.startsWith('image/'))
+            path = await window.desktop!.saveImage(
+              file.type,
+              new Uint8Array(await file.arrayBuffer()),
+            );
+          if (!path) throw new Error('没有可用的本机文件路径。');
+          const attachment: FileAttachment = { path, name: folderName(path), deviceId: owner };
+          found.push(attachment);
+          const info = await window.desktop!.inspectPath(path);
+          if (info.kind !== 'file') throw new Error('本机找不到这个文件。');
+          attachment.size = info.size;
+        } catch (error) {
+          errors.push(`${name}：${error instanceof Error ? error.message : '添加失败'}`);
         }
+      }
+      updateDraft((current) => {
+        const keys = new Set(
+          current.attachments.map((file) => `${file.deviceId}:${pathKey(file.path)}`),
+        );
+        const added = found.filter((file) => {
+          const key = `${file.deviceId}:${pathKey(file.path)}`;
+          if (keys.has(key)) return false;
+          keys.add(key);
+          return true;
+        });
+        return {
+          ...current,
+          attachments: [...current.attachments, ...added],
+          attachmentError: errors.join('\n'),
+        };
+      });
+      input.current?.focus();
+    } catch (error) {
+      updateDraft((current) => ({
+        ...current,
+        attachmentError: error instanceof Error ? error.message : '添加文件失败。',
+      }));
+    } finally {
+      updateDraft((current) => ({ ...current, adding: current.adding! - 1 }));
     }
-    if (shown.current === pasted) attach(found);
   }
   return (
     <div className="composer-area">
@@ -291,25 +323,48 @@ export default function Composer({
         )}
       </div>
       <form
-        className={`composer ${dropping ? 'dropping' : ''}`}
+        className={`composer ${dropping ? 'dropping' : ''}${draft.attachments.length ? ' with-attachments' : ''}`}
         onSubmit={(event) => {
           event.preventDefault();
           send();
         }}
         onDragOver={(event) => {
-          if (!window.desktop || inputDisabled || !event.dataTransfer.types.includes('Files'))
-            return;
+          if (!canAttach || !event.dataTransfer.types.includes('Files')) return;
           event.preventDefault();
           setDropping(true);
         }}
         onDragLeave={() => setDropping(false)}
         onDrop={(event) => {
           setDropping(false);
-          if (!window.desktop || inputDisabled || !event.dataTransfer.files.length) return;
+          if (!canAttach || !event.dataTransfer.files.length) return;
           event.preventDefault();
-          void paste([...event.dataTransfer.files]);
+          void attach([...event.dataTransfer.files]);
         }}
       >
+        {draft.attachments.length > 0 && (
+          <Attachments
+            files={draft.attachments}
+            deviceId={deviceId}
+            disabled={inputDisabled}
+            remove={(file) =>
+              updateDraft((current) => ({
+                ...current,
+                attachments: current.attachments.filter((item) => item !== file),
+                attachmentError: '',
+              }))
+            }
+          />
+        )}
+        {!!draft.adding && (
+          <p className="attachment-pending" role="status">
+            正在添加文件…
+          </p>
+        )}
+        {draft.attachmentError && (
+          <p className="attachment-error" role="alert">
+            {draft.attachmentError}
+          </p>
+        )}
         <textarea
           ref={input}
           aria-label="消息"
@@ -318,7 +373,7 @@ export default function Composer({
               ? '会话在终端中打开，关闭终端后可以在这里接着聊'
               : '随心输入…'
           }
-          value={draft}
+          value={draft.text}
           disabled={inputDisabled}
           maxLength={16000}
           rows={2}
@@ -329,7 +384,7 @@ export default function Composer({
           }}
           onPaste={(event) => {
             // Pasted text is left to the browser, also when a program put a picture of it beside the text.
-            if (!window.desktop || !event.clipboardData.files.length) return;
+            if (!canAttach || !event.clipboardData.files.length) return;
             const files = [...event.clipboardData.files];
             const text = event.clipboardData.getData('text/plain');
             const usable = files.filter(
@@ -338,7 +393,7 @@ export default function Composer({
             );
             if (!usable.length) return;
             event.preventDefault();
-            void paste(usable);
+            void attach(usable);
           }}
           onKeyDown={(event) => {
             if (event.key === 'Escape') {
@@ -366,10 +421,10 @@ export default function Composer({
         <div className="composer-toolbar">
           {window.desktop && (
             <IconButton
-              title="添加文件：把文件的路径放进消息"
+              title={attachmentDeviceId ? '添加文件' : '只能向本机执行的会话添加文件'}
               className="attach-button"
-              disabled={inputDisabled}
-              onClick={() => void window.desktop!.chooseFiles().then(attach)}
+              disabled={!canAttach}
+              onClick={() => void attach(window.desktop!.chooseFiles())}
             >
               <Plus />
             </IconButton>
@@ -426,7 +481,7 @@ export default function Composer({
                 <Square />
               </IconButton>
             )}
-          {resume && !draft.trim() ? (
+          {resume && !draft.text.trim() && !draft.attachments.length && !draft.adding ? (
             <IconButton title="接着上一轮继续" className="send-button" onClick={resume}>
               <Play />
             </IconButton>
@@ -437,7 +492,11 @@ export default function Composer({
                 className="icon-button send-button"
                 aria-label="发送消息"
                 title="发送消息"
-                disabled={!draft.trim() || inputDisabled}
+                disabled={
+                  (!draft.text.trim() && !draft.attachments.length) ||
+                  inputDisabled ||
+                  !!draft.adding
+                }
               >
                 <ArrowUp />
               </button>

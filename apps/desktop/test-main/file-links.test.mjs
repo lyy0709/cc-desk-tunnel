@@ -2,10 +2,56 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { createRequire } from 'node:module';
 import { posix, win32 } from 'node:path';
+import { join } from 'node:path';
+import { mkdtempSync, writeFileSync, rmSync, existsSync, mkdirSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 
-const { editorUrl, runs, localPath, pictureOf } = createRequire(import.meta.url)(
+const { editorUrl, runs, localPath, pictureOf, previewText } = createRequire(import.meta.url)(
   '../electron/file-links.cjs',
 );
+
+test('text preview is bounded, decodes BOMs, and never executes scripts or parses document containers', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'ccdt-preview-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const marker = join(root, 'executed');
+  const script = join(root, '中文 "脚本".sh');
+  const source = `#!/bin/sh\nprintf unexpected > "${marker}"\n`;
+  writeFileSync(script, source, { mode: 0o755 });
+  assert.deepEqual(await previewText(script), { kind: 'text', text: source, truncated: false });
+  assert.equal(existsSync(marker), false);
+  for (const [name, bytes] of [
+    ['utf8.txt', Buffer.from('\ufeff中文\n')],
+    ['utf16le.txt', Buffer.from('\ufeff中文\n', 'utf16le')],
+    ['utf16be.txt', Buffer.from('\ufeff中文\n', 'utf16le').swap16()],
+  ]) {
+    writeFileSync(join(root, name), bytes);
+    assert.equal((await previewText(join(root, name))).text, '中文\n');
+  }
+  writeFileSync(join(root, 'large.txt'), '汉'.repeat(400000));
+  const large = await previewText(join(root, 'large.txt'));
+  assert.equal(large.truncated, true);
+  assert.ok(Buffer.byteLength(large.text) <= 1024 * 1024);
+  assert.ok(!large.text.includes('\ufffd'));
+  writeFileSync(join(root, 'lines.txt'), 'line\n'.repeat(10000));
+  assert.equal((await previewText(join(root, 'lines.txt'))).truncated, false);
+  writeFileSync(join(root, 'lines.txt'), 'line\n'.repeat(10002));
+  const lines = await previewText(join(root, 'lines.txt'));
+  assert.equal(lines.truncated, true);
+  assert.equal(lines.text.split('\n').length, 10000);
+  for (const [name, bytes] of [
+    ['binary', Buffer.from([1, 0, 255])],
+    ['report.pdf', '%PDF-test'],
+    ['report.docx', 'ZIP container'],
+  ]) {
+    writeFileSync(join(root, name), bytes);
+    assert.deepEqual(await previewText(join(root, name)), { kind: 'unsupported' });
+  }
+  mkdirSync(join(root, 'directory'));
+  await assert.rejects(previewText(join(root, 'directory')), /普通文件/);
+  await assert.rejects(previewText(join(root, 'missing')), { code: 'ENOENT' });
+  await assert.rejects(previewText('../outside'), /本机/);
+  await assert.rejects(previewText('//server/share/file'), /本机/);
+});
 
 test('an editor opens a file at a line from its own address', () => {
   assert.equal(editorUrl('vscode', 'C:\\a b\\#1.ts', 12, 3), 'vscode://file/C:/a%20b/%231.ts:12:3');

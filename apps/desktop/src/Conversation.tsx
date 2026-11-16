@@ -1,6 +1,8 @@
 import {
   lazy,
+  memo,
   Suspense,
+  useCallback,
   useContext,
   useEffect,
   useLayoutEffect,
@@ -30,7 +32,14 @@ import {
   Wrench,
   X,
 } from 'lucide-react';
-import type { PlanExecutionMode, Session, SessionEvent } from '@cc-desk-tunnel/protocol';
+import { messageText } from '@cc-desk-tunnel/protocol';
+import type {
+  FileAttachment,
+  PlanExecutionMode,
+  Session,
+  SessionEvent,
+} from '@cc-desk-tunnel/protocol';
+import Attachments from './Attachments.tsx';
 import { describe, duration, summarize } from './activity.ts';
 import type { Category } from './activity.ts';
 import type { HistoryState, TaskProgress } from './client.ts';
@@ -46,6 +55,7 @@ import { CopyButton, copyText } from './copy.tsx';
 import { messageTime } from './messageTime.ts';
 import TurnStats from './TurnStats.tsx';
 import ConversationFind, { SearchExpanded } from './ConversationFind.tsx';
+import ConversationNav from './ConversationNav.tsx';
 import { IconButton, Menu, Modal } from './ui.tsx';
 import type { MenuItem, MenuPosition } from './ui.tsx';
 import { LinkPlace, linkTarget } from './links.ts';
@@ -581,16 +591,15 @@ function WorkGroup({
 // closes a turn: copy, the turn's figures and the time, always shown on the latest. Replies said along the way have
 // nothing under them. A delivery that did not plainly arrive stays in sight. Replies of the simulated service keep the
 // heading, which says they are not real.
-function Message({
-  item,
+const Message = memo(function Message({
   native,
   edit,
   footer,
   closing = false,
   latest = false,
   joined = false,
-}: {
-  item: Text;
+  ...item
+}: Text & {
   native: boolean;
   edit?: (item: Text) => void;
   footer?: ReactNode;
@@ -601,13 +610,18 @@ function Message({
 }) {
   const time = messageTime(item.kind === 'assistant' ? (item.doneAt ?? item.at) : item.at);
   const user = item.kind === 'user';
+  const deviceId = useContext(LinkPlace)?.deviceId;
+  const copied = messageText(item.text, item.attachments);
   const stamp = time && (
     <time className="message-time" dateTime={item.at} title={time.full}>
       {time.short}
     </time>
   );
   return (
-    <article className={`message ${item.kind}${latest ? ' latest' : ''}${joined ? ' joined' : ''}`}>
+    <article
+      className={`message ${item.kind}${latest ? ' latest' : ''}${joined ? ' joined' : ''}`}
+      data-copy-text={copied}
+    >
       {!user && !native && (
         <div className="message-label">
           CC Desk Tunnel
@@ -616,9 +630,14 @@ function Message({
           <CopyButton text={item.text} />
         </div>
       )}
-      <div className="message-content" data-search-content data-copy-text={item.text}>
-        {user ? <p>{item.text}</p> : <Rich text={item.text} />}
-      </div>
+      {(!user || item.text) && (
+        <div className="message-content" data-search-content data-copy-text={copied}>
+          {user ? <p>{item.text}</p> : <Rich text={item.text} />}
+        </div>
+      )}
+      {user && !!item.attachments?.length && (
+        <Attachments files={item.attachments} deviceId={deviceId} />
+      )}
       {user && (
         <div className="message-footer">
           {item.terminal && (
@@ -655,7 +674,7 @@ function Message({
               <Pencil />
             </button>
           )}
-          <CopyButton text={item.text} />
+          <CopyButton text={copied} />
         </div>
       )}
       {!user && native && closing && (
@@ -667,7 +686,7 @@ function Message({
       )}
     </article>
   );
-}
+});
 
 // A compaction of the context, in its place among the steps: under way with its timer, then what it compacted.
 function CompactMark({ item, active, now }: { item: Compact; active: boolean; now: number }) {
@@ -715,6 +734,20 @@ function heldOpen(turns: Turn[], index: number) {
   return last > index && !turns[last].endedAt;
 }
 
+// Rebuilding the transcript creates new records even for unchanged history. Compare its plain data
+// without copying large tool outputs into serialized strings on each streamed update.
+function sameTurn(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (!a || !b || typeof a !== 'object' || typeof b !== 'object') return false;
+  const left = a as Record<string, unknown>;
+  const right = b as Record<string, unknown>;
+  const keys = Object.keys(left);
+  return (
+    keys.length === Object.keys(right).length &&
+    keys.every((key) => Object.hasOwn(right, key) && sameTurn(left[key], right[key]))
+  );
+}
+
 function TurnView({
   turn,
   native,
@@ -754,15 +787,16 @@ function TurnView({
           />
         )
       ) : (
-        <Message key={step.id} item={step} native={native} />
+        <Message key={step.id} {...step} native={native} />
       ),
     );
   return (
     <>
+      <div className="turn-anchor" data-turn-id={turn.id} aria-hidden="true" />
       {/* "Continue" without the turn it takes up, which is on an earlier page, shows nothing for itself. */}
       {turn.question && !turn.question.continued && (
         <Message
-          item={turn.question}
+          {...turn.question}
           native={native}
           edit={turn.joined ? undefined : live.edit}
           joined={turn.joined}
@@ -788,7 +822,7 @@ function TurnView({
           )}
       {turn.answer ? (
         <Message
-          item={turn.answer}
+          {...turn.answer}
           native={native}
           closing
           latest={latest}
@@ -830,11 +864,13 @@ export default function Conversation({
   edit,
   findRequest,
   here,
+  deviceId,
   reviewing = false,
 }: {
   session: Session | undefined;
   // This window can open the files of the session's project: a desktop on the computer they are on.
   here: boolean;
+  deviceId?: string;
   reviewing?: boolean;
   events: SessionEvent[];
   history: HistoryState | undefined;
@@ -858,7 +894,12 @@ export default function Conversation({
     executionMode?: PlanExecutionMode,
     // Whether the answer reached the service.
   ) => Promise<boolean>;
-  edit?: (messageId: string, text: string, deliveryStatus?: Text['delivery']) => void;
+  edit?: (
+    messageId: string,
+    text: string,
+    deliveryStatus?: Text['delivery'],
+    attachments?: FileAttachment[],
+  ) => void;
   clock: Clock;
   // What the session's background tasks last said of themselves, by task.
   progress: Record<string, TaskProgress> | undefined;
@@ -906,9 +947,10 @@ export default function Conversation({
             projectPath: session.projectPath,
             here: here && !!window.desktop,
             browser: !window.desktop,
+            deviceId,
           }
         : null,
-    [session?.projectPath, here],
+    [session?.projectPath, here, deviceId],
   );
   const [linkCard, setLinkCard] = useState<LinkCard | null>(null);
   const resting = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -969,7 +1011,7 @@ export default function Conversation({
   const [answered, setAnswered] = useState<ReadonlySet<string>>(new Set());
   // A press on a task's buttons holds them until the call returns; should nothing come of it, they are offered again.
   const [taskSent, setTaskSent] = useState<ReadonlySet<string>>(new Set());
-  const sendTask = (toolId: string) => {
+  const sendTask = useCallback((toolId: string) => {
     setTaskSent((value) => new Set(value).add(toolId));
     setTimeout(
       () =>
@@ -980,54 +1022,105 @@ export default function Conversation({
         }),
       5000,
     );
-  };
-  const live: Live = {
-    now,
-    busy,
-    answered: (tool) => !!tool.approvalId && answered.has(tool.approvalId),
-    canApprove: (tool) =>
-      connected &&
-      ownsRun &&
-      session?.activeRun?.id === tool.runId &&
-      !tool.resolved &&
-      !!tool.approvalId,
-    reply: (tool, allowed, answers, executionMode) => {
-      const id = tool.approvalId!;
-      if (answering.current.has(id)) return;
-      answering.current.add(id);
-      setAnswered((value) => new Set(value).add(id));
-      void replyApproval(tool.runId, id, allowed, answers, executionMode).then((sent) => {
-        if (sent) return;
-        answering.current.delete(id);
-        setAnswered((value) => {
-          const rest = new Set(value);
-          rest.delete(id);
-          return rest;
-        });
-      });
-    },
-    edit: edit && !running ? (item) => edit(item.id, item.text, item.delivery) : undefined,
-    taskControl: (tool) =>
-      connected &&
-      ownsRun &&
-      session?.activeRun?.id === tool.runId &&
-      tool.taskId &&
-      !tool.endedAt &&
-      // A command over in a moment is not worth buttons that would flash.
-      now - Date.parse(tool.at) >= 3000
-        ? taskSent.has(tool.id)
-          ? 'sent'
-          : 'ready'
-        : undefined,
-    endTool: (tool) => {
-      sendTask(tool.id);
-      stopTask(tool.taskId!);
-    },
-    backgroundTool: (tool) => {
-      sendTask(tool.id);
-      backgroundTask(tool.id);
-    },
-  };
+  }, []);
+  const actions = useRef({ edit, replyApproval, stopTask, backgroundTask });
+  useLayoutEffect(() => {
+    actions.current = { edit, replyApproval, stopTask, backgroundTask };
+  }, [edit, replyApproval, stopTask, backgroundTask]);
+  const editMessage = useCallback((item: Text) => {
+    actions.current.edit?.(item.id, item.text, item.delivery, item.attachments);
+  }, []);
+  const editable = !!edit && !running;
+  const activeRun = session?.activeRun?.id;
+  const live = useMemo<Live>(
+    () => ({
+      now,
+      busy,
+      answered: (tool) => !!tool.approvalId && answered.has(tool.approvalId),
+      canApprove: (tool) =>
+        connected && ownsRun && activeRun === tool.runId && !tool.resolved && !!tool.approvalId,
+      reply: (tool, allowed, answers, executionMode) => {
+        const id = tool.approvalId!;
+        if (answering.current.has(id)) return;
+        answering.current.add(id);
+        setAnswered((value) => new Set(value).add(id));
+        void actions.current
+          .replyApproval(tool.runId, id, allowed, answers, executionMode)
+          .then((sent) => {
+            if (sent) return;
+            answering.current.delete(id);
+            setAnswered((value) => {
+              const rest = new Set(value);
+              rest.delete(id);
+              return rest;
+            });
+          });
+      },
+      edit: editable ? editMessage : undefined,
+      taskControl: (tool) =>
+        connected &&
+        ownsRun &&
+        activeRun === tool.runId &&
+        tool.taskId &&
+        !tool.endedAt &&
+        // A command over in a moment is not worth buttons that would flash.
+        now - Date.parse(tool.at) >= 3000
+          ? taskSent.has(tool.id)
+            ? 'sent'
+            : 'ready'
+          : undefined,
+      endTool: (tool) => {
+        sendTask(tool.id);
+        actions.current.stopTask(tool.taskId!);
+      },
+      backgroundTool: (tool) => {
+        sendTask(tool.id);
+        actions.current.backgroundTask(tool.id);
+      },
+    }),
+    [now, busy, answered, connected, ownsRun, activeRun, editable, editMessage, taskSent, sendTask],
+  );
+  const rows = useRef<{
+    live: Live;
+    native: boolean;
+    entries: Map<string, { turn: Turn; latest: boolean; held: boolean; element: ReactNode }>;
+  } | null>(null);
+  const renderedTurns = useMemo(() => {
+    const previous = rows.current;
+    const entries: NonNullable<typeof previous>['entries'] = new Map();
+    const elements = turns.map((turn, index) => {
+      const latest = index === turns.length - 1;
+      const held = heldOpen(turns, index);
+      const old =
+        previous?.live === live && previous.native === native
+          ? previous.entries.get(turn.id)
+          : undefined;
+      // Reuse the element as well as its message bodies: a streamed fragment should not create and
+      // reconcile a thousand unchanged rows. Replacing the map drops rows from the previous page/session.
+      const entry =
+        old && old.latest === latest && old.held === held && sameTurn(old.turn, turn)
+          ? old
+          : {
+              turn,
+              latest,
+              held,
+              element: (
+                <TurnView
+                  key={turn.id}
+                  turn={turn}
+                  native={native}
+                  live={live}
+                  latest={latest}
+                  held={held}
+                />
+              ),
+            };
+      entries.set(turn.id, entry);
+      return entry.element;
+    });
+    rows.current = { live, native, entries };
+    return elements;
+  }, [turns, live, native]);
   const scroll = useRef<HTMLDivElement>(null);
   // The view follows new output until the reader moves up from the end, and again once they come back down to it.
   const follow = useRef(true);
@@ -1127,291 +1220,296 @@ export default function Conversation({
           }}
         />
       )}
-      <div
-        className={`conversation ${searching ? 'searching' : ''}`}
-        tabIndex={-1}
-        ref={scroll}
-        onContextMenu={(event) => {
-          const target = event.target as HTMLElement;
-          if (target.closest('input, textarea, [contenteditable="true"]')) return;
-          event.preventDefault();
-          const selection = window.getSelection()?.toString() ?? '';
-          const message = target.closest<HTMLElement>('[data-copy-text]');
-          const block = target.closest('pre');
-          const copy = (text: string) => {
-            void copyText(text).then(
-              () => setCopyStatus('已复制'),
-              () => setCopyStatus('复制失败，请重试'),
-            );
-          };
-          const items: MenuItem[] = [
-            { label: '复制选中文字', disabled: !selection, run: () => copy(selection) },
-            ...(block ? [{ label: '复制此代码块', run: () => copy(block.textContent ?? '') }] : []),
-            ...(message
-              ? [{ label: '复制整条消息', run: () => copy(message.dataset.copyText ?? '') }]
-              : []),
-            {
-              label: '全选对话文字',
-              run: () => {
-                if (!transcriptRoot.current) return;
-                const range = document.createRange();
-                range.selectNodeContents(transcriptRoot.current);
-                const selected = window.getSelection();
-                selected?.removeAllRanges();
-                selected?.addRange(range);
+      <div className={`conversation-body${session && turns.length > 1 ? ' with-nav' : ''}`}>
+        <div
+          className={`conversation ${searching ? 'searching' : ''}`}
+          tabIndex={-1}
+          ref={scroll}
+          onContextMenu={(event) => {
+            const target = event.target as HTMLElement;
+            if (target.closest('input, textarea, [contenteditable="true"]')) return;
+            event.preventDefault();
+            const selection = window.getSelection()?.toString() ?? '';
+            const message = target.closest<HTMLElement>('[data-copy-text]');
+            const block = target.closest('pre');
+            const copy = (text: string) => {
+              void copyText(text).then(
+                () => setCopyStatus('已复制'),
+                () => setCopyStatus('复制失败，请重试'),
+              );
+            };
+            const items: MenuItem[] = [
+              { label: '复制选中文字', disabled: !selection, run: () => copy(selection) },
+              ...(block
+                ? [{ label: '复制此代码块', run: () => copy(block.textContent ?? '') }]
+                : []),
+              ...(message
+                ? [{ label: '复制整条消息', run: () => copy(message.dataset.copyText ?? '') }]
+                : []),
+              {
+                label: '全选对话文字',
+                run: () => {
+                  if (!transcriptRoot.current) return;
+                  const range = document.createRange();
+                  range.selectNodeContents(transcriptRoot.current);
+                  const selected = window.getSelection();
+                  selected?.removeAllRanges();
+                  selected?.addRange(range);
+                },
               },
-            },
-            { label: '查找对话内容', separated: true, run: openFind },
-          ];
-          const { clientX: x, clientY: y } = event;
-          const element = target.closest<HTMLElement>('[data-link]');
-          const link = element?.dataset.link ? linkTarget(element.dataset.link, place) : null;
-          clearTimeout(resting.current);
-          setLinkCard(null);
-          if (!element || !link) {
-            setContextMenu({ x, y, items });
-            return;
-          }
-          // A link's own choices come first; what is done to the text follows.
-          void linkMenu(link, (note) => showLink(element, link, note), copy).then(
-            (menu) =>
-              setContextMenu({
-                x,
-                y,
-                heading: menu.heading,
-                items: [...menu.items, { ...items[0], separated: true }, ...items.slice(1)],
-              }),
-            () => setContextMenu({ x, y, items }),
-          );
-        }}
-        onClick={(event) => {
-          // The window opens no page itself: a link is followed here, where the session's project is known.
-          const anchor = (event.target as HTMLElement).closest<HTMLElement>('a[href]');
-          if (!anchor || !transcriptRoot.current?.contains(anchor)) return;
-          event.preventDefault();
-          const link = anchor.dataset.link ? linkTarget(anchor.dataset.link, place) : null;
-          clearTimeout(resting.current);
-          if (link) void followLink(link, (note) => showLink(anchor, link, note));
-        }}
-        onPointerOver={(event) => {
-          const anchor = (event.target as HTMLElement).closest<HTMLElement>('a[data-link]');
-          if (!anchor || linkCard?.note) return;
-          clearTimeout(resting.current);
-          resting.current = setTimeout(() => {
-            const link = linkTarget(anchor.dataset.link!, place);
-            if (link) showLink(anchor, link);
-          }, 350);
-        }}
-        onPointerOut={(event) => {
-          const anchor = (event.target as HTMLElement).closest('a[data-link]');
-          if (!anchor || anchor.contains(event.relatedTarget as Node | null)) return;
-          clearTimeout(resting.current);
-          setLinkCard((card) => (card?.note ? card : null));
-        }}
-        onScroll={() => {
-          // Only when one is shown: scrolling must not draw the conversation again.
-          if (linkCard) setLinkCard(null);
-          if (!scroll.current) return;
-          const top = scroll.current.scrollTop;
-          const end = fromEnd(scroll.current) < 40;
-          // Coming down to the end follows again; only moving down does, so a slow wheel or a flick upwards is not
-          // pulled back while output comes in fast. Moving up away from it leaves, by touch as well: heights that
-          // settle or shrink keep the view at the end, where the reader never is after scrolling up.
-          if (!reviewing && end && top > lastTop.current) rejoin();
-          else if (!end && top < lastTop.current && follow.current) leave();
-          // Reading on upwards past what is loaded brings the page before it; a failed load waits for the button.
-          if (top < lastTop.current && top < 240 && !loadError) loadMore();
-          lastTop.current = top;
-        }}
-        onPointerDown={(event) => {
-          // Steps opened or closed are being read where they are.
-          if ((event.target as HTMLElement).closest('summary, [data-reading-control]')) leave();
-        }}
-        onKeyDown={(event) => {
-          if (
-            ['Enter', ' '].includes(event.key) &&
-            (event.target as HTMLElement).closest('[data-reading-control]')
-          )
-            leave();
-          if ((event.target as HTMLElement).closest('input, textarea, [contenteditable="true"]'))
-            return;
-          if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) leave();
-          else if (event.key === 'End') rejoin();
-        }}
-        onWheel={(event) => {
-          // Left at once, before the scroll it starts arrives: output in between would pull the view back.
-          if (
-            event.deltaY < 0 &&
-            scroll.current &&
-            scroll.current.scrollHeight > scroll.current.clientHeight
-          )
-            leave();
-          // A turn down that reaches the end follows again from it. The scroll it makes is told too late for that
-          // when output is coming in: by then the end has moved on.
-          if (event.deltaY > 0 && scroll.current && !follow.current) {
-            const box = scroll.current;
-            const by =
-              event.deltaMode === 1
-                ? event.deltaY * 40
-                : event.deltaMode === 2
-                  ? event.deltaY * box.clientHeight
-                  : event.deltaY;
-            if (fromEnd(box) <= by + 40) rejoin();
-          }
-          // A loaded page shorter than the window cannot scroll, so the wheel itself asks for more.
-          if (event.deltaY < 0 && scroll.current?.scrollTop === 0 && !loadError) loadMore();
-        }}
-      >
-        {!session ? (
-          <div className="empty-state">
-            <MessageSquare />
-            <h2>新会话</h2>
-            <button
-              type="button"
-              className="button primary"
-              disabled={!connected}
-              onClick={newSession}
-            >
-              <Plus />
-              新建会话
-            </button>
-          </div>
-        ) : (
-          <div className="transcript" ref={transcriptRoot}>
-            {loadError && (
-              <div className="history-status" role="alert">
-                {loadError}
-              </div>
-            )}
-            {history?.hasEarlier && (
+              { label: '查找对话内容', separated: true, run: openFind },
+            ];
+            const { clientX: x, clientY: y } = event;
+            const element = target.closest<HTMLElement>('[data-link]');
+            const link = element?.dataset.link ? linkTarget(element.dataset.link, place) : null;
+            clearTimeout(resting.current);
+            setLinkCard(null);
+            if (!element || !link) {
+              setContextMenu({ x, y, items });
+              return;
+            }
+            // A link's own choices come first; what is done to the text follows.
+            void linkMenu(link, (note) => showLink(element, link, note), copy).then(
+              (menu) =>
+                setContextMenu({
+                  x,
+                  y,
+                  heading: menu.heading,
+                  items: [...menu.items, { ...items[0], separated: true }, ...items.slice(1)],
+                }),
+              () => setContextMenu({ x, y, items }),
+            );
+          }}
+          onClick={(event) => {
+            // The window opens no page itself: a link is followed here, where the session's project is known.
+            const anchor = (event.target as HTMLElement).closest<HTMLElement>('a[href]');
+            if (!anchor || !transcriptRoot.current?.contains(anchor)) return;
+            event.preventDefault();
+            const link = anchor.dataset.link ? linkTarget(anchor.dataset.link, place) : null;
+            clearTimeout(resting.current);
+            if (link) void followLink(link, (note) => showLink(anchor, link, note));
+          }}
+          onPointerOver={(event) => {
+            const anchor = (event.target as HTMLElement).closest<HTMLElement>('a[data-link]');
+            if (!anchor || linkCard?.note) return;
+            clearTimeout(resting.current);
+            resting.current = setTimeout(() => {
+              const link = linkTarget(anchor.dataset.link!, place);
+              if (link) showLink(anchor, link);
+            }, 350);
+          }}
+          onPointerOut={(event) => {
+            const anchor = (event.target as HTMLElement).closest('a[data-link]');
+            if (!anchor || anchor.contains(event.relatedTarget as Node | null)) return;
+            clearTimeout(resting.current);
+            setLinkCard((card) => (card?.note ? card : null));
+          }}
+          onScroll={() => {
+            // Only when one is shown: scrolling must not draw the conversation again.
+            if (linkCard) setLinkCard(null);
+            if (!scroll.current) return;
+            const top = scroll.current.scrollTop;
+            const end = fromEnd(scroll.current) < 40;
+            // Coming down to the end follows again; only moving down does, so a slow wheel or a flick upwards is not
+            // pulled back while output comes in fast. Moving up away from it leaves, by touch as well: heights that
+            // settle or shrink keep the view at the end, where the reader never is after scrolling up.
+            if (!reviewing && end && top > lastTop.current) rejoin();
+            else if (!end && top < lastTop.current && follow.current) leave();
+            // Reading on upwards past what is loaded brings the page before it; a failed load waits for the button.
+            if (top < lastTop.current && top < 240 && !loadError) loadMore();
+            lastTop.current = top;
+          }}
+          onPointerDown={(event) => {
+            // Steps opened or closed are being read where they are.
+            if ((event.target as HTMLElement).closest('summary, [data-reading-control]')) leave();
+          }}
+          onKeyDown={(event) => {
+            if (
+              ['Enter', ' '].includes(event.key) &&
+              (event.target as HTMLElement).closest('[data-reading-control]')
+            )
+              leave();
+            if ((event.target as HTMLElement).closest('input, textarea, [contenteditable="true"]'))
+              return;
+            if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) leave();
+            else if (event.key === 'End') rejoin();
+          }}
+          onWheel={(event) => {
+            // Left at once, before the scroll it starts arrives: output in between would pull the view back.
+            if (
+              event.deltaY < 0 &&
+              scroll.current &&
+              scroll.current.scrollHeight > scroll.current.clientHeight
+            )
+              leave();
+            // A turn down that reaches the end follows again from it. The scroll it makes is told too late for that
+            // when output is coming in: by then the end has moved on.
+            if (event.deltaY > 0 && scroll.current && !follow.current) {
+              const box = scroll.current;
+              const by =
+                event.deltaMode === 1
+                  ? event.deltaY * 40
+                  : event.deltaMode === 2
+                    ? event.deltaY * box.clientHeight
+                    : event.deltaY;
+              if (fromEnd(box) <= by + 40) rejoin();
+            }
+            // A loaded page shorter than the window cannot scroll, so the wheel itself asks for more.
+            if (event.deltaY < 0 && scroll.current?.scrollTop === 0 && !loadError) loadMore();
+          }}
+        >
+          {!session ? (
+            <div className="empty-state">
+              <MessageSquare />
+              <h2>新会话</h2>
               <button
                 type="button"
-                className="history-load"
-                disabled={!connected || history.loadingEarlier || history.loading}
-                onClick={loadMore}
+                className="button primary"
+                disabled={!connected}
+                onClick={newSession}
               >
-                <ArrowUpToLine />
-                {history.loadingEarlier ? '加载中' : '加载更早记录'}
+                <Plus />
+                新建会话
               </button>
-            )}
-            {history?.loading && (
-              <div className="history-status" role="status">
-                同步会话
-              </div>
-            )}
-            {turns.length === 0 && !history?.loading && (
-              <div className="empty-state">
-                <MessageSquare />
-                <h2>{session.title}</h2>
-                <span className="empty-project">{session.projectPath}</span>
-              </div>
-            )}
-            <LinkPlace.Provider value={place}>
-              {turns.map((turn, index) => (
-                <TurnView
-                  key={turn.id}
-                  turn={turn}
-                  native={native}
-                  live={live}
-                  latest={index === turns.length - 1}
-                  held={heldOpen(turns, index)}
-                />
-              ))}
-            </LinkPlace.Provider>
-            {session.activeRun && background && (
-              <div className="background-tasks">
-                <div className="run-indicator" role="status">
-                  <span className={`running-dot${connected ? ' breathing' : ''}`} />
-                  {!connected && '最后已知：'}后台任务{tasks.length ? ` ${tasks.length} 个` : ''} ·
-                  Claude 已答完，任务结束后会接着处理
-                  {!ownsRun && ' · 所在设备不在线'}
+            </div>
+          ) : (
+            <div className="transcript" ref={transcriptRoot}>
+              {loadError && (
+                <div className="history-status" role="alert">
+                  {loadError}
                 </div>
-                {/* The run is still on, so the controls that need it over are greyed out; this says why. */}
-                <p className="background-hint">
-                  任务结束前不能更改模型、思考强度和审批模式，也不能改名、分叉或编辑重发
-                  {ownsRun && '；消息可以照常发送'}。
-                </p>
-                <ul>
-                  {tasks.map((task) => (
-                    <li key={task.id}>
-                      <span>
-                        {task.description || task.kind}
-                        <TaskLine
-                          since={listedAt(task.id)}
-                          progress={progress?.[task.id]}
-                          clock={clock}
-                          connected={connected}
-                        />
-                      </span>
-                      <button
-                        type="button"
-                        className="button"
-                        disabled={!connected || !ownsRun || busy}
-                        onClick={() => stopTask(task.id)}
-                      >
-                        结束
-                      </button>
-                    </li>
-                  ))}
-                </ul>
-                {tasks.length !== 1 && (
-                  <button
-                    type="button"
-                    className="button"
-                    disabled={!connected || !ownsRun || busy}
-                    onClick={stop}
-                  >
-                    全部结束
-                  </button>
-                )}
-              </div>
-            )}
-            {/* A terminal holds the session: what it does is recorded here as each of its turns ends. */}
-            {session.activeRun?.surface === 'terminal' && (
-              <div className="run-indicator" role="status">
-                <span
-                  className={`running-dot${session.activeRun.activity === 'working' && connected ? ' breathing' : ''}`}
-                />
-                {`${runtime.task} · 进展随后显示在这里，关闭终端后可以在这里接着聊`}
-              </div>
-            )}
-            {session.activeRun &&
-              session.activeRun.surface !== 'terminal' &&
-              !background &&
-              (session.activeRun.status !== 'awaiting_approval' ? (
-                <RunStatus
-                  label={runtime.task}
-                  tool={toolAtWork}
-                  since={Math.max(
-                    clock.activityAt(session.id),
-                    Date.parse(events.at(-1)?.createdAt ?? '') || 0,
+              )}
+              {history?.hasEarlier && (
+                <button
+                  type="button"
+                  className="history-load"
+                  disabled={!connected || history.loadingEarlier || history.loading}
+                  onClick={loadMore}
+                >
+                  <ArrowUpToLine />
+                  {history.loadingEarlier ? '加载中' : '加载更早记录'}
+                </button>
+              )}
+              {history?.loading && (
+                <div className="history-status" role="status">
+                  同步会话
+                </div>
+              )}
+              {turns.length === 0 && !history?.loading && (
+                <div className="empty-state">
+                  <MessageSquare />
+                  <h2>{session.title}</h2>
+                  <span className="empty-project">{session.projectPath}</span>
+                </div>
+              )}
+              <LinkPlace.Provider value={place}>{renderedTurns}</LinkPlace.Provider>
+              {session.activeRun && background && (
+                <div className="background-tasks">
+                  <div className="run-indicator" role="status">
+                    <span className={`running-dot${connected ? ' breathing' : ''}`} />
+                    {!connected && '最后已知：'}后台任务{tasks.length ? ` ${tasks.length} 个` : ''}{' '}
+                    · Claude 已答完，任务结束后会接着处理
+                    {!ownsRun && ' · 所在设备不在线'}
+                  </div>
+                  {/* The run is still on, so the controls that need it over are greyed out; this says why. */}
+                  <p className="background-hint">
+                    任务结束前不能更改模型、思考强度和审批模式，也不能改名、分叉或编辑重发
+                    {ownsRun && '；消息可以照常发送'}。
+                  </p>
+                  <ul>
+                    {tasks.map((task) => (
+                      <li key={task.id}>
+                        <span>
+                          {task.description || task.kind}
+                          <TaskLine
+                            since={listedAt(task.id)}
+                            progress={progress?.[task.id]}
+                            clock={clock}
+                            connected={connected}
+                          />
+                        </span>
+                        <button
+                          type="button"
+                          className="button"
+                          disabled={!connected || !ownsRun || busy}
+                          onClick={() => stopTask(task.id)}
+                        >
+                          结束
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                  {tasks.length !== 1 && (
+                    <button
+                      type="button"
+                      className="button"
+                      disabled={!connected || !ownsRun || busy}
+                      onClick={stop}
+                    >
+                      全部结束
+                    </button>
                   )}
-                  clock={clock}
-                  connected={connected}
-                  suffix={ownsRun ? '' : ' · 所在设备不在线'}
-                />
-              ) : (
-                <div className="run-indicator" role="status">
-                  <span className="running-dot" />
-                  {runtime.task}
-                  {!ownsRun && ' · 所在设备不在线'}
                 </div>
-              ))}
-          </div>
-        )}
-        {session && away && (
-          <div className="to-end">
-            <IconButton
-              title="回到底部"
-              className="to-end-button"
-              onClick={() => {
-                rejoin();
-                toEnd();
-              }}
-            >
-              <ArrowDown />
-            </IconButton>
-          </div>
+              )}
+              {/* A terminal holds the session: what it does is recorded here as each of its turns ends. */}
+              {session.activeRun?.surface === 'terminal' && (
+                <div className="run-indicator" role="status">
+                  <span
+                    className={`running-dot${session.activeRun.activity === 'working' && connected ? ' breathing' : ''}`}
+                  />
+                  {`${runtime.task} · 进展随后显示在这里，关闭终端后可以在这里接着聊`}
+                </div>
+              )}
+              {session.activeRun &&
+                session.activeRun.surface !== 'terminal' &&
+                !background &&
+                (session.activeRun.status !== 'awaiting_approval' ? (
+                  <RunStatus
+                    label={runtime.task}
+                    tool={toolAtWork}
+                    since={Math.max(
+                      clock.activityAt(session.id),
+                      Date.parse(events.at(-1)?.createdAt ?? '') || 0,
+                    )}
+                    clock={clock}
+                    connected={connected}
+                    suffix={ownsRun ? '' : ' · 所在设备不在线'}
+                  />
+                ) : (
+                  <div className="run-indicator" role="status">
+                    <span className="running-dot" />
+                    {runtime.task}
+                    {!ownsRun && ' · 所在设备不在线'}
+                  </div>
+                ))}
+            </div>
+          )}
+          {session && away && (
+            <div className="to-end">
+              <IconButton
+                title="回到底部"
+                className="to-end-button"
+                onClick={() => {
+                  rejoin();
+                  toEnd();
+                }}
+              >
+                <ArrowDown />
+              </IconButton>
+            </div>
+          )}
+        </div>
+        {session && turns.length > 1 && (
+          <ConversationNav
+            key={session.id}
+            turns={turns}
+            root={transcriptRoot}
+            scroll={scroll}
+            partial={!!history?.hasEarlier}
+            loading={!connected || !!history?.loadingEarlier || !!history?.loading}
+            loadEarlier={loadMore}
+            navigate={leave}
+          />
         )}
       </div>
       {contextMenu && (

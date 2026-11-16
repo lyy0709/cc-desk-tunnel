@@ -5,6 +5,7 @@ import { ProxyClient, RequestInterruptedError } from '../src/client.ts';
 import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
 import { conversation, transcript } from '../src/transcript.ts';
 import { describe, duration, summarize } from '../src/activity.ts';
+import { cleanDrafts, withoutSentDraft } from '../src/drafts.ts';
 import {
   describeSchedule,
   formatTasks,
@@ -12,6 +13,45 @@ import {
   parseTasks,
   taskMessage,
 } from '../src/schedules.ts';
+
+test('draft migration keeps old text and file references while discarding interrupted local reads', () => {
+  const attachment = { name: 'file.txt', path: '/tmp/file.txt', deviceId: randomUUID(), size: 20 };
+  assert.deepEqual(
+    cleanDrafts({
+      old: '"/tmp/legacy.txt"',
+      new: { text: '', attachments: [attachment], adding: 1, attachmentError: 'old' },
+    }),
+    {
+      old: { text: '"/tmp/legacy.txt"', attachments: [] },
+      new: { text: '', attachments: [attachment] },
+    },
+  );
+});
+
+test('a send receipt only clears the captured text and references, keeping newly added draft content', () => {
+  const first = { name: 'file.txt', path: '/tmp/file.txt', deviceId: randomUUID() };
+  const next = { ...first, path: '/tmp/next.txt' };
+  const sent = { text: '发送', attachments: [first] };
+  assert.deepEqual(withoutSentDraft(sent, sent), { text: '', attachments: [] });
+  assert.deepEqual(
+    withoutSentDraft({ text: '后来输入', attachments: [first, next], adding: 1 }, sent),
+    {
+      text: '后来输入',
+      attachments: [next],
+      adding: 1,
+    },
+  );
+  const reselected = { ...first };
+  assert.deepEqual(withoutSentDraft({ ...sent, attachments: [reselected] }, sent).attachments, [
+    reselected,
+  ]);
+  const warned = { ...sent, attachmentError: '旧的添加错误' };
+  assert.equal(withoutSentDraft(warned, warned).attachmentError, '');
+  assert.equal(
+    withoutSentDraft({ ...warned, attachmentError: '新的添加错误' }, warned).attachmentError,
+    '新的添加错误',
+  );
+});
 
 function fixture(t) {
   const Original = globalThis.WebSocket;

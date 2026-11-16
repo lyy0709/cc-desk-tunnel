@@ -3,7 +3,7 @@ import { isWindowsPath } from '@cc-desk-tunnel/protocol';
 
 // Where the links of a conversation lead from: the session's project folder, whether this window can open what
 // is in it (a desktop window on the computer the project is on), and whether it is a browser.
-export type Place = { projectPath: string; here: boolean; browser: boolean };
+export type Place = { projectPath: string; here: boolean; browser: boolean; deviceId?: string };
 export const LinkPlace = createContext<Place | null>(null);
 
 export type Link =

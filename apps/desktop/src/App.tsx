@@ -34,13 +34,14 @@ import {
 } from 'lucide-react';
 import { GithubMark, openProject, project } from './project.tsx';
 import type {
+  FileAttachment,
   Effort,
   EventPayload,
   PermissionMode,
   Session,
   SessionEvent,
 } from '@cc-desk-tunnel/protocol';
-import { FORCED_UPGRADE_SINCE, runWorking } from '@cc-desk-tunnel/protocol';
+import { FORCED_UPGRADE_SINCE, runWorking, messageText } from '@cc-desk-tunnel/protocol';
 import { browserSession, browserSocket, watchActivity } from './browser-api.ts';
 import { CertificateWarning } from './WebGate.tsx';
 import { hostCapabilities } from './host-capabilities.ts';
@@ -53,7 +54,7 @@ import { sessionRuntime } from './RunStatus.tsx';
 import SessionBar from './SessionBar.tsx';
 import { isHere, thisDevice } from './device.ts';
 import { isMac, selfUpdating } from './platform.ts';
-import { useDrafts } from './drafts.ts';
+import { useDrafts, emptyDraft, withoutSentDraft } from './drafts.ts';
 import SchedulePanel from './SchedulePanel.tsx';
 import { taskMessage, useSchedules } from './schedules.ts';
 import type { Scenario } from './Composer.tsx';
@@ -187,7 +188,7 @@ export function App({
   const [projects, setProjects] = useState(savedProjects);
   // The folders that hold sessions without a project; new ones are made in the first.
   const [workspaceRoots, setWorkspaceRoots] = useState<string[]>([]);
-  const [drafts, setDraft] = useDrafts();
+  const [drafts, setDraft, updateDraft] = useDrafts();
   const [scenario, setScenario] = useState<Scenario>('chat');
   const [slashOpen, setSlashOpen] = useState(false);
   // The side column is shown beside the page on a wide window and laid over it on a narrow one.
@@ -408,7 +409,8 @@ export function App({
     },
     { name: 'refresh', title: '刷新原生状态', detail: '上下文与订阅额度', reason: controlReason },
   ];
-  const draft = selected ? (drafts[selected.id] ?? '') : '';
+  const composition = selected ? (drafts[selected.id] ?? emptyDraft) : emptyDraft;
+  const draft = composition.text;
   // The last turn of the session did not reach its end: it can be taken up again from the message box.
   const lastStatus = selected
     ? state.events[selected.id]?.findLast((event) => event.payload.type === 'run.status')?.payload
@@ -949,7 +951,10 @@ export function App({
   }
   // A fork continues from the same context in a session of its own. Forking before a message brings that
   // message back as a draft, which is how an earlier message is edited and sent again.
-  async function fork(session: Session, before?: { id: string; text: string }) {
+  async function fork(
+    session: Session,
+    before?: { id: string; text: string; attachments?: FileAttachment[] },
+  ) {
     await act(async () => {
       // The copy of a session that is on another computer needs a directory on this one.
       const projectPath = onThis(session) ? undefined : await placeHere(session);
@@ -961,12 +966,13 @@ export function App({
         ...(projectPath ? { projectPath } : {}),
       });
       if (!response.sessionId) return;
-      if (before) setDraft(response.sessionId, before.text);
+      if (before) setDraft(response.sessionId, before.text, before.attachments ?? []);
       show(response.sessionId);
     });
   }
   async function send(text = draft) {
-    if (!selected || !text.trim()) return;
+    if (!selected || composition.adding || (!text.trim() && !composition.attachments.length))
+      return;
     const command = nativeMode ? localCommand(text) : null;
     if (command) {
       const action = localActions.find((item) => item.name === command.name);
@@ -998,6 +1004,17 @@ export function App({
     }
     if (inputDisabled) return;
     const sessionId = selected.id;
+    const sent = {
+      ...composition,
+      text: command?.name === 'plan' ? command.body : composition.text,
+    };
+    if (
+      (command?.name !== 'plan' || command.body) &&
+      messageText(command?.body ?? text.trim(), sent.attachments).length > 16000
+    ) {
+      setError('正文与文件路径合计不能超过 16,000 字符。');
+      return;
+    }
     setSlashOpen(false);
     await act(async () => {
       if (command?.name === 'plan') {
@@ -1010,9 +1027,10 @@ export function App({
         type: 'message.send',
         sessionId,
         text: command?.body ?? text,
+        ...(sent.attachments.length ? { attachments: sent.attachments } : {}),
         scenario,
       });
-      setDraft(sessionId, '');
+      updateDraft(sessionId, (current) => withoutSentDraft(current, sent));
     });
   }
   // Takes up the last turn, which was stopped or cut off, without the user writing anything.
@@ -1769,6 +1787,7 @@ export function App({
                   findRequest={findRequest}
                   session={selected}
                   here={!!selected && onThis(selected)}
+                  deviceId={window.desktop && !browser ? state.device?.id : undefined}
                   events={events}
                   history={history}
                   connected={connected}
@@ -1784,20 +1803,24 @@ export function App({
                   edit={
                     controlsDisabled || away
                       ? undefined
-                      : (id, text, deliveryStatus) => {
+                      : (id, text, deliveryStatus, attachments = []) => {
                           // Only a confirmed non-delivery can be resent in place. A missing receipt is not proof.
                           if (deliveryStatus === 'not_sent') {
-                            if (draft && draft !== text) {
+                            if (
+                              (draft || composition.attachments.length) &&
+                              messageText(draft, composition.attachments) !==
+                                messageText(text, attachments)
+                            ) {
                               setError(
                                 '输入框里还有草稿，请先发送或清空，再编辑这条未送达的消息。',
                               );
                               return;
                             }
                             setError(null);
-                            setDraft(selected!.id, text);
+                            setDraft(selected!.id, text, attachments);
                             return;
                           }
-                          void fork(selected!, { id, text });
+                          void fork(selected!, { id, text, attachments });
                         }
                   }
                   stopTask={(taskId) => {
@@ -1929,6 +1952,7 @@ export function App({
                 )}
                 {selected && (!away || remote) && (
                   <Composer
+                    key={selected.id}
                     openAccount={() => open('settings', 'account')}
                     session={selected}
                     projectName={
@@ -1944,8 +1968,15 @@ export function App({
                         : (position) =>
                             setMenu({ kind: 'move', sessionId: selected.id, ...position })
                     }
-                    draft={draft}
-                    setDraft={(text) => setDraft(selected.id, text)}
+                    draft={composition}
+                    updateDraft={(update) => {
+                      if (client.state.sessions.some((session) => session.id === selected.id))
+                        updateDraft(selected.id, update);
+                    }}
+                    deviceId={window.desktop && !browser ? state.device?.id : undefined}
+                    attachmentDeviceId={
+                      window.desktop && !browser && onThis(selected) ? state.device?.id : undefined
+                    }
                     native={nativeMode}
                     localProject={canReadProject}
                     showChanges={showChanges}
@@ -2060,7 +2091,7 @@ export function App({
           confirm={() => {
             void act(async () => {
               await client.request({ type: 'session.delete', sessionId: deleteSession.id });
-              setDraft(deleteSession.id, '');
+              updateDraft(deleteSession.id, () => emptyDraft);
               // A plain session's directory goes with it when the session left nothing there.
               if (isInside(deleteSession.projectPath, workspaceRoots))
                 void window.desktop?.removeWorkspace(deleteSession.projectPath);

@@ -1,4 +1,5 @@
 import type { Session, SessionEvent } from '@cc-desk-tunnel/protocol';
+import { messageText } from '@cc-desk-tunnel/protocol';
 import type { ProxyClient } from './client.ts';
 import { conversation } from './transcript.ts';
 import type { Step } from './transcript.ts';
@@ -44,7 +45,7 @@ export function markdown(session: Session, events: SessionEvent[]) {
     if (turn.question && !turn.question.continued)
       parts.push(
         `## 你 · ${new Date(turn.question.at).toLocaleString('zh-CN')}`,
-        turn.question.text,
+        messageText(turn.question.text, turn.question.attachments),
       );
     const body = [...turn.steps.flatMap(step), ...(turn.answer ? [turn.answer.text] : [])];
     if (body.length) parts.push('## Claude Code', ...body);

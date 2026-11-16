@@ -691,6 +691,70 @@ test('duplicate message and create request IDs survive reconnect without replay'
   assert.ok(conflict.type === 'response' && !conflict.ok && conflict.code === 'request_conflict');
 });
 
+test('attachment references persist, reject changed retries and cannot be supplied from another device', async (t) => {
+  const f = await fixture(t);
+  const owner = await f.connect();
+  const sessionId = await f.create(owner);
+  const attachments = [
+    { path: 'D:\\工作\\中文 文件.txt', name: '中文 文件.txt', size: 24, deviceId: device.id },
+  ];
+  const command = {
+    type: 'message.send',
+    requestId: randomUUID(),
+    sessionId,
+    text: '',
+    attachments,
+  };
+  owner.send(command);
+  await owner.wait(
+    (message) =>
+      message.type === 'session.event' &&
+      message.event.payload.type === 'run.status' &&
+      message.event.payload.status === 'completed',
+  );
+  const recorded = f.server.store.userMessage(sessionId, command.requestId)!.payload;
+  assert.ok(recorded.type === 'message.user');
+  assert.equal(recorded.text, '');
+  assert.deepEqual(recorded.attachments, attachments);
+  const size = f.server.store.snapshot(sessionId).events.length;
+  const next = await f.connect();
+  next.send(command);
+  const duplicate = await next.wait(
+    (message) => message.type === 'response' && message.requestId === command.requestId,
+  );
+  assert.ok(duplicate.type === 'response' && duplicate.ok);
+  assert.equal(f.server.store.snapshot(sessionId).events.length, size);
+  const third = await f.connect();
+  third.send({ ...command, attachments: [{ ...attachments[0], path: 'D:\\different.txt' }] });
+  const conflict = await third.wait(
+    (message) => message.type === 'response' && message.requestId === command.requestId,
+  );
+  assert.ok(conflict.type === 'response' && !conflict.ok && conflict.code === 'request_conflict');
+  const laptop = { id: randomUUID(), name: '另一台电脑' };
+  const away = await f.connect(laptop);
+  for (const files of [attachments, [{ ...attachments[0], deviceId: laptop.id }]]) {
+    const refused = await away.request({ ...command, requestId: undefined, attachments: files });
+    assert.ok(refused.type === 'response' && !refused.ok && refused.code === 'attachment_device');
+  }
+  const spoofed = await owner.request({
+    ...command,
+    attachments: [{ ...attachments[0], deviceId: laptop.id }],
+  });
+  assert.ok(spoofed.type === 'response' && !spoofed.ok && spoofed.code === 'attachment_device');
+  const fork = await away.request({ type: 'session.fork', sessionId, projectPath: 'E:\\新项目' });
+  assert.ok(fork.type === 'response' && fork.ok && fork.sessionId);
+  assert.deepEqual(
+    f.server.store.userMessage(fork.sessionId, command.requestId)!.payload,
+    recorded,
+  );
+  const restored = new SessionStore(f.directory);
+  try {
+    assert.deepEqual(restored.userMessage(sessionId, command.requestId)!.payload, recorded);
+  } finally {
+    restored.close();
+  }
+});
+
 test('simulated upstream errors are terminal and session deletion removes history only', async (t) => {
   const f = await fixture(t);
   const client = await f.connect();
