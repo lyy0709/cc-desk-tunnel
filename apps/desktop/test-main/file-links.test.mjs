@@ -14,7 +14,7 @@ test('text preview is bounded, decodes BOMs, and never executes scripts or parse
   const root = mkdtempSync(join(tmpdir(), 'ccdt-preview-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const marker = join(root, 'executed');
-  const script = join(root, '中文 "脚本".sh');
+  const script = join(root, process.platform === 'win32' ? '中文 脚本.sh' : '中文 "脚本".sh');
   const source = `#!/bin/sh\nprintf unexpected > "${marker}"\n`;
   writeFileSync(script, source, { mode: 0o755 });
   assert.deepEqual(await previewText(script), { kind: 'text', text: source, truncated: false });
