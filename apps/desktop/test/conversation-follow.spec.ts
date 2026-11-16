@@ -2,8 +2,10 @@ import { test, expect } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
-import type { Session } from '@cc-desk-tunnel/protocol';
+import type { Session, SessionEvent, EventPayload } from '@cc-desk-tunnel/protocol';
+import { conversationOutline } from '@cc-desk-tunnel/protocol/transcript';
 import { join } from 'node:path';
+import { readFileSync } from 'node:fs';
 import { screenshots } from './helpers.ts';
 
 // Trace snapshots walk the entire DOM and distort the frame/input timings measured in this file.
@@ -28,7 +30,10 @@ function reply(n: number) {
 }
 
 // Opens the session; what is returned starts a reply streaming into it, fast, and stops it when called.
-async function open(page: Page, { count = turns, earlier = 0, historyFailure = '' } = {}) {
+async function open(
+  page: Page,
+  { count = turns, earlier = 0, historyFailure = '', holdReads = false, readFailure = '' } = {},
+) {
   const now = new Date().toISOString();
   const connectionId = randomUUID();
   let stream = (): (() => void) => () => {};
@@ -46,14 +51,16 @@ async function open(page: Page, { count = turns, earlier = 0, historyFailure = '
   };
   const other = { ...session, id: randomUUID(), title: '另一段会话' };
   const requests: string[] = [];
+  const reads: { purpose: string; sequence: number }[] = [];
+  const pendingReads: (() => void)[] = [];
   await page.routeWebSocket('ws://127.0.0.1:18894/ws', (route) => {
     const send = (value: unknown) => route.send(JSON.stringify(value));
     let sequence = 0;
     const start = Date.now() - 3_600_000;
-    const events: unknown[] = [];
+    const events: SessionEvent[] = [];
     for (let n = 0; n < count; n++) {
       const runId = randomUUID();
-      const event = (payload: unknown) => ({
+      const event = (payload: EventPayload) => ({
         sessionId: session.id,
         runId,
         sequence: ++sequence,
@@ -88,17 +95,17 @@ async function open(page: Page, { count = turns, earlier = 0, historyFailure = '
     stream = () => {
       const messageId = randomUUID();
       const runId = randomUUID();
-      const emit = (payload: unknown) =>
-        send({
-          type: 'session.event',
-          event: {
-            sessionId: session.id,
-            runId,
-            sequence: ++sequence,
-            createdAt: new Date().toISOString(),
-            payload,
-          },
-        });
+      const emit = (payload: EventPayload) => {
+        const event = {
+          sessionId: session.id,
+          runId,
+          sequence: ++sequence,
+          createdAt: new Date().toISOString(),
+          payload,
+        };
+        events.push(event);
+        send({ type: 'session.event', event });
+      };
       send({
         type: 'session.updated',
         session: { ...session, activeRun: { id: runId, status: 'running', connectionId } },
@@ -132,6 +139,53 @@ async function open(page: Page, { count = turns, earlier = 0, historyFailure = '
           adapter: 'claude-code',
           sessions: [session, other],
         });
+        return;
+      }
+      if (message.type === 'session.outline') {
+        send({
+          type: 'session.outline',
+          requestId: message.requestId,
+          sessionId: message.sessionId,
+          throughSequence: sequence,
+          fromSequence: 0,
+          entries: message.sessionId === session.id ? conversationOutline(events) : [],
+        });
+      }
+      if (message.type === 'session.read') {
+        reads.push(message);
+        if (readFailure) {
+          send({ type: 'response', requestId: message.requestId, ok: false, message: readFailure });
+          return;
+        }
+        const upper = message.throughSequence ?? sequence;
+        const target = Math.floor((message.sequence - 1) / 5);
+        const body =
+          message.direction === 'around'
+            ? events.slice(Math.max(0, target - 5) * 5, (target + 6) * 5)
+            : message.direction === 'before'
+              ? events.filter((event) => event.sequence < message.sequence).slice(-100)
+              : events
+                  .filter((event) => event.sequence > message.sequence && event.sequence <= upper)
+                  .slice(0, 100);
+        const result = {
+          type: 'session.read',
+          requestId: message.requestId,
+          session,
+          events: body,
+          firstSequence: body[0]?.sequence ?? 0,
+          lastSequence: body.at(-1)?.sequence ?? 0,
+          throughSequence: upper,
+          hasEarlier: (body[0]?.sequence ?? 0) > 1,
+          hasLater: (body.at(-1)?.sequence ?? upper) < upper,
+          totalEvents: upper,
+          capturedAt: now,
+        };
+        const deliver = () => {
+          send(result);
+          send({ type: 'response', requestId: message.requestId, ok: true });
+        };
+        if (holdReads) pendingReads.push(deliver);
+        else deliver();
         return;
       }
       if (message.type === 'session.history' && historyFailure) {
@@ -191,7 +245,11 @@ async function open(page: Page, { count = turns, earlier = 0, historyFailure = '
   await expect(page.getByText(`第${count - 1}轮的回答。`)).toBeVisible();
   // Wait for Markdown rather than its temporary plain-text fallback before measuring layout or clicking folds.
   await expect(page.locator('.message.assistant').last().locator('table')).toBeVisible();
-  return Object.assign(() => stream(), { requests });
+  return Object.assign(() => stream(), {
+    requests,
+    reads,
+    releaseRead: () => pendingReads.shift()?.(),
+  });
 }
 
 // How far the view is from the end of the conversation, once it has stopped moving.
@@ -395,27 +453,43 @@ test('turn navigation previews without scrolling, jumps by pointer or keyboard a
   }
 });
 
-test('navigation keeps the reading anchor when older turns arrive and clears on a session switch', async ({
+test('the complete directory jumps directly to unloaded turns and preserves the reading anchor when paging', async ({
   page,
 }) => {
-  await open(page, { count: 80, earlier: 30 });
+  const stream = await open(page, { count: 80, earlier: 30 });
   const track = page.getByRole('slider');
-  await expect(track).toHaveAttribute('aria-valuemax', '50');
+  await expect(track).toHaveAttribute('aria-valuemax', '80');
+  const before = stream.requests.length;
   await track.focus();
   await track.press('Home');
   for (let n = 0; n < 10; n++) await track.press('ArrowDown');
+  await expect(page.getByRole('tooltip')).toContainText('第10问');
+  expect(stream.requests.length).toBe(before);
   await track.press('Enter');
-  const reading = page.getByText('第40问', { exact: true });
+  const reading = page.getByText('第10问', { exact: true });
   await expect(reading).toBeInViewport();
+  expect(stream.requests.filter((type) => type === 'session.read')).toHaveLength(1);
   await fromEnd(page);
   const top = (await reading.boundingBox())!.y;
-  await page.getByRole('button', { name: '导航：加载更早记录', exact: true }).click();
-  await expect(track).toHaveAttribute('aria-valuemax', '80');
+  await page
+    .getByRole('button', { name: '加载更早记录', exact: true })
+    .evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.getByText('第0问', { exact: true })).toBeAttached();
   await expect(reading).toBeInViewport();
   expect(Math.abs((await reading.boundingBox())!.y - top)).toBeLessThan(3);
-  await expect(page.getByRole('button', { name: '导航：加载更早记录', exact: true })).toHaveCount(
-    0,
-  );
+  await expect(track).toHaveAttribute('aria-valuemax', '80');
+  const stop = stream();
+  await page.waitForTimeout(300);
+  await expect(reading).toBeInViewport();
+  stop();
+  await page
+    .getByRole('button', { name: '加载较新记录', exact: true })
+    .evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.getByText('第30问', { exact: true })).toBeAttached();
+  await expect(reading).toBeInViewport();
+  await page.getByRole('button', { name: '回到最新记录', exact: true }).click();
+  await expect(page.getByText('第79问', { exact: true })).toBeAttached();
+  await expect(page.getByRole('button', { name: '加载较新记录', exact: true })).toHaveCount(0);
   await track.focus();
   await track.press('ArrowUp');
   await expect(page.getByRole('tooltip')).toBeVisible();
@@ -463,9 +537,38 @@ test('navigation fits a narrow dark window and reduced motion still reaches the 
 });
 
 test.describe('navigation performance', () => {
+  test('10,000 turns expose their full directory while only requested bodies enter the page', async ({
+    page,
+  }, info) => {
+    const started = Date.now();
+    const history = await open(page, { count: 10000, earlier: 9990 });
+    const track = page.getByRole('slider');
+    await expect(track).toHaveAttribute('aria-valuemax', '10000');
+    expect(await page.locator('.turn-anchor').count()).toBe(10);
+    expect(await track.locator('i').count()).toBeLessThan(70);
+    const rail = (await track.boundingBox())!;
+    const position = { x: rail.width / 2, y: 8 + (5000 / 9999) * (rail.height - 16) };
+    await track.hover({ position });
+    await expect(page.getByRole('tooltip')).toContainText('第5000问');
+    expect(history.reads).toHaveLength(0);
+    const jumping = Date.now();
+    await track.click({ position });
+    await expect(page.getByText('第5000问', { exact: true })).toBeInViewport();
+    expect(history.reads).toEqual([expect.objectContaining({ purpose: 'view', sequence: 25001 })]);
+    expect(await page.locator('.turn-anchor').count()).toBe(11);
+    expect(Date.now() - jumping).toBeLessThan(1000);
+    await page.screenshot({ path: join(screenshots, 'conversation-navigation-10000.png') });
+    await info.attach('10000-turn-directory', {
+      body: JSON.stringify({ elapsedMs: Date.now() - started, renderedTurns: 11 }),
+      contentType: 'application/json',
+    });
+  });
   test('1000 mixed turns keep navigation, scrolling and typing responsive during streaming', async ({
     page,
   }, info) => {
+    await page.addInitScript(() =>
+      localStorage.setItem('proxy-prefs', JSON.stringify({ followup: 'later' })),
+    );
     const started = Date.now();
     const stream = await open(page, { count: 1000 });
     const openMs = Date.now() - started;
@@ -478,6 +581,15 @@ test.describe('navigation performance', () => {
     await track.press('Enter');
     const stop = stream();
     try {
+      const message = page.getByRole('textbox', { name: '消息', exact: true });
+      for (const text of ['稍后检查代码', '最后给出总结']) {
+        await message.fill(text);
+        await page.getByRole('button', { name: '发送消息', exact: true }).click();
+      }
+      await expect(
+        page.getByRole('list', { name: '待发送消息' }).getByRole('listitem'),
+      ).toHaveCount(2);
+      expect(stream.requests).not.toContain('message.send');
       const metrics = await page.evaluate(async () => {
         const box = document.querySelector<HTMLElement>('.conversation')!;
         const track = document.querySelector<HTMLElement>('.conversation-nav-track')!;
@@ -520,7 +632,6 @@ test.describe('navigation performance', () => {
       await track.press('Enter');
       await expect(page.getByText('第998问', { exact: true })).toBeInViewport();
       const jumpMs = Date.now() - jumpAt;
-      const message = page.getByRole('textbox', { name: '消息', exact: true });
       const typed = Date.now();
       await message.pressSequentially('abcdefghijklmnopqrstuvwxyz0123456789');
       const perKeyMs = (Date.now() - typed) / 36;
@@ -540,4 +651,101 @@ test.describe('navigation performance', () => {
       stop();
     }
   });
+});
+
+test('a failed jump keeps the current body and reports the error without scrolling', async ({
+  page,
+}) => {
+  await open(page, { earlier: 40, readFailure: '测试读取失败：原始错误' });
+  const track = page.getByRole('slider');
+  await track.focus();
+  await track.press('Home');
+  await track.press('Enter');
+  await expect(page.locator('.conversation-tools')).toContainText('测试读取失败：原始错误');
+  await expect(page.getByText('第59轮的回答。')).toBeAttached();
+  await expect(page.getByText('第0问', { exact: true })).toHaveCount(0);
+  expect(await fromEnd(page)).toBeLessThan(2);
+});
+
+test('a late navigation reply cannot override a newer loaded destination or another session', async ({
+  page,
+}) => {
+  const history = await open(page, { count: 80, earlier: 60, holdReads: true });
+  const track = page.getByRole('slider');
+  await track.focus();
+  await track.press('Home');
+  await track.press('Enter');
+  await expect.poll(() => history.reads.length).toBe(1);
+  await track.press('End');
+  await track.press('Enter');
+  history.releaseRead();
+  await expect(page.getByText('第79问', { exact: true })).toBeInViewport();
+  await expect(page.getByText('第0问', { exact: true })).toHaveCount(0);
+  await track.press('Home');
+  await track.press('Enter');
+  await expect.poll(() => history.reads.length).toBe(2);
+  await page.locator('.session-select').filter({ hasText: '另一段会话' }).click();
+  history.releaseRead();
+  await expect(page.locator('.turn-anchor')).toHaveCount(0);
+  await expect(page.locator('.titlebar h1')).toHaveText('另一段会话');
+});
+
+test('export keeps its existing menu, leaves drafts and the reading position alone and can be cancelled', async ({
+  page,
+}) => {
+  await page.clock.install();
+  const history = await open(page, { count: 60, earlier: 40, holdReads: true });
+  const input = page.getByRole('textbox', { name: '消息', exact: true });
+  await input.fill('未发送的草稿');
+  const track = page.getByRole('slider');
+  await track.focus();
+  await track.press('End');
+  for (let n = 0; n < 10; n++) await track.press('ArrowUp');
+  await track.press('Enter');
+  await fromEnd(page);
+  const scroller = page.locator('.conversation');
+  const position = await scroller.evaluate((element) => element.scrollTop);
+  const nodes = await page.locator('.turn-anchor').count();
+  const exportMenu = async (label: string) => {
+    await page.getByRole('button', { name: '文件', exact: true }).click();
+    await page.getByRole('menuitem', { name: label, exact: true }).click();
+  };
+  let downloads = 0;
+  page.on('download', () => downloads++);
+  await exportMenu('导出当前会话…');
+  await expect.poll(() => history.reads.length).toBe(1);
+  await page.clock.fastForward(5000);
+  await expect(page.locator('.conversation-tools')).toContainText('正在导出');
+  await expect(input).toBeEnabled();
+  await expect(input).toHaveValue('未发送的草稿');
+  expect(await scroller.evaluate((element) => element.scrollTop)).toBe(position);
+  expect(await page.locator('.turn-anchor').count()).toBe(nodes);
+  await exportMenu('取消会话导出');
+  history.releaseRead();
+  await expect(page.locator('.conversation-tools')).toContainText('已取消导出');
+  await page.clock.fastForward(5000);
+  await expect(page.locator('.conversation-tools')).not.toContainText('已取消导出');
+  expect(downloads).toBe(0);
+  await exportMenu('导出当前会话…');
+  await expect.poll(() => history.reads.length).toBe(2);
+  // Changing the current session does not redirect or cancel this independent export.
+  await page.locator('.session-select').filter({ hasText: '另一段会话' }).click();
+  const download = page.waitForEvent('download');
+  for (let n = 0; n < 3; n++) {
+    history.releaseRead();
+    if (n < 2) await expect.poll(() => history.reads.length).toBe(3 + n);
+  }
+  const file = await download;
+  expect(file.suggestedFilename()).toBe('长对话.md');
+  const text = readFileSync((await file.path())!, 'utf8');
+  expect(text).toContain('第0问');
+  expect(text).toContain('第59问');
+  expect(text).toContain('## 第 60 轮');
+  await expect(page.locator('.conversation-tools')).toContainText('已导出“长对话”');
+  await page.clock.fastForward(5000);
+  await expect(page.locator('.conversation-tools')).not.toContainText('已导出');
+  await expect(page.locator('.titlebar h1')).toHaveText('另一段会话');
+  await expect(page.locator('.turn-anchor')).toHaveCount(0);
+  await page.locator('.session-select').filter({ hasText: '长对话' }).click();
+  await expect(input).toHaveValue('未发送的草稿');
 });

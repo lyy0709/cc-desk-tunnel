@@ -65,6 +65,7 @@ export type ClaudeRun = {
   model?: string | null;
   effort?: Effort | null;
   input: NativeInput;
+  scheduled?: 'scheduled' | 'manual';
   dataDir: string;
   resume: boolean;
   signal: AbortSignal;
@@ -75,6 +76,7 @@ export type ClaudeRun = {
     toolId: string,
     waiting: 'approval' | 'question',
     toolName: string,
+    signal: AbortSignal,
   ) => Promise<{
     allowed: boolean;
     answers?: Record<string, string>;
@@ -96,11 +98,10 @@ export type ClaudeRun = {
     promptIds: string[];
     background: boolean;
   }) => void;
-  // Filled in while the CLI is running, so the service can ask it for fresh account quota mid-run and end
+  // Filled in while the CLI is running, so the service can refresh context and observed usage mid-run and end
   // one of its background tasks.
   controls: {
-    // `asked`: the user asked on the account page, which reads the quota anew.
-    refresh?: (asked?: boolean) => Promise<void>;
+    refresh?: () => Promise<void>;
     stopTask?: (taskId: string) => Promise<void>;
     backgroundTask?: (toolId: string) => Promise<boolean>;
   };
@@ -146,13 +147,11 @@ const UNANSWERED: Record<Unanswered, string> = {
 const UNANSWERED_CAPABILITY = 'ask_user_question_unanswered_v1';
 // How long a CLI whose input has ended is given to exit by itself.
 const EXIT_MS = 5000;
+// A mid-turn hook can drop an input without echoing its UUID. Bound that idle, unconfirmed wait.
+const RECEIPT_WAIT_MS = 30_000;
 const loginExpiry = loginExpiryWarnings();
-// The plan quota, held by login for every session and device; the service tells it which clients want it current.
+// The observed plan quota, held by login for every session and device.
 export const quotas = new Quotas();
-const quotaOf =
-  (login: string, asked = false) =>
-  (query: Query) =>
-    quotas.through(login, query, { asked });
 // The PATH of a session's CLI, with its own `ssh`, `scp` and `sftp` first (see `sessionSsh`).
 export function sshPath(
   ssh: SshConnection | undefined,
@@ -232,6 +231,7 @@ export async function runClaude(
   let capabilities: string[] = [];
   let settle: ReturnType<typeof setTimeout> | undefined;
   let exiting: ReturnType<typeof setTimeout> | undefined;
+  let receiptWait: ReturnType<typeof setTimeout> | undefined;
   let settled = false;
   try {
     session = query({
@@ -275,17 +275,25 @@ export async function runClaude(
           ],
         },
         maxTurns: options.maxTurns,
-        env: { ...process.env, ...options.environment, ...sshPath(run.ssh) },
+        env: {
+          ...process.env,
+          ...options.environment,
+          ...sshPath(run.ssh),
+          ...(run.scheduled ? { CLAUDE_CODE_HOST_SCHEDULED_RUN: '1' } : {}),
+        },
         stderr: (text) => {
           stderr = (stderr + text).slice(-8192);
         },
         canUseTool: async (name, input, context) => {
           const tool = mapper.tool(name, input, context.toolUseID);
           const question = name === 'AskUserQuestion';
-          const { allowed, answers, unanswered, executionMode } =
-            context.signal.aborted || run.signal.aborted
-              ? { allowed: false }
-              : await run.approve(tool.id, question ? 'question' : 'approval', name);
+          const signal = AbortSignal.any([context.signal, run.signal]);
+          const { allowed, answers, unanswered, executionMode } = signal.aborted
+            ? { allowed: false }
+            : await run.approve(tool.id, question ? 'question' : 'approval', name, signal);
+          if (signal.aborted) {
+            return { behavior: 'deny', message: 'The permission request was cancelled.' };
+          }
           if (question && unanswered) {
             // A CLI that knows of it is told how the question went: the tool's result says so, and Claude reads
             // the answer given for each question. An older one refuses an answer that says it.
@@ -315,6 +323,7 @@ export async function runClaude(
     });
     const initialized = await session.initializationResult();
     const login = loginOf(initialized.account);
+    quotas.identify(login);
     // The commands change while the run goes on: each turn's `init` names those bound to the CLI's terminal, and
     // skills found on the way bring a new list. A change is passed on once.
     let commands = initialized.commands;
@@ -341,9 +350,9 @@ export async function runClaude(
     const running = session;
     run.controls.stopTask = (taskId) => running.stopTask(taskId);
     run.controls.backgroundTask = (toolId) => running.backgroundTasks(toolId);
-    run.controls.refresh = async (asked) => {
+    run.controls.refresh = async () => {
       const payload = await nativeMetrics(running, undefined, {
-        quota: quotaOf(login, asked),
+        rateLimits: quotas.of(login),
         previous: metrics?.usage,
       });
       if (payload.type === 'native.metrics') metrics = payload;
@@ -354,8 +363,23 @@ export async function runClaude(
     // none is left.
     let background = 0;
     let idle = false;
+    let checkingReceipt = false;
     let told = false;
     let turnStartedAt = Date.now();
+    const waitForReceipt = () => {
+      if (!checkingReceipt || background || !run.input.awaitingReceipt) return;
+      clearTimeout(receiptWait);
+      receiptWait = setTimeout(() => {
+        if (run.signal.aborted || background || !run.input.awaitingReceipt) return;
+        failure = new Error(
+          '原生已结束本轮，但后续消息在 30 秒内仍未确认接收；已停止等待，消息未自动重发。',
+        );
+        settled = true;
+        run.input.close();
+        running.close();
+      }, RECEIPT_WAIT_MS);
+    };
+    run.input.onDrain = waitForReceipt;
     // What each background task last said of itself, and when it was passed on.
     const progress = new Map<string, { said: string; at: number }>();
     for await (const message of session) {
@@ -411,11 +435,15 @@ export async function runClaude(
           }, 3000);
       } else if (
         (message.type === 'system' && message.subtype === 'init') ||
-        ['user', 'assistant', 'stream_event'].includes(message.type)
+        (['user', 'assistant', 'stream_event'].includes(message.type) &&
+          !(message.type === 'stream_event' && String(message.event.type) === 'ping') &&
+          !('parent_tool_use_id' in message && message.parent_tool_use_id))
       ) {
         if (told && !run.signal.aborted) run.waiting(false);
         told = false;
         idle = false;
+        checkingReceipt = false;
+        clearTimeout(receiptWait);
         clearTimeout(settle);
       }
       if (!run.signal.aborted) {
@@ -430,9 +458,9 @@ export async function runClaude(
         Date.now() - refreshedAt >= 5000
       ) {
         refreshedAt = Date.now();
-        // The quota comes as the service holds it, which reads it anew only when due (see `Quotas`).
+        // Quota observations come from the native response events, without a separate request.
         refresh = nativeMetrics(session, undefined, {
-          quota: quotaOf(login),
+          rateLimits: quotas.of(login),
           previous: metrics?.usage,
         })
           .then(
@@ -449,6 +477,8 @@ export async function runClaude(
           });
       }
       if (message.type === 'result') {
+        clearTimeout(receiptWait);
+        checkingReceipt = false;
         const endedAt = Date.now();
         await refresh;
         const done = run.input.endTurn(message, background > 0);
@@ -481,7 +511,7 @@ export async function runClaude(
         promptIds = [];
         if (!run.signal.aborted) {
           try {
-            const payload = await nativeMetrics(session, message, { quota: quotaOf(login) });
+            const payload = await nativeMetrics(session, message, { rateLimits: quotas.of(login) });
             if (payload.type === 'native.metrics') {
               metrics = payload;
               run.emit(ttl ? { ...payload, cacheTtl: ttl } : payload);
@@ -507,6 +537,8 @@ export async function runClaude(
           told = true;
           run.waiting(true);
         }
+        checkingReceipt = message.queued_turn_count === 0 && !background;
+        waitForReceipt();
       }
     }
   } catch (error) {
@@ -515,6 +547,8 @@ export async function runClaude(
   } finally {
     clearTimeout(settle);
     clearTimeout(exiting);
+    clearTimeout(receiptWait);
+    run.input.onDrain = undefined;
     run.controls.refresh = undefined;
     run.controls.stopTask = undefined;
     run.controls.backgroundTask = undefined;
@@ -557,11 +591,7 @@ export async function readNativeStatus(
   signal: AbortSignal,
   // The user asked on the account page; `previous` is the session's last totals, kept if no new ones come. Without
   // `resume` the CLI does not take up the native session, which a terminal may hold.
-  {
-    asked = false,
-    previous = null,
-    resume = true,
-  }: { asked?: boolean; previous?: NativeMetrics['usage']; resume?: boolean } = {},
+  { previous = null, resume = true }: { previous?: NativeMetrics['usage']; resume?: boolean } = {},
 ) {
   const cwd = prepareNativeDirectory(options, dataDir, nativeRoot);
   const saved = resume && (await getSessionInfo(sessionId, { dir: cwd }));
@@ -600,6 +630,7 @@ export async function readNativeStatus(
     })().catch(() => {});
     const initialized = await process.initializationResult();
     const login = loginOf(initialized.account);
+    quotas.identify(login);
     return [
       nativeCapabilities(
         initialized.models,
@@ -607,7 +638,7 @@ export async function readNativeStatus(
         initialized.commands,
         options.model,
       ),
-      await nativeMetrics(process, undefined, { quota: quotaOf(login, asked), previous }),
+      await nativeMetrics(process, undefined, { rateLimits: quotas.of(login), previous }),
     ];
   } finally {
     clearTimeout(timer);

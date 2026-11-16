@@ -2,6 +2,25 @@ import { useSyncExternalStore } from 'react';
 import { onSharedChange, saveShared, shareOnce, shared } from './shared.ts';
 import { defaultView, viewModes } from './transcriptView.ts';
 import type { TranscriptView } from './transcriptView.ts';
+import type { MessagePriority } from '@cc-desk-tunnel/protocol';
+
+export const followupModes = [
+  {
+    priority: 'later',
+    label: '排队',
+    detail: '等当前轮完成后发送；等待时可编辑、删除或立即引导。',
+  },
+  {
+    priority: 'next',
+    label: '追加消息',
+    detail: '等当前工具调用结束后加入当前轮；若当前轮已结束，则进入下一轮。',
+  },
+  {
+    priority: 'now',
+    label: '立即引导',
+    detail: '尽快处理这条消息；可转后台的任务继续运行，其他情况下会中断当前轮。',
+  },
+] as const;
 
 // Choices that belong to this computer and never reach the service: what is pinned, what a project is called
 // here, which events raise a notification, and the keyboard shortcuts. The windows of the computer's
@@ -43,9 +62,7 @@ export type Prefs = {
   stats: { enabled: boolean; summary: Record<string, boolean> };
   // Whether the quota used is shown beside the message box.
   quota: boolean;
-  // Whether the service is to keep the plan quota current while runs go on, reading it once a minute; off, the
-  // quota shown is what the replies carry (see `quota.watch`).
-  quotaReads: boolean;
+  followup: MessagePriority;
   // How much of the work behind a reply is shown.
   view: TranscriptView;
   // The strip under the input box with the whole session's figures; chosen the same way.
@@ -76,7 +93,7 @@ const defaults: Prefs = {
   bypassPermissions: false,
   stats: { enabled: false, summary: {} },
   quota: false,
-  quotaReads: true,
+  followup: 'next',
   view: defaultView,
   sessionBar: { enabled: false, summary: {} },
   theme: 'system',
@@ -124,7 +141,8 @@ function read(saved: any = shared('prefs') ?? stored()): Prefs {
       ) as ConnectionWaits,
       bypassPermissions: saved.bypassPermissions === true,
       quota: saved.quota === true,
-      quotaReads: saved.quotaReads !== false,
+      followup:
+        followupModes.find((entry) => entry.priority === saved.followup)?.priority ?? 'next',
       view: {
         mode: viewModes.find((entry) => entry.mode === saved.view?.mode)?.mode ?? defaultView.mode,
       },

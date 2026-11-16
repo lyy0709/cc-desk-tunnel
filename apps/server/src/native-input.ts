@@ -1,16 +1,22 @@
 import type { SDKUserMessage, SDKMessage } from '@anthropic-ai/claude-agent-sdk';
-import type { EventPayload } from '@cc-desk-tunnel/protocol';
+import type { EventPayload, MessagePriority } from '@cc-desk-tunnel/protocol';
 import { DomainError } from './errors.ts';
 
 // This is only the SDK's input transport. Claude Code owns scheduling and merging turns.
 export class NativeInput {
-  private messages: { id: string; text: string }[] = [];
+  private messages: {
+    id: string;
+    text: string;
+    scheduled?: 'scheduled' | 'manual';
+    priority?: MessagePriority;
+  }[] = [];
   private outstanding = new Map<string, { delivered: boolean; received: boolean }>();
   private wake?: () => void;
   private ended = false;
   private accepting = true;
   private sessionId: string;
   private emit: (event: EventPayload) => void;
+  onDrain?: () => void;
   constructor(sessionId: string, emit: (event: EventPayload) => void) {
     this.sessionId = sessionId;
     this.emit = emit;
@@ -22,10 +28,10 @@ export class NativeInput {
     if (this.outstanding.size >= 32)
       throw new DomainError('input_busy', '已有较多补充消息等待原生处理，请稍后发送。');
   }
-  submit(id: string, text: string) {
+  submit(id: string, text: string, scheduled?: 'scheduled' | 'manual', priority?: MessagePriority) {
     this.assertWritable();
     this.outstanding.set(id, { delivered: false, received: false });
-    this.messages.push({ id, text });
+    this.messages.push({ id, text, scheduled, priority });
     this.emit({ type: 'message.delivery', messageId: id, status: 'submitted' });
     this.wake?.();
   }
@@ -40,13 +46,21 @@ export class NativeInput {
       }
       this.outstanding.get(message.id)!.delivered = true;
       this.emit({ type: 'message.delivery', messageId: message.id, status: 'queued' });
+      if (!this.messages.length) this.onDrain?.();
       yield {
         type: 'user',
         uuid: message.id as SDKUserMessage['uuid'],
         message: { role: 'user', content: message.text },
         parent_tool_use_id: null,
         session_id: this.sessionId,
-        origin: { kind: 'human' },
+        ...(message.priority ? { priority: message.priority } : {}),
+        origin: message.scheduled
+          ? {
+              kind: 'task-notification',
+              subkind: 'scheduled-trigger',
+              fireReason: message.scheduled,
+            }
+          : { kind: 'human' },
       };
     }
   }
@@ -70,6 +84,8 @@ export class NativeInput {
   }
   // `waiting` says background tasks are still alive in the CLI; the turn their completion starts is yet to come.
   endTurn(result: Extract<SDKMessage, { type: 'result' }>, waiting = false) {
+    // An error ends this turn, not the native turns already waiting behind it.
+    if ((result.queued_turn_count ?? 0) > 0) return false;
     // Seal synchronously before post-turn metrics, so new inputs cannot be lost in cleanup.
     if (result.is_error || (!this.outstanding.size && !(result.queued_turn_count ?? 0))) {
       if (waiting && !result.is_error) return false;
@@ -85,6 +101,12 @@ export class NativeInput {
       return true;
     }
     return false;
+  }
+  get awaitingReceipt() {
+    return (
+      !this.messages.length &&
+      [...this.outstanding.values()].some((message) => message.delivered && !message.received)
+    );
   }
   close() {
     if (this.ended) return;

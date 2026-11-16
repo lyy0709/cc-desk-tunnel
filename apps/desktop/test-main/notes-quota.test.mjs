@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { readFileSync } from 'node:fs';
 import { absoluteLinks, alertLabels, releaseSection } from '../src/notes.ts';
-import { quotaFigures } from '../src/quota.ts';
+import { quotaFigures, currentQuota } from '../src/quota.ts';
 
 test('a version’s notes are its section of the changelog, without the heading', () => {
   const text =
@@ -62,6 +62,24 @@ test('the quota beside the message box is the five hours and the fullest week', 
   assert.deepEqual(quotaFigures({ available: true, windows: [window('seven_day', 0)] }), [
     { label: '每周', used: 0, resetsAt: null },
   ]);
+});
+
+test('known reset times expire without inventing a zero reading or changing the observation time', () => {
+  const limits = {
+    available: true,
+    measuredAt: new Date(0).toISOString(),
+    windows: [
+      { name: 'five_hour', utilization: 80, resetsAt: new Date(1000).toISOString() },
+      { name: 'seven_day', utilization: 30, resetsAt: new Date(2000).toISOString() },
+    ],
+  };
+  assert.equal(currentQuota(limits, 1000).measuredAt, limits.measuredAt);
+  assert.deepEqual(quotaFigures(limits, 1000), [
+    { label: '每周', used: 30, resetsAt: new Date(2000).toISOString() },
+  ]);
+  assert.equal(currentQuota(limits, 2000), null);
+  assert.deepEqual(quotaFigures(limits, 2000), []);
+  assert.equal(limits.windows.length, 2);
 });
 
 test("GitHub's alerts in the notes open with their label in the program", () => {

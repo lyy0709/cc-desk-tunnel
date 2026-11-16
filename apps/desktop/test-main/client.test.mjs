@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { randomUUID } from 'node:crypto';
 import { ProxyClient, RequestInterruptedError } from '../src/client.ts';
+import { exportSession } from '../src/exportSession.ts';
 import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
-import { conversation, transcript } from '../src/transcript.ts';
+import { conversation, transcript } from '@cc-desk-tunnel/protocol/transcript';
 import { describe, duration, summarize } from '../src/activity.ts';
 import { cleanDrafts, withoutSentDraft, changeDraftText, insertDraftFiles } from '../src/drafts.ts';
 import {
@@ -26,6 +27,49 @@ test('draft migration keeps old text and file references while discarding interr
       new: { text: '', attachments: [attachment] },
     },
   );
+});
+
+test('queued drafts retain attachments and restore paused instead of replaying an uncertain send', () => {
+  const file = { path: '/tmp/稿件.txt', name: '稿件.txt', deviceId: randomUUID(), reference: 1 };
+  const queued = { id: randomUUID(), text: '看 [文件 #1]', attachments: [file], error: '回执丢失' };
+  const restored = cleanDrafts({
+    session: { text: '另一个草稿', attachments: [], queued: [queued] },
+  }).session;
+  assert.deepEqual(restored.queued, [{ ...queued, paused: true }]);
+  assert.equal(restored.text, '另一个草稿');
+  assert.deepEqual(withoutSentDraft(restored, restored).queued, restored.queued);
+});
+
+test('a withdrawn queue draft retains its send choice until the draft is consumed', () => {
+  const restored = cleanDrafts({
+    session: { text: '编辑后的消息', attachments: [], requeue: true },
+  }).session;
+  assert.equal(restored.requeue, true);
+  const edited = changeDraftText(restored, '进一步修改');
+  assert.equal(edited.requeue, true);
+  assert.equal(withoutSentDraft(edited, restored).requeue, true);
+  assert.equal(withoutSentDraft(edited, edited).requeue, undefined);
+});
+
+test('stashed drafts keep their attachments and return only after the current draft is consumed', () => {
+  const attachment = {
+    name: '草稿.txt',
+    path: '/tmp/草稿.txt',
+    deviceId: randomUUID(),
+    reference: 1,
+  };
+  const original = { text: '原草稿 [文件 #1]', attachments: [attachment] };
+  const draft = cleanDrafts({
+    session: { text: '编辑队列', attachments: [], requeue: true, stashed: [original] },
+  }).session;
+  assert.deepEqual(draft.stashed, [original]);
+  assert.equal(withoutSentDraft({ ...draft, text: '发送时新输入' }, draft).text, '发送时新输入');
+  assert.deepEqual(withoutSentDraft({ ...draft, adding: 1 }, draft).stashed, [original]);
+  const restored = withoutSentDraft(draft, draft);
+  assert.equal(restored.text, original.text);
+  assert.deepEqual(restored.attachments, original.attachments);
+  assert.equal(restored.requeue, undefined);
+  assert.deepEqual(restored.stashed, []);
 });
 
 test('a send receipt only clears the captured text and references, keeping newly added draft content', () => {
@@ -154,6 +198,208 @@ function event(sessionId, sequence, text = 'text') {
     payload: { type: 'text.delta', messageId: randomUUID(), text },
   };
 }
+
+test('detached reading leaves the live cursor intact and a late jump cannot cross sessions', async (t) => {
+  const { client, socket, sessions, snapshot } = fixture(t);
+  const session = sessions[0];
+  client.select(session.id);
+  const latest = event(session.id, 100, '最新正文');
+  snapshot(session, [latest]);
+  const directory = socket.sent.findLast((request) => request.type === 'session.outline');
+  socket.message({
+    type: 'session.outline',
+    requestId: directory.requestId,
+    sessionId: session.id,
+    throughSequence: 100,
+    fromSequence: 0,
+    entries: [],
+  });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const read = client.readWindow(session.id, 'around', 1);
+  const request = socket.sent.at(-1);
+  const page = {
+    type: 'session.read',
+    requestId: request.requestId,
+    session,
+    events: [event(session.id, 1, '旧正文')],
+    firstSequence: 1,
+    lastSequence: 1,
+    throughSequence: 100,
+    hasEarlier: false,
+    hasLater: true,
+    capturedAt: session.createdAt,
+    totalEvents: 100,
+  };
+  socket.message(page);
+  await read;
+  assert.equal(client.state.reading.page.events[0].sequence, 1);
+  assert.equal(client.state.history[session.id].lastSequence, 100);
+  assert.deepEqual(client.shown(session.id), [latest]);
+  socket.message({ type: 'session.event', event: event(session.id, 101, '继续输出') });
+  client.flushStream();
+  assert.equal(client.state.reading.page.lastSequence, 1);
+  assert.equal(client.state.history[session.id].lastSequence, 101);
+  client.returnLatest();
+  assert.equal(client.shown(session.id).at(-1).sequence, 101);
+  const cancelled = client.readWindow(session.id, 'around', 2);
+  const late = socket.sent.at(-1);
+  const rejection = assert.rejects(cancelled, { name: 'AbortError' });
+  client.select(sessions[1].id);
+  socket.message({ ...page, requestId: late.requestId });
+  await rejection;
+  assert.equal(client.state.reading, null);
+  assert.equal(client.state.selectedId, sessions[1].id);
+  client.select(session.id);
+  assert.equal(socket.sent.at(-1).afterSequence, 101);
+});
+
+test('export reads its own snapshot, preserves complete content and never selects or fills the UI history', async (t) => {
+  const { client, socket, sessions, snapshot } = fixture(t);
+  const selected = sessions[0],
+    exported = sessions[1];
+  client.select(selected.id);
+  snapshot(selected, [event(selected.id, 1, '正在阅读')]);
+  const uiEvents = client.state.events;
+  const saved = [];
+  const oldWindow = globalThis.window;
+  globalThis.window = {
+    desktop: {
+      saveFile: async (name, text) => {
+        saved.push({ name, text });
+        return true;
+      },
+    },
+  };
+  t.after(() => {
+    globalThis.window = oldWindow;
+  });
+  const result = exportSession(client, exported);
+  const first = socket.sent.at(-1);
+  assert.equal(first.type, 'session.read');
+  assert.equal(first.purpose, 'export');
+  const run = randomUUID();
+  const make = (sequence, payload) => ({ ...event(exported.id, sequence), runId: run, payload });
+  const firstEvents = [
+    make(1, {
+      type: 'message.user',
+      messageId: randomUUID(),
+      text: '先看[文件 #1]再处理',
+      scenario: 'chat',
+      attachments: [
+        { path: '/tmp/中文 文件.ts', name: '中文 文件.ts', deviceId: randomUUID(), reference: 1 },
+      ],
+    }),
+    make(2, { type: 'thinking.delta', messageId: randomUUID(), text: '保存全部思考' }),
+    make(3, {
+      type: 'tool.requested',
+      toolId: 'tool',
+      name: 'Read',
+      input: '```\n完整输入\n```',
+      target: 'Windows',
+    }),
+    make(4, {
+      type: 'tool.result',
+      toolId: 'tool',
+      output: '完整工具输出',
+      status: 'completed',
+      exitCode: null,
+    }),
+    make(5, { type: 'run.status', status: 'completed', connectionId: randomUUID() }),
+  ];
+  const fragment = event(exported.id, 7, '开始导出时尚未保存的片段');
+  const frame = {
+    type: 'session.read',
+    session: exported,
+    firstSequence: 1,
+    lastSequence: 5,
+    throughSequence: 6,
+    hasEarlier: false,
+    hasLater: true,
+    totalEvents: 6,
+    capturedAt: exported.createdAt,
+  };
+  socket.message({ ...frame, requestId: first.requestId, events: firstEvents, fragment });
+  while (socket.sent.at(-1).requestId === first.requestId)
+    await new Promise((resolve) => setTimeout(resolve, 1));
+  const second = socket.sent.at(-1);
+  assert.equal(second.throughSequence, 6);
+  assert.equal(second.sequence, 5);
+  const last = {
+    ...event(exported.id, 6),
+    runId: fragment.runId,
+    payload: { type: 'message.user', messageId: randomUUID(), text: '下一轮', scenario: 'chat' },
+  };
+  socket.message({
+    ...frame,
+    requestId: second.requestId,
+    events: [last],
+    firstSequence: 6,
+    lastSequence: 6,
+    hasEarlier: true,
+    hasLater: false,
+  });
+  assert.equal(await result, true);
+  assert.equal(saved.length, 1);
+  for (const text of [
+    '## 第 1 轮',
+    '## 第 2 轮',
+    '保存全部思考',
+    '完整输入',
+    '完整工具输出',
+    '先看"/tmp/中文 文件.ts"再处理',
+    fragment.payload.text,
+  ])
+    assert.ok(saved[0].text.includes(text), text);
+  assert.equal(client.state.selectedId, selected.id);
+  assert.equal(client.state.events, uiEvents);
+  assert.equal(client.state.history[exported.id], undefined);
+});
+
+test('cancelled or disconnected export does not write a partial file or cancel a view read', async (t) => {
+  const { client, socket, sessions } = fixture(t);
+  const saved = [];
+  const oldWindow = globalThis.window;
+  globalThis.window = {
+    desktop: {
+      saveFile: async (...value) => {
+        saved.push(value);
+        return true;
+      },
+    },
+  };
+  t.after(() => {
+    globalThis.window = oldWindow;
+  });
+  const controller = new AbortController();
+  const exporting = exportSession(client, sessions[0], { signal: controller.signal });
+  const request = socket.sent.at(-1);
+  const view = client.fetch({
+    type: 'session.read',
+    sessionId: sessions[0].id,
+    purpose: 'view',
+    direction: 'around',
+    sequence: 1,
+  });
+  const viewId = socket.sent.at(-1).requestId;
+  const rejected = assert.rejects(exporting, { name: 'AbortError' });
+  controller.abort();
+  await rejected;
+  assert.ok(client.pending.has(viewId));
+  assert.equal(socket.sent.at(-1).requestId, request.requestId);
+  const failed = exportSession(client, sessions[0]);
+  socket.message({
+    type: 'response',
+    requestId: socket.sent.at(-1).requestId,
+    ok: false,
+    message: '读取失败',
+  });
+  await assert.rejects(failed, /读取失败/);
+  const lostExport = assert.rejects(exportSession(client, sessions[0]), RequestInterruptedError);
+  const interrupted = assert.rejects(view, RequestInterruptedError);
+  client.disconnect();
+  await Promise.all([interrupted, lostExport]);
+  assert.deepEqual(saved, []);
+});
 
 test('history parts preserve the snapshot boundary while live output continues and renew only their own wait', async (t) => {
   t.mock.timers.enable({ apis: ['setTimeout'] });
@@ -637,6 +883,47 @@ test('conversation folds a finished turn into question, activity and answer', ()
   assert.equal(duration(turn.startedAt, turn.endedAt), '1 分 7 秒');
   assert.equal(summarize(turn.steps[1], false, false).label, '读取了 1 个文件，编辑了 1 个文件');
   assert.equal(turns[1].endedAt, undefined);
+});
+
+test('command summaries show the actual first line and preserve the full command for reading', () => {
+  const command = '  printf "中文\\n"\npwd\n';
+  const tool = {
+    name: 'Bash',
+    input: JSON.stringify({ command, description: '核对目录' }),
+    state: 'running',
+  };
+  const described = describe(tool, true);
+  assert.equal(described.subject, 'printf "中文\\n"');
+  assert.equal(described.command, command);
+  assert.equal(described.description, '核对目录');
+  assert.equal(describe({ ...tool, name: 'PowerShell' }, true).command, command);
+  assert.equal(describe({ ...tool, name: 'Read' }, true).command, null);
+  for (const input of ['{"command":', '{}', '{"command":false}', '{"command":"   "}'])
+    assert.equal(describe({ ...tool, input }, true).command, null);
+});
+
+test('SSH heredoc input decodes newlines and quotes without changing shell content', () => {
+  // Same shape as a native command forwarded to the local shell; the address is a documentation fixture.
+  const input = String.raw`{
+    "command": "ssh device-zsh <<'SH'\nfor u in ubuntu lighthouse admin; do\n  echo \"--- trying $u\"\n  ssh -p 18022 -o BatchMode=yes -o ConnectTimeout=10 \"$u@203.0.113.10\" 'hostname; whoami' 2>&1 | head -5\ndone\necho \"--- ssh agent identities (fingerprints only) ---\"\nssh-add -l 2>&1 | head -5\nSH",
+    "description": "Try other default users on the server"
+  }`;
+  const parsed = describe({ name: 'Bash', input, state: 'completed' }, false);
+  assert.equal(
+    parsed.command,
+    [
+      "ssh device-zsh <<'SH'",
+      'for u in ubuntu lighthouse admin; do',
+      '  echo "--- trying $u"',
+      '  ssh -p 18022 -o BatchMode=yes -o ConnectTimeout=10 "$u@203.0.113.10" \'hostname; whoami\' 2>&1 | head -5',
+      'done',
+      'echo "--- ssh agent identities (fingerprints only) ---"',
+      'ssh-add -l 2>&1 | head -5',
+      'SH',
+    ].join('\n'),
+  );
+  assert.equal(parsed.subject, "ssh device-zsh <<'SH'");
+  assert.equal(parsed.description, 'Try other default users on the server');
 });
 
 test('scheduled tasks: the file round-trips, bad tasks are named, and rules find their next time', () => {

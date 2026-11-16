@@ -44,6 +44,34 @@ test('message dates, selection menu, code copy and conversation find work togeth
   const find = page.getByRole('search', { name: '对话内查找' });
   await find.getByRole('textbox').fill('阅读唯一词');
   await expect(find.getByRole('status')).toHaveText('1 / 4');
+  const checkFindLayout = async () => {
+    await find.getByRole('textbox').focus();
+    const overlaps = await find.evaluate((element) => {
+      const input = element.querySelector('input')!;
+      const style = getComputedStyle(input);
+      const reach = parseFloat(style.outlineWidth) + parseFloat(style.outlineOffset);
+      const box = input.getBoundingClientRect();
+      return [...element.children]
+        .filter((child) => child !== input)
+        .some((child) => {
+          const other = child.getBoundingClientRect();
+          return (
+            box.right + reach > other.left &&
+            box.left - reach < other.right &&
+            box.bottom + reach > other.top &&
+            box.top - reach < other.bottom
+          );
+        });
+    });
+    expect(overlaps, 'the focused input must not cover the count or navigation buttons').toBe(
+      false,
+    );
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(
+      true,
+    );
+  };
+  await checkFindLayout();
+  await page.screenshot({ path: join(screenshots, 'conversation-find-wide.png') });
   await find.getByRole('button', { name: '下一个匹配（Enter）', exact: true }).click();
   await expect(find.getByRole('status')).toHaveText('2 / 4');
   await find.getByRole('textbox').press('Enter');
@@ -76,8 +104,10 @@ test('message dates, selection menu, code copy and conversation find work togeth
     'const value = "中文";\n',
   );
   await page.setViewportSize({ width: 390, height: 844 });
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await expect(page.locator('.sidebar-shade')).toBeHidden();
   await expect(find).toBeVisible();
-  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await checkFindLayout();
   await page.screenshot({ path: join(screenshots, 'conversation-find-narrow.png') });
 });
 

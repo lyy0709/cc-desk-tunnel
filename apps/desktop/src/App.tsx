@@ -36,6 +36,7 @@ import {
 import { GithubMark, openProject, project } from './project.tsx';
 import type {
   FileAttachment,
+  MessagePriority,
   Effort,
   EventPayload,
   PermissionMode,
@@ -170,6 +171,9 @@ export function App({
   const [error, setError] = useState<string | RequestInterruptedError | null>(null);
   // One request at a time from this window; `refreshing` is the slower native status read.
   const [busy, setBusy] = useState(false);
+  const exporting = useRef<{ sessionId: string; controller: AbortController } | null>(null);
+  const [exportingId, setExportingId] = useState<string | null>(null);
+  const [exportStatus, setExportStatus] = useState('');
   const [refreshing, setRefreshing] = useState(false);
   const [findRequest, setFindRequest] = useState(0);
   const [statusRequest, setStatusRequest] = useState(0);
@@ -191,6 +195,8 @@ export function App({
   // The folders that hold sessions without a project; new ones are made in the first.
   const [workspaceRoots, setWorkspaceRoots] = useState<string[]>([]);
   const [drafts, setDraft, updateDraft] = useDrafts();
+  const queueFlight = useRef<string | null>(null);
+  const [sendingQueued, setSendingQueued] = useState<string | null>(null);
   const [scenario, setScenario] = useState<Scenario>('chat');
   const [slashOpen, setSlashOpen] = useState(false);
   // The side column is shown beside the page on a wide window and laid over it on a narrow one.
@@ -388,6 +394,45 @@ export function App({
     [selected?.id, recorded, unfinished],
   );
   const history = selected ? state.history[selected.id] : undefined;
+  const reading = state.reading?.page.session.id === selected?.id ? state.reading : null;
+  const readingEvents = useMemo(
+    () =>
+      reading
+        ? [
+            ...reading.page.events,
+            ...(!reading.page.hasLater && reading.page.fragment ? [reading.page.fragment] : []),
+          ]
+        : events,
+    [reading?.page, reading ? null : events],
+  );
+  const readingHistory = reading
+    ? {
+        firstSequence: reading.page.firstSequence,
+        lastSequence: reading.page.lastSequence,
+        hasEarlier: reading.page.hasEarlier,
+        loading: false,
+        loadingEarlier: reading.loading,
+      }
+    : history;
+  useEffect(() => {
+    const active = exporting.current;
+    if (
+      active &&
+      (!connected || !state.sessions.some((session) => session.id === active.sessionId))
+    )
+      active.controller.abort();
+  }, [connected, state.sessions]);
+  useEffect(
+    () => () => {
+      exporting.current?.controller.abort();
+    },
+    [],
+  );
+  useEffect(() => {
+    if (exportingId || !exportStatus) return;
+    const timer = setTimeout(() => setExportStatus(''), 4000);
+    return () => clearTimeout(timer);
+  }, [exportingId, exportStatus]);
   const runtime = sessionRuntime(selected, events, connected, nativeMode);
   const nativeSession = selected?.activeRun
     ? runtime.nativeSession
@@ -471,6 +516,26 @@ export function App({
   ];
   const composition = selected ? (drafts[selected.id] ?? emptyDraft) : emptyDraft;
   const draft = composition.text;
+  useEffect(() => {
+    if (!nativeMode || !connected || busy || refreshing || queueFlight.current) return;
+    for (const session of state.sessions) {
+      if (session.activeRun && session.activeRun.waiting !== 'background') continue;
+      const first = drafts[session.id]?.queued?.[0];
+      if (!first || first.paused) continue;
+      if (
+        !session.activeRun &&
+        (session.lastRunStatus === 'cancelled' || session.lastRunStatus === 'failed')
+      ) {
+        updateDraft(session.id, (current) => ({
+          ...current,
+          queued: current.queued?.map((message) => ({ ...message, paused: true })),
+        }));
+        continue;
+      }
+      void sendQueued(session.id, first.id, 'later');
+      break;
+    }
+  }, [nativeMode, connected, busy, refreshing, state.sessions, drafts]);
   // The last turn of the session did not reach its end: it can be taken up again from the message box.
   const lastStatus = selected
     ? state.events[selected.id]?.findLast((event) => event.payload.type === 'run.status')?.payload
@@ -724,11 +789,6 @@ export function App({
   useEffect(() => {
     if (nativeMode && connected) void client.request({ type: 'compaction.get' }).catch(() => {});
   }, [nativeMode, connected]);
-  // Each connection tells the service anew whether this client wants the quota kept current.
-  useEffect(() => {
-    if (nativeMode && connected)
-      void client.request({ type: 'quota.watch', active: prefs.quotaReads }).catch(() => {});
-  }, [nativeMode, connected, prefs.quotaReads]);
   useEffect(() => {
     if (
       !accountOpen ||
@@ -795,6 +855,10 @@ export function App({
   function stopRun() {
     if (!selected?.activeRun) return;
     const { id: sessionId, activeRun } = selected;
+    updateDraft(sessionId, (current) => ({
+      ...current,
+      queued: current.queued?.map((message) => ({ ...message, paused: true })),
+    }));
     void act(async () => {
       await client.request({ type: 'run.cancel', sessionId, runId: activeRun.id });
     });
@@ -881,12 +945,11 @@ export function App({
         setCcdtNeeded(opened.status === 'outdated' ? { installed: opened.installed } : {});
     });
   }
-  // `quota`: asked for on the account page, which reads the plan quota anew.
-  async function refreshStatus(sessionId = selected?.id ?? sessions[0]?.id, quota = false) {
+  async function refreshStatus(sessionId = selected?.id ?? sessions[0]?.id) {
     if (!sessionId || refreshing) return;
     setRefreshing(true);
     try {
-      await client.request({ type: 'session.status', sessionId, ...(quota ? { quota } : {}) });
+      await client.request({ type: 'session.status', sessionId });
     } catch (error) {
       setError(
         error instanceof RequestInterruptedError
@@ -949,7 +1012,7 @@ export function App({
   );
   useEffect(() => window.desktop?.onNotifyClicked((sessionId) => sessionId && show(sessionId)));
   const schedules = useSchedules(
-    async (task, due) => {
+    async (task, due, scheduled) => {
       const { status, sessions, selectedId, device } = client.state;
       if (
         status !== 'connected' ||
@@ -991,6 +1054,7 @@ export function App({
         sessionId: session.id,
         text: taskMessage(task, due),
         scenario: 'chat',
+        scheduled,
       });
       return true;
     },
@@ -1040,7 +1104,49 @@ export function App({
       show(response.sessionId);
     });
   }
-  async function send(text = draft) {
+  async function sendQueued(sessionId: string, messageId: string, priority: MessagePriority) {
+    if (queueFlight.current || busy || !connected) return;
+    const session = client.state.sessions.find((item) => item.id === sessionId);
+    const message = drafts[sessionId]?.queued?.find((item) => item.id === messageId);
+    if (!session || !message || session.activeRun?.surface === 'terminal') return;
+    queueFlight.current = messageId;
+    setSendingQueued(messageId);
+    setBusy(true);
+    setError(null);
+    updateDraft(sessionId, (current) => ({
+      ...current,
+      queued: current.queued?.map((item) =>
+        item.id === messageId ? { ...item, paused: true, error: undefined } : item,
+      ),
+    }));
+    try {
+      await client.request({
+        type: 'message.send',
+        sessionId,
+        text: message.text,
+        ...(message.attachments.length ? { attachments: message.attachments } : {}),
+        scenario: 'chat',
+        priority,
+      });
+      updateDraft(sessionId, (current) => ({
+        ...current,
+        queued: current.queued?.filter((item) => item.id !== messageId),
+      }));
+    } catch (cause) {
+      const message = cause instanceof Error ? cause.message : '消息发送失败。';
+      updateDraft(sessionId, (current) => ({
+        ...current,
+        queued: current.queued?.map((item) =>
+          item.id === messageId ? { ...item, paused: true, error: message } : item,
+        ),
+      }));
+    } finally {
+      queueFlight.current = null;
+      setSendingQueued(null);
+      setBusy(false);
+    }
+  }
+  async function send(text = draft, priority?: MessagePriority) {
     if (!selected || composition.adding || (!text.trim() && !composition.attachments.length))
       return;
     const command = nativeMode ? localCommand(text) : null;
@@ -1086,6 +1192,27 @@ export function App({
       return;
     }
     setSlashOpen(false);
+    const delivery =
+      priority ??
+      (composition.requeue
+        ? 'later'
+        : selected.activeRun?.waiting === 'question'
+          ? 'next'
+          : prefs.followup);
+    if (
+      nativeMode &&
+      selected.activeRun &&
+      selected.activeRun.waiting !== 'background' &&
+      !command &&
+      delivery === 'later'
+    ) {
+      const message = { id: crypto.randomUUID(), text, attachments: sent.attachments };
+      updateDraft(sessionId, (current) => ({
+        ...withoutSentDraft(current, sent),
+        queued: [...(current.queued ?? []), message],
+      }));
+      return;
+    }
     await act(async () => {
       if (command?.name === 'plan') {
         if (selected.permissionMode !== 'plan')
@@ -1099,6 +1226,7 @@ export function App({
         text: command?.body ?? text,
         ...(sent.attachments.length ? { attachments: sent.attachments } : {}),
         scenario,
+        ...(nativeMode && selected.activeRun && !command ? { priority: delivery } : {}),
       });
       updateDraft(sessionId, (current) => withoutSentDraft(current, sent));
     });
@@ -1133,6 +1261,36 @@ export function App({
         ...values,
       });
     });
+  }
+  async function exportConversation(session: Session) {
+    if (exporting.current) {
+      exporting.current.controller.abort();
+      return;
+    }
+    const controller = new AbortController();
+    exporting.current = { sessionId: session.id, controller };
+    setExportingId(session.id);
+    setExportStatus(`正在导出“${session.title}”…`);
+    setError(null);
+    try {
+      const saved = await exportSession(client, session, {
+        signal: controller.signal,
+        progress: (read, total) =>
+          setExportStatus(
+            `正在导出“${session.title}” · ${read.toLocaleString()} / ${total.toLocaleString()} 条记录`,
+          ),
+      });
+      setExportStatus(saved ? `已导出“${session.title}”` : '已取消导出');
+    } catch (cause) {
+      if (controller.signal.aborted) setExportStatus('已取消导出');
+      else {
+        setExportStatus('');
+        setError(cause instanceof RequestInterruptedError ? cause : (cause as Error).message);
+      }
+    } finally {
+      exporting.current = null;
+      setExportingId(null);
+    }
   }
   function sessionMenu(session: Session): MenuItem[] {
     const idle = connected && !busy;
@@ -1170,13 +1328,11 @@ export function App({
           ]
         : []),
       {
-        label: '导出为 Markdown',
+        label: exportingId === session.id ? '取消导出' : '导出为 Markdown',
         icon: <FileDown />,
-        disabled: !connected,
+        disabled: !connected || (!!exportingId && exportingId !== session.id),
         run: () => {
-          void act(async () => {
-            await exportSession(client, session);
-          });
+          void exportConversation(session);
         },
       },
       // A session on another computer is taken over first, with a directory here.
@@ -1443,13 +1599,12 @@ export function App({
             ]
           : []),
         {
-          label: '导出当前会话…',
-          disabled: !selected || !connected,
+          label: exportingId ? '取消会话导出' : '导出当前会话…',
+          disabled: !exportingId && (!selected || !connected),
           separated: true,
           run: () => {
-            void act(async () => {
-              await exportSession(client, selected!);
-            });
+            if (exporting.current) exporting.current.controller.abort();
+            else void exportConversation(selected!);
           },
         },
         { label: browser ? '退出登录' : '断开连接', separated: true, run: disconnect },
@@ -1541,6 +1696,7 @@ export function App({
       newSession: canCreate && (() => void newSession()),
       settings: () => open('settings'),
       find: !!selected && place.page === 'chat' && (() => setFindRequest((value) => value + 1)),
+      steer: false, // The message box owns this shortcut, so it never submits from another control.
       zoomIn: window.desktop && (() => window.desktop!.zoom(1)),
       zoomOut: window.desktop && (() => window.desktop!.zoom(-1)),
       zoomReset: window.desktop && (() => window.desktop!.zoom(0)),
@@ -1791,7 +1947,7 @@ export function App({
               disabled={!state.sessions.length || !connected || refreshing}
               error={currentError}
               refresh={() => {
-                void refreshStatus(undefined, true);
+                void refreshStatus();
               }}
             />
           }
@@ -1861,8 +2017,21 @@ export function App({
                   session={selected}
                   here={!!selected && onThis(selected)}
                   deviceId={window.desktop && !browser ? state.device?.id : undefined}
-                  events={events}
-                  history={history}
+                  events={readingEvents}
+                  currentEvents={events}
+                  history={readingHistory}
+                  outline={selected ? state.outlines[selected.id] : undefined}
+                  reading={!!reading}
+                  hasLater={!!reading?.page.hasLater}
+                  readTurn={(entry) => client.readWindow(selected!.id, 'around', entry.sequence)}
+                  loadLater={() =>
+                    client.readWindow(selected!.id, 'after', reading!.page.lastSequence)
+                  }
+                  returnLatest={() => client.returnLatest()}
+                  retryOutline={() => {
+                    void client.loadOutline(selected!.id);
+                  }}
+                  exportStatus={exportStatus}
                   connected={connected}
                   native={nativeMode}
                   ownsRun={ownsRun}
@@ -2042,6 +2211,11 @@ export function App({
                             setMenu({ kind: 'move', sessionId: selected.id, ...position })
                     }
                     draft={composition}
+                    followup={prefs.followup}
+                    sendingQueued={sendingQueued}
+                    sendQueued={(id, priority) => {
+                      void sendQueued(selected.id, id, priority);
+                    }}
                     updateDraft={(update) => {
                       if (client.state.sessions.some((session) => session.id === selected.id))
                         updateDraft(selected.id, update);
@@ -2069,8 +2243,8 @@ export function App({
                     capabilities={capabilities}
                     nativeSession={nativeSession}
                     metrics={metrics}
-                    send={(text) => {
-                      void send(text);
+                    send={(text, priority) => {
+                      void send(text, priority);
                     }}
                     resume={stopped && !inputDisabled ? resume : undefined}
                     refresh={() => {

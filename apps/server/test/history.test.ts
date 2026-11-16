@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { SessionStore } from '../src/store.ts';
 import type { EventPayload } from '@cc-desk-tunnel/protocol';
+import { conversation, conversationOutline } from '@cc-desk-tunnel/protocol/transcript';
 
 function fixture(t: TestContext) {
   const directory = mkdtempSync(join(tmpdir(), 'cc-desk-tunnel-history-'));
@@ -31,6 +32,198 @@ function reopenAsOld(made: { store: SessionStore; directory: string }) {
 }
 const texts = (events: { payload: EventPayload }[]) =>
   events.map(({ payload }) => (payload.type === 'text.delta' ? payload.text : '')).join('');
+
+test('the last run outcome is available in the directory and survives reopening', (t) => {
+  const f = fixture(t);
+  for (const status of ['completed', 'cancelled', 'failed'] as const) {
+    const run = randomUUID(),
+      connectionId = randomUUID();
+    f.made.store.append(f.session.id, run, { type: 'run.status', status: 'running', connectionId });
+    f.made.store.append(f.session.id, run, { type: 'run.status', status, connectionId });
+    assert.equal(f.made.store.list()[0].lastRunStatus, status);
+    f.made.store.close();
+    f.made.store = new SessionStore(f.directory);
+    assert.equal(f.made.store.get(f.session.id).session.lastRunStatus, status);
+  }
+});
+
+test('the full outline follows transcript boundaries, including continuations, queued questions and terminals', async (t) => {
+  const { store, session } = fixture(t);
+  const connectionId = randomUUID();
+  const append = (runId: string, payload: EventPayload) => store.append(session.id, runId, payload);
+  append(randomUUID(), { type: 'native.notice', text: '没有提问的历史' });
+  const run = randomUUID();
+  append(run, { type: 'message.user', messageId: randomUUID(), text: '第一问', scenario: 'chat' });
+  append(run, { type: 'thinking.delta', messageId: randomUUID(), text: '完整思考'.repeat(1000) });
+  append(run, {
+    type: 'tool.requested',
+    toolId: 'one',
+    name: 'Read',
+    input: '不能进入目录的工具输入'.repeat(1000),
+    target: 'Windows',
+  });
+  append(run, {
+    type: 'tool.result',
+    toolId: 'one',
+    output: '不能进入目录的工具输出'.repeat(1000),
+    status: 'completed',
+    exitCode: null,
+  });
+  append(run, {
+    type: 'message.user',
+    messageId: randomUUID(),
+    text: '运行中补问',
+    scenario: 'chat',
+  });
+  append(run, {
+    type: 'text.delta',
+    messageId: randomUUID(),
+    text: '# 回答\n' + '内容'.repeat(1000),
+  });
+  append(run, { type: 'run.status', status: 'cancelled', connectionId });
+  const before = await store.outline(session.id, randomUUID());
+  const continued = randomUUID();
+  append(continued, {
+    type: 'message.user',
+    messageId: randomUUID(),
+    text: '继续',
+    continued: true,
+    scenario: 'chat',
+  });
+  append(continued, { type: 'native.notice', text: 'compacting' });
+  append(continued, { type: 'native.compact', trigger: 'auto', previousTokens: 123 });
+  append(continued, { type: 'text.delta', messageId: randomUUID(), text: '继续之后的回答' });
+  append(continued, { type: 'run.status', status: 'completed', connectionId });
+  const terminal = randomUUID();
+  append(terminal, {
+    type: 'run.status',
+    status: 'running',
+    surface: 'terminal',
+    activity: 'working',
+    connectionId,
+  });
+  for (let n = 0; n < 2; n++) {
+    append(terminal, {
+      type: 'message.user',
+      messageId: randomUUID(),
+      text: `终端${n}`,
+      scenario: 'chat',
+    });
+    append(terminal, { type: 'text.delta', messageId: randomUUID(), text: `终端回答${n}` });
+    append(terminal, {
+      type: 'run.status',
+      status: 'running',
+      surface: 'terminal',
+      activity: 'idle',
+      connectionId,
+    });
+  }
+  const all = store.snapshot(session.id).events;
+  const outline = await store.outline(session.id, randomUUID());
+  assert.deepEqual(outline.entries, conversationOutline(all));
+  assert.equal(outline.entries.length, 5);
+  assert.equal(JSON.stringify(outline).includes('不能进入目录'), false);
+  const incremental = await store.outline(
+    session.id,
+    randomUUID(),
+    before.entries.at(-1)!.sequence,
+  );
+  assert.deepEqual(
+    [
+      ...before.entries.filter((entry) => entry.sequence < incremental.fromSequence),
+      ...incremental.entries,
+    ],
+    outline.entries,
+  );
+  for (const entry of outline.entries) {
+    const page = store.read(session.id, randomUUID(), 'around', entry.sequence);
+    assert.ok(conversation(page.events).some((turn) => turn.id === entry.id));
+  }
+});
+
+test('10,000-turn outlines stay small and direct reads and forward export respect a fixed boundary', async (t) => {
+  const { store, session } = fixture(t);
+  const connectionId = randomUUID();
+  // Bulk insertion is fixture setup; exercise the real store queries on a large existing library.
+  const insert = store.database.prepare('INSERT INTO events VALUES (?, ?, ?, ?)');
+  let sequence = 0;
+  store.database.exec('BEGIN');
+  for (let n = 0; n < 10000; n++) {
+    const runId = randomUUID();
+    const payloads: EventPayload[] = [
+      { type: 'message.user', messageId: randomUUID(), text: `问题${n}`, scenario: 'chat' },
+      { type: 'tool.requested', toolId: `tool-${n}`, name: 'Read', input: '{}', target: 'Windows' },
+      {
+        type: 'tool.result',
+        toolId: `tool-${n}`,
+        output: n % 100 === 0 ? '大型工具结果'.repeat(40000) : '结果',
+        status: 'completed',
+        exitCode: null,
+      },
+      { type: 'text.delta', messageId: randomUUID(), text: `回答${n}` },
+      { type: 'run.status', status: 'completed', connectionId },
+    ];
+    for (const payload of payloads) {
+      const event = {
+        sessionId: session.id,
+        runId,
+        sequence: ++sequence,
+        createdAt: session.createdAt,
+        payload,
+      };
+      insert.run(session.id, sequence, runId, JSON.stringify(event));
+    }
+  }
+  store.database.exec('COMMIT');
+  let yielded = false;
+  setImmediate(() => {
+    yielded = true;
+  });
+  const outline = await store.outline(session.id, randomUUID());
+  assert.ok(yielded, 'Directory scanning yields between batches');
+  assert.equal(outline.entries.length, 10000);
+  assert.ok(Buffer.byteLength(JSON.stringify(outline)) < 3 * 1024 * 1024);
+  assert.equal(JSON.stringify(outline).includes('大型工具结果'), false);
+  const controller = new AbortController();
+  const cancelled = store.outline(session.id, randomUUID(), 0, controller.signal);
+  controller.abort();
+  await assert.rejects(cancelled, /历史读取已取消/);
+  const target = outline.entries[4000];
+  const around = store.read(session.id, randomUUID(), 'around', target.sequence);
+  assert.equal(around.lastSequence, target.sequence + 4);
+  assert.ok(around.events.length < 1001);
+  assert.ok(around.hasEarlier && around.hasLater);
+  const earlier = store.read(
+    session.id,
+    randomUUID(),
+    'before',
+    around.firstSequence,
+    around.throughSequence,
+  );
+  const later = store.read(
+    session.id,
+    randomUUID(),
+    'after',
+    around.lastSequence,
+    around.throughSequence,
+  );
+  assert.equal(earlier.lastSequence + 1, around.firstSequence);
+  assert.equal(later.firstSequence, around.lastSequence + 1);
+  let page = store.read(session.id, randomUUID(), 'after', 0);
+  const upper = page.throughSequence;
+  store.append(session.id, randomUUID(), { type: 'native.notice', text: '导出开始之后' });
+  let count = page.events.length;
+  while (page.hasLater) {
+    const next = store.read(session.id, randomUUID(), 'after', page.lastSequence, upper);
+    assert.equal(next.firstSequence, page.lastSequence + 1);
+    count += next.events.length;
+    page = next;
+  }
+  assert.equal(count, 50000);
+  assert.equal(page.lastSequence, upper);
+  assert.equal(page.totalEvents, 50000);
+  assert.throws(() => store.read(session.id, randomUUID(), 'around', upper + 3), /游标/);
+});
 
 test('history pages retain complete runs of a merged library without losing content or cursors', (t) => {
   const f = fixture(t);
@@ -168,6 +361,38 @@ test('a single oversized run stays intact and earlier runs remain accessible', (
     earlier,
   ]);
   assert.deepEqual(store.history(session.id, randomUUID(), 0, earlier.sequence).events, []);
+});
+
+test('an initial page beginning with a large continuation keeps its original question', (t) => {
+  const { store, session } = fixture(t);
+  const first = randomUUID(),
+    continuation = randomUUID();
+  const question = store.append(session.id, first, {
+    type: 'message.user',
+    messageId: randomUUID(),
+    text: '原问题',
+    scenario: 'chat',
+  });
+  store.append(session.id, first, { type: 'text.delta', messageId: randomUUID(), text: '暂停前' });
+  store.append(session.id, continuation, {
+    type: 'message.user',
+    messageId: randomUUID(),
+    text: '继续',
+    continued: true,
+    scenario: 'chat',
+  });
+  store.append(session.id, continuation, {
+    type: 'text.delta',
+    messageId: randomUUID(),
+    text: 'x'.repeat(600000),
+  });
+  const page = store.history(session.id, randomUUID());
+  assert.equal(page.firstSequence, question.sequence);
+  assert.deepEqual(
+    conversation(page.events).map((turn) => turn.id),
+    conversation(store.snapshot(session.id).events).map((turn) => turn.id),
+  );
+  assert.equal(page.hasEarlier, false);
 });
 
 test('the event limit also pages runs with only small state readings', (t) => {

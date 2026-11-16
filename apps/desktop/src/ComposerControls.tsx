@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { ArrowLeft, ChevronDown, ChevronRight, Check, RotateCcw } from 'lucide-react';
 import { usePrefs } from './prefs.ts';
-import { quotaFigures } from './quota.ts';
+import { quotaFigures, useQuota } from './quota.ts';
 import type {
   Effort,
   NativeCapabilities,
@@ -94,7 +94,8 @@ export default function ComposerControls({
     commitPending.current = false;
     dragging.current = false;
   }, [model]);
-  const quota = usePrefs().quota ? quotaFigures(metrics?.rateLimits) : [];
+  const limits = useQuota(metrics?.rateLimits);
+  const quota = usePrefs().quota ? quotaFigures(limits) : [];
   const fullest = Math.max(0, ...quota.map((figure) => figure.used));
   return (
     <div className="composer-controls" ref={container}>

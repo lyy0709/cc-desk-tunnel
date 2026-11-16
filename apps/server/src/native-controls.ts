@@ -14,15 +14,8 @@ import type {
 } from '@cc-desk-tunnel/protocol';
 
 type ContextUsage = Awaited<ReturnType<Query['getContextUsage']>>;
-type UsageReading = Awaited<
-  ReturnType<Query['usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET']>
->;
 type Windows = NonNullable<Metrics['rateLimits']>['windows'];
 export type ObservedQuota = { windows: Windows; measuredAt: string };
-// `seven_day_overage_included` is the weekly window of the models the plan counts apart. The response headers do not
-// say which models those are, so it keeps its own name rather than one guessed after native `/usage`, which names the
-// same window after the model the server calls it by.
-type UnifiedWindow = { utilization?: number; resetsAt?: number };
 
 // Who the CLI is signed in as. A reading seen under one login says nothing about another.
 export function loginOf(account: NativeCapabilities['account']) {
@@ -37,34 +30,23 @@ export function loginOf(account: NativeCapabilities['account']) {
   ]);
 }
 
-// The CLI passes on the quota its own model requests were answered with as `rate_limit_event`. A login with
-// CLAUDE_CODE_OAUTH_TOKEN may not read the plan quota through `/usage`, but its requests carry it all the same.
-// `unifiedWindows` names every window of the response; it is not in the SDK's published type. Without it the event
-// speaks for one window. Utilization comes as a fraction and the reset as Unix seconds.
+// Quota comes only from the public event fields, in fractions and Unix seconds.
 export function observedQuota(
   event: SDKRateLimitEvent,
   previous: ObservedQuota | null,
   now = Date.now(),
 ): ObservedQuota | null {
-  const info = event.rate_limit_info as SDKRateLimitEvent['rate_limit_info'] & {
-    unifiedWindows?: Record<string, UnifiedWindow | undefined>;
-  };
-  const named: [string, UnifiedWindow | undefined][] = info.unifiedWindows
-    ? Object.entries(info.unifiedWindows)
-    : info.rateLimitType && info.rateLimitType !== 'overage'
-      ? [[info.rateLimitType, info]]
-      : [];
-  const windows = named.flatMap(([name, window]) =>
-    window && Number.isFinite(window.utilization)
+  const info = event.rate_limit_info;
+  const windows =
+    info.rateLimitType && info.rateLimitType !== 'overage' && Number.isFinite(info.utilization)
       ? [
           {
-            name,
-            utilization: Math.max(0, window.utilization! * 100),
-            resetsAt: window.resetsAt ? new Date(window.resetsAt * 1000).toISOString() : null,
+            name: info.rateLimitType,
+            utilization: Math.max(0, info.utilization! * 100),
+            resetsAt: info.resetsAt ? new Date(info.resetsAt * 1000).toISOString() : null,
           },
         ]
-      : [],
-  );
+      : [];
   return merged(windows, previous, now);
 }
 
@@ -123,8 +105,7 @@ export class ObservedQuotas {
   }
 }
 
-// A stored reading outlives its window: once the reset time passes, the figure no longer holds. The CLI drops such
-// windows from `unifiedWindows` the same way; a window without a reset time cannot be told apart and is dropped too.
+// A reading stops describing the current window once its reset time passes. Without a reset it cannot be dated.
 export function unexpired(observed: ObservedQuota | null, now = Date.now()): ObservedQuota | null {
   const windows = (observed?.windows ?? []).filter(
     (window) => window.resetsAt !== null && Date.parse(window.resetsAt) > now,
@@ -132,68 +113,23 @@ export function unexpired(observed: ObservedQuota | null, now = Date.now()): Obs
   return windows.length ? { ...observed!, windows } : null;
 }
 
-// The plan quota as the CLI's `/usage` data gives it, as of `measuredAt`.
-function planQuota(usage: UsageReading, measuredAt: string): NonNullable<Metrics['rateLimits']> {
-  const windows = usage.rate_limits
-    ? Object.entries(usage.rate_limits).flatMap(([name, value]) => {
-        if (!value || name === 'extra_usage') return [];
-        // Per-model weekly rows (a Max plan's Fable limit) are named after the weekly window they belong to.
-        if (name === 'model_scoped' && Array.isArray(value))
-          return value.map((item) => ({
-            name: `seven_day:${item.display_name}`,
-            utilization: item.utilization,
-            resetsAt: item.resets_at,
-          }));
-        if (!Array.isArray(value) && 'utilization' in value && 'resets_at' in value)
-          return [{ name, utilization: value.utilization, resetsAt: value.resets_at }];
-        return [];
-      })
-    : [];
-  return { available: usage.rate_limits_available, windows, measuredAt };
-}
-
-// What a reading gets of the quota: what the service holds, why a read it made failed, and the CLI's whole
-// answer if that CLI was the one asked, whose session totals are then this session's.
-export type QuotaAnswer = {
-  rateLimits: Metrics['rateLimits'];
-  error?: string;
-  usage?: UsageReading;
-};
-
-// The plan quota is the account's, not a session's: the service holds one per login, and every session and device
-// reads it here. Most of it comes with the replies: the CLI passes on the quota every model response carries
-// (`rate_limit_event`) whenever it moves, at no cost. A read adds what only `/usage` gives (the per-model rows, and
-// whether the plan quota applies at all) and stands in where nothing is being answered. It is a request of its own
-// to the account's usage endpoint (`GET /api/oauth/usage` in the CLI), which answers each account only so often, so
-// only the service decides when: at most once a minute, through whichever CLI is at hand then, and only while a
-// connected client wants the quota kept current (`wanted`) or the user asks.
+// One account's observations are shared across its sessions. No account endpoint is polled.
 export class Quotas {
-  wanted: () => boolean = () => true;
-  private readonly interval: number;
   private observed = new ObservedQuotas();
   private limits = new Map<string, SDKRateLimitEvent['rate_limit_info']>();
-  private reads = new Map<
-    string,
-    { at: number; rateLimits: Metrics['rateLimits']; pending?: Promise<unknown> }
-  >();
-  // The login last seen in a run or a read. A terminal's CLI does not say whom it is signed in as; it is the service's
-  // own CLI configuration, so it is taken to be this one.
   private login?: string;
-  constructor(interval = 60_000) {
-    this.interval = interval;
-  }
   // Setup tokens need not expose an account identity, so replacing one can keep the same login key.
   clear() {
     this.observed = new ObservedQuotas();
-    this.reads.clear();
+    this.limits.clear();
     this.login = undefined;
   }
-  private heard(login: string) {
+  identify(login: string) {
     if (this.login === undefined) this.observed.adopt('', login);
     this.login = login;
   }
   observe(login: string, event: SDKRateLimitEvent, now = Date.now()) {
-    this.heard(login);
+    this.identify(login);
     this.limits.set(login, event.rate_limit_info);
     this.observed.observe(login, event, now);
   }
@@ -230,55 +166,9 @@ export class Quotas {
     this.observed.observeWindows(login, windows, now);
     return this.of(login, now);
   }
-  // Reads anew through `query` when asked or due; a read under way is waited for instead.
-  async through(
-    login: string,
-    query: Query,
-    { asked = false, timeoutMs = 5000, now = Date.now() } = {},
-  ): Promise<QuotaAnswer> {
-    this.heard(login);
-    const held = this.reads.get(login);
-    if (held?.pending) await held.pending;
-    else if (asked || (this.wanted() && (!held || now - held.at >= this.interval))) {
-      const measuredAt = new Date(now).toISOString();
-      const entry: { at: number; rateLimits: Metrics['rateLimits']; pending?: Promise<unknown> } = {
-        at: now,
-        rateLimits: held?.rateLimits ?? null,
-      };
-      this.reads.set(login, entry);
-      const pending = optionalStatus(
-        () =>
-          query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }),
-        timeoutMs,
-      );
-      entry.pending = pending;
-      const { value, error } = await pending;
-      entry.pending = undefined;
-      // A failed read keeps the last reading, which says how old it is.
-      if (value) entry.rateLimits = planQuota(value, measuredAt);
-      return { rateLimits: this.of(login, now), error, ...(value ? { usage: value } : {}) };
-    }
-    return { rateLimits: this.of(login, now) };
-  }
-  // The windows the replies carried since the last read replace those of the read, which keeps the rest. Where the
-  // CLI says the plan quota does not apply, as with a login by CLAUDE_CODE_OAUTH_TOKEN, the replies are all there is.
   of(login: string, now = Date.now()): Metrics['rateLimits'] {
-    const read = this.reads.get(login)?.rateLimits ?? null;
     const observed = unexpired(this.observed.of(login), now);
-    if (!observed) return read;
-    if (!read?.available) return { available: true, ...observed };
-    if (observed.measuredAt <= read.measuredAt!) return read;
-    const carried = new Map(observed.windows.map((window) => [window.name, window]));
-    return {
-      available: true,
-      windows: [
-        ...read.windows.map((window) => carried.get(window.name) ?? window),
-        ...observed.windows.filter(
-          (window) => !read.windows.some((row) => row.name === window.name),
-        ),
-      ],
-      measuredAt: observed.measuredAt,
-    };
+    return observed ? { available: true, ...observed } : null;
   }
 }
 
@@ -401,42 +291,29 @@ function contextSummary(context: ContextUsage | null): Metrics['context'] {
     : null;
 }
 
-// `quota` gets the plan quota (see `Quotas`); without it this CLI is asked directly. `previous` holds the session
-// totals for a reading that brings none of its own.
+// Context is a native summary; usage totals come from results, while refresh keeps the last totals.
 export async function nativeMetrics(
   query: Query,
   result?: SDKResultMessage,
   {
     timeoutMs = 5000,
-    quota = (query) => new Quotas().through('', query, { asked: true, timeoutMs }),
+    rateLimits = null,
     previous = null,
   }: {
     timeoutMs?: number;
-    quota?: (query: Query) => Promise<QuotaAnswer>;
+    rateLimits?: Metrics['rateLimits'];
     previous?: Metrics['usage'];
   } = {},
 ): Promise<EventPayload> {
-  const [contextStatus, answer] = await Promise.all([
-    optionalStatus(() => query.getContextUsage({ detail: 'summary' }), timeoutMs),
-    quota(query),
-  ]);
-  const totals =
-    result ??
-    (answer.usage?.session
-      ? ({
-          total_cost_usd: answer.usage.session.total_cost_usd,
-          modelUsage: answer.usage.session.model_usage,
-        } as SDKResultMessage)
-      : undefined);
+  const contextStatus = await optionalStatus(
+    () => query.getContextUsage({ detail: 'summary' }),
+    timeoutMs,
+  );
   return eventPayloadSchema.parse({
     type: 'native.metrics',
     context: contextSummary(contextStatus.value),
-    usage: totals ? resultUsage(totals) : previous,
-    rateLimits: answer.rateLimits,
-    ...(contextStatus.error || answer.error
-      ? {
-          errors: { context: contextStatus.error, usage: answer.error },
-        }
-      : {}),
+    usage: result ? resultUsage(result) : previous,
+    rateLimits,
+    ...(contextStatus.error ? { errors: { context: contextStatus.error } } : {}),
   });
 }

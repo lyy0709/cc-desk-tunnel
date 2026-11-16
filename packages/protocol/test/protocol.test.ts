@@ -14,6 +14,51 @@ import {
   tunnelCredentialsSchema,
 } from '../src/index.ts';
 
+test('scheduled provenance is a bounded optional marker and obsolete quota controls are rejected', () => {
+  const command = {
+    type: 'message.send',
+    requestId: randomUUID(),
+    sessionId: randomUUID(),
+    text: '任务',
+  };
+  assert.equal(commandSchema.safeParse(command).success, true);
+  for (const scheduled of ['scheduled', 'manual'])
+    assert.equal(commandSchema.safeParse({ ...command, scheduled }).success, true);
+  assert.equal(commandSchema.safeParse({ ...command, scheduled: 'peer' }).success, false);
+  assert.equal(commandSchema.safeParse({ ...command, origin: { kind: 'human' } }).success, false);
+  assert.equal(
+    commandSchema.safeParse({ type: 'quota.watch', requestId: randomUUID(), active: true }).success,
+    false,
+  );
+  assert.equal(
+    commandSchema.safeParse({
+      type: 'session.status',
+      requestId: randomUUID(),
+      sessionId: command.sessionId,
+      quota: true,
+    }).success,
+    false,
+  );
+});
+
+test('manual message priority is bounded and does not change scheduled provenance', () => {
+  const message = {
+    type: 'message.send',
+    requestId: randomUUID(),
+    sessionId: randomUUID(),
+    text: '人工补充',
+  };
+  for (const priority of ['next', 'later', 'now']) {
+    const parsed = commandSchema.parse({ ...message, priority });
+    assert.ok(parsed.type === 'message.send' && parsed.priority === priority);
+    assert.equal(
+      commandSchema.safeParse({ ...message, priority, scheduled: 'manual' }).success,
+      false,
+    );
+  }
+  assert.equal(commandSchema.safeParse({ ...message, priority: 'urgent' }).success, false);
+});
+
 test('tunnel credentials accept spaces in usernames without allowing config delimiters', () => {
   const credentials = {
     type: 'tunnel.credentials',

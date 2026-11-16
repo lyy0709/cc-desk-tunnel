@@ -167,7 +167,7 @@ curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deplo
 
 这只是对结构的说明，**不是对账号安全的保证**。请留意：
 
-- **服务器所在地就是你的使用地点。** Claude Code 的全部请求都从服务器发出。请选择位于 [Anthropic 支持的国家和地区](https://www.anthropic.com/supported-countries)、来源正常的服务器。即使你本人身处支持的地区，把服务端放在不支持的地区，或放在被大量滥用过的 IP 上，也可能触发风控而被误判。本项目不会、也不能改变或掩饰这一点。
+- **服务器出口不能单独证明使用资格。** Claude Code 的模型请求从服务器发出，但 Anthropic 的[地区政策](https://www.anthropic.com/legal/supported-regions)还考虑使用者实际所在地和实体资格；应同时确认这些条件，而不只检查服务器地址。本项目不改变或掩饰地区信息。
 - **条款由你自己确认。** Anthropic 对订阅登录和 Agent SDK 的使用范围有明确规定（见其[法律与合规说明](https://code.claude.com/docs/en/legal-and-compliance)），其中限制第三方产品提供 Claude.ai 登录或代为使用订阅额度。技术上能用不代表你的用法获得了许可；拿不准时改用 API key（在数据目录的 `config/provider.json` 中配置）。
 - **一个账号只给自己用。** 不要用它共享或转售账号；项目不提供、也不接受这类功能。
 - 项目不对账号状态、可用性或合规性作任何承诺。

@@ -18,8 +18,8 @@ import type {
 } from '@cc-desk-tunnel/protocol';
 import UsagePanel, { dollars, quotaName, tokens } from './UsagePanel.tsx';
 import type { ProxyClient } from './client.ts';
-import { IconButton, Page, Row, Switch } from './ui.tsx';
-import { setPrefs, usePrefs } from './prefs.ts';
+import { IconButton, Page, Row } from './ui.tsx';
+import { useQuota } from './quota.ts';
 import { copyText } from './copy.tsx';
 
 // What the date a stored claude.ai sign-in ends means for the user. Renewing the access token does not move it; the
@@ -52,7 +52,7 @@ export default function AccountPanel({
   refresh: () => void;
 }) {
   const account = capabilities?.account;
-  const { quotaReads } = usePrefs();
+  const limits = useQuota(metrics?.rateLimits);
   const [working, setWorking] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
   const [code, setCode] = useState('');
@@ -95,7 +95,7 @@ export default function AccountPanel({
     <Page
       title="账号与额度"
       label="账号信息"
-      intro="云端 Claude Code 登录的账号，与官方读取的订阅额度。"
+      intro="云端 Claude Code 登录的账号，与原生回复提供的额度数据。"
       actions={
         <IconButton title="刷新账号信息" disabled={disabled} onClick={refresh}>
           <RefreshCw className={refreshing ? 'spinning' : ''} />
@@ -389,9 +389,9 @@ export default function AccountPanel({
         </button>
       </div>
       <div className="card account-card">
-        {metrics?.rateLimits?.available ? (
+        {limits ? (
           <div className="quota-list">
-            {metrics.rateLimits.windows.map((window, index) => (
+            {limits.windows.map((window, index) => (
               <div className="quota-row" key={`${window.name}:${index}`}>
                 <div>
                   <strong>{quotaName(window.name) ?? window.name}</strong>
@@ -433,30 +433,14 @@ export default function AccountPanel({
                 })()}
               </div>
             ))}
-            {!metrics.rateLimits.windows.length && (
-              <p className="muted">原生接口未返回额度窗口。</p>
-            )}
             <p className="account-updated">
-              {metrics.rateLimits.measuredAt &&
-                `更新于 ${new Date(metrics.rateLimits.measuredAt).toLocaleTimeString('zh-CN')}`}
+              {limits.measuredAt &&
+                `更新于 ${new Date(limits.measuredAt).toLocaleTimeString('zh-CN')}`}
             </p>
           </div>
         ) : (
-          <p className="muted">
-            {metrics?.errors?.usage ??
-              (metrics?.rateLimits ? '当前账号未提供订阅额度' : '等待读取原生额度')}
-          </p>
+          <p className="muted">尚无额度数据</p>
         )}
-        <Row
-          title="运行中每分钟读取一次额度"
-          detail="让服务端在有任务运行时每分钟向官方读取一次 5 小时与每周额度，各会话、各设备共用这一次读取；关闭后只记录回复里自带的额度，上方的刷新仍会读取"
-        >
-          <Switch
-            label="运行中每分钟读取一次额度"
-            checked={quotaReads}
-            onChange={(value) => setPrefs((prefs) => ({ ...prefs, quotaReads: value }))}
-          />
-        </Row>
       </div>
       <h2 className="page-heading">当前会话</h2>
       <div className="card">

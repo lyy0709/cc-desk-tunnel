@@ -4,7 +4,7 @@ import { webCertificateStateSchema } from './web-certificate.ts';
 export * from './web.ts';
 export * from './web-certificate.ts';
 
-export const PROTOCOL_VERSION = 28;
+export const PROTOCOL_VERSION = 30;
 // The release each protocol version began with, from 0.2.4 on: a client newer than its service signs in with
 // the service's number to have it upgrade (see the README). A new number adds its line here.
 export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
@@ -27,6 +27,8 @@ export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
   '0.3.15': 26,
   '0.3.17': 27,
   '0.3.18': 28,
+  '0.3.19': 29,
+  '0.3.20': 30,
 };
 export const MAX_FRAME_BYTES = 256 * 1024;
 // The longest global instructions edited here, in characters; it keeps a frame of them within MAX_FRAME_BYTES.
@@ -300,6 +302,8 @@ export const terminalStatuses = new Set<RunStatus>(['completed', 'cancelled', 'f
 export type RunStatus = z.infer<typeof runStatusSchema>;
 
 const scenarioSchema = z.enum(['chat', 'tool', 'question', 'error']);
+export const messagePrioritySchema = z.enum(['next', 'later', 'now']);
+export type MessagePriority = z.infer<typeof messagePrioritySchema>;
 const toolSchema = z.object({
   toolId: z.string().min(1),
   name: z.string().min(1),
@@ -313,6 +317,8 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     text: z.string(),
     attachments: z.array(fileAttachmentSchema).optional(),
     scenario: scenarioSchema,
+    scheduled: z.enum(['scheduled', 'manual']).optional(),
+    priority: messagePrioritySchema.optional(),
     // Sent by the "continue" button rather than written: the page shows a mark in place of the text.
     continued: z.boolean().optional(),
   }),
@@ -439,6 +445,7 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     type: z.literal('approval.resolved'),
     approvalId: id,
     allowed: z.boolean(),
+    cancelled: z.boolean().optional(),
     executionMode: planExecutionModeSchema.optional(),
   }),
   z.object({
@@ -549,6 +556,8 @@ export const sessionSchema = z.object({
     .optional(),
   createdAt: timestamp,
   updatedAt: timestamp,
+  // The last outcome lets a window pause its unsent queue while another session is selected.
+  lastRunStatus: z.enum(['completed', 'cancelled', 'failed']).optional(),
   activeRun: z
     .object({
       id,
@@ -581,6 +590,38 @@ export const historyPageSchema = snapshotSchema.extend({
   hasEarlier: z.boolean(),
 });
 export type HistoryPage = z.infer<typeof historyPageSchema>;
+
+export const outlineEntrySchema = z.object({
+  id: z.string(),
+  sequence: z.number().int().positive(),
+  at: timestamp,
+  ended: z.boolean(),
+  question: z.string().max(180),
+  answer: z.string().max(300),
+});
+export type OutlineEntry = z.infer<typeof outlineEntrySchema>;
+const sessionOutlineSchema = z.object({
+  type: z.literal('session.outline'),
+  requestId: id,
+  sessionId: id,
+  throughSequence: z.number().int().nonnegative(),
+  fromSequence: z.number().int().nonnegative(),
+  entries: z.array(outlineEntrySchema),
+});
+export type SessionOutline = z.infer<typeof sessionOutlineSchema>;
+const sessionReadSchema = snapshotSchema.extend({
+  type: z.literal('session.read'),
+  requestId: id,
+  firstSequence: z.number().int().nonnegative(),
+  lastSequence: z.number().int().nonnegative(),
+  throughSequence: z.number().int().nonnegative(),
+  hasEarlier: z.boolean(),
+  hasLater: z.boolean(),
+  totalEvents: z.number().int().nonnegative(),
+  capturedAt: timestamp,
+  fragment: eventSchema.optional(),
+});
+export type SessionRead = z.infer<typeof sessionReadSchema>;
 
 const versionSchema = z.string().regex(/^\d+\.\d+\.\d+$/);
 const installerSchema = z.object({
@@ -761,13 +802,8 @@ export const commandSchema = z.discriminatedUnion('type', [
       type: z.literal('session.status'),
       ...request,
       sessionId: id,
-      // Asked for on the account page: the plan quota is read anew.
-      quota: z.boolean().optional(),
     })
     .strict(),
-  // Whether this client keeps the plan quota current on its screen. While any connected client does, the service
-  // reads it once a minute during runs; otherwise only what the replies carry is taken.
-  z.object({ type: z.literal('quota.watch'), ...request, active: z.boolean() }).strict(),
   z
     .object({
       type: z.literal('terminal.open'),
@@ -801,14 +837,37 @@ export const commandSchema = z.discriminatedUnion('type', [
     .strict(),
   z
     .object({
+      type: z.literal('session.outline'),
+      ...request,
+      sessionId: id,
+      // Re-read the last known turn's run and everything that followed it.
+      afterSequence: z.number().int().nonnegative().default(0),
+    })
+    .strict(),
+  z
+    .object({
+      type: z.literal('session.read'),
+      ...request,
+      sessionId: id,
+      purpose: z.enum(['view', 'export']),
+      direction: z.enum(['around', 'before', 'after']),
+      sequence: z.number().int().nonnegative(),
+      throughSequence: z.number().int().nonnegative().optional(),
+    })
+    .strict(),
+  z
+    .object({
       type: z.literal('message.send'),
       ...request,
       sessionId: id,
       text: z.string().trim().max(16000),
       attachments: z.array(fileAttachmentSchema).optional(),
       scenario: scenarioSchema.default('chat'),
+      scheduled: z.enum(['scheduled', 'manual']).optional(),
+      priority: messagePrioritySchema.optional(),
     })
     .strict()
+    .refine((value) => !value.scheduled || !value.priority, '定时任务不使用手动消息的发送方式')
     .refine((value) => {
       const length = messageText(value.text, value.attachments).length;
       return length > 0 && length <= 16000;
@@ -912,6 +971,8 @@ export const historyControlSchema = z
   })
   .strict();
 export const serverMessageSchema = z.discriminatedUnion('type', [
+  sessionOutlineSchema,
+  sessionReadSchema,
   z.object({
     type: z.literal('session.history.part'),
     requestId: id,

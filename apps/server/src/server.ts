@@ -112,10 +112,14 @@ type Peer = {
   registering: boolean;
   // The client said it was closing the connection: nothing is kept for it to come back to.
   left: boolean;
-  // The client keeps the plan quota current on its screen, so the service reads it while runs go on.
-  quotaWanted?: boolean;
   subscriptions: Set<string>;
   history?: HistoryDelivery;
+  reads?: Partial<
+    Record<
+      'outline' | 'view' | 'export',
+      { requestId: string; delivery: HistoryDelivery; controller: AbortController }
+    >
+  >;
   responses: Map<string, { command: string; response: Promise<ServerMessage> }>;
 };
 // A run belongs to the computer its session is on, not to the connection that started it: connections come
@@ -159,6 +163,7 @@ export type Run = {
         answers?: Record<string, string>,
         unanswered?: Unanswered,
         executionMode?: PlanExecutionMode,
+        cancelled?: boolean,
       ) => void;
     }
   >;
@@ -170,8 +175,9 @@ export type Run = {
   // Output still arriving in pieces: sent on as it comes, recorded once it is whole.
   open?: Fragment;
   input?: NativeInput;
+  scheduled?: 'scheduled' | 'manual';
   controls: {
-    refresh?: (asked?: boolean) => Promise<void>;
+    refresh?: () => Promise<void>;
     stopTask?: (taskId: string) => Promise<void>;
     backgroundTask?: (toolId: string) => Promise<boolean>;
   };
@@ -269,7 +275,6 @@ export function createProxyServer(options: ServerOptions) {
   const usage = new UsageLog(store.database);
   const usageReceiver = options.claude ? createUsageReceiver(usage) : undefined;
   const peers = new Set<Peer>();
-  quotas.wanted = () => [...peers].some((peer) => peer.quotaWanted);
   // One run or one terminal per session, each a CLI process of its own in the session's directory. What reads
   // or changes the state the CLI keeps for all of them — a status read or session change (`mutations`), an
   // account change — waits until none is going.
@@ -433,7 +438,12 @@ export function createProxyServer(options: ServerOptions) {
     // History benefits from compression; small live events and control replies do not need it.
     if (peer.socket.readyState === WebSocket.OPEN)
       peer.socket.send(JSON.stringify(message), {
-        compress: message.type === 'session.snapshot' || message.type === 'session.history.part',
+        compress: [
+          'session.snapshot',
+          'session.history.part',
+          'session.outline',
+          'session.read',
+        ].includes(message.type),
       });
   }
   function broadcast(message: ServerMessage, sessionId?: string) {
@@ -662,7 +672,8 @@ export function createProxyServer(options: ServerOptions) {
     runs.delete(run.sessionId);
     run.controller.abort();
     run.decide?.(false);
-    for (const { decide } of run.approvals.values()) decide(false);
+    for (const { decide } of run.approvals.values())
+      decide(false, undefined, undefined, undefined, true);
     run.approvals.clear();
   }
   // A native run ends through its own adapter, which reports what is known about in-flight tools first.
@@ -674,7 +685,8 @@ export function createProxyServer(options: ServerOptions) {
     run.cancelReason = reason;
     run.input?.close();
     run.controller.abort();
-    for (const { decide } of run.approvals.values()) decide(false);
+    for (const { decide } of run.approvals.values())
+      decide(false, undefined, undefined, undefined, true);
     run.approvals.clear();
   }
   function nativeRoot(sessionId: string) {
@@ -705,6 +717,7 @@ export function createProxyServer(options: ServerOptions) {
         model: session.model,
         effort: session.effort,
         input: run.input!,
+        scheduled: run.scheduled,
         controls: run.controls,
         waiting: (background) =>
           emit(run, {
@@ -719,19 +732,38 @@ export function createProxyServer(options: ServerOptions) {
         signal: run.controller.signal,
         ssh,
         emit: (event) => emit(run, event),
-        approve: (toolId, waiting, toolName) => {
-          if (run.controller.signal.aborted) return Promise.resolve({ allowed: false });
+        approve: (toolId, waiting, toolName, signal) => {
+          if (signal.aborted) return Promise.resolve({ allowed: false });
           const approvalId = randomUUID();
           if (waiting === 'question') run.questions.add(approvalId);
           return new Promise((resolve) => {
+            const abort = () =>
+              answerApproval(
+                run,
+                approvalId,
+                false,
+                undefined,
+                undefined,
+                run.connectionId,
+                undefined,
+                true,
+              );
             run.approvals.set(approvalId, {
               toolName,
-              decide: (allowed, answers, unanswered, executionMode) => {
+              decide: (allowed, answers, unanswered, executionMode, cancelled) => {
+                signal.removeEventListener('abort', abort);
                 run.questions.delete(approvalId);
-                emit(run, { type: 'approval.resolved', approvalId, allowed, executionMode });
+                emit(run, {
+                  type: 'approval.resolved',
+                  approvalId,
+                  allowed,
+                  executionMode,
+                  ...(cancelled ? { cancelled } : {}),
+                });
                 resolve({ allowed, answers, unanswered, executionMode });
               },
             });
+            signal.addEventListener('abort', abort, { once: true });
             emit(run, { type: 'approval.requested', approvalId, toolId });
             emit(run, {
               type: 'run.status',
@@ -763,6 +795,20 @@ export function createProxyServer(options: ServerOptions) {
     if (target) send(target, { type: 'account.state', ...state });
     else broadcast({ type: 'account.state', ...state });
   }
+  function resetQuotas() {
+    quotas.clear();
+    // End the old account's current readings without removing its historical usage records.
+    for (const session of store.list()) {
+      if (!store.lastQuota(session.id)) continue;
+      const previous = store.lastMetrics(session.id);
+      record(session.id, randomUUID(), {
+        type: 'native.metrics',
+        context: previous?.context ?? null,
+        usage: previous?.usage ?? null,
+        rateLimits: { available: false, windows: [], measuredAt: new Date().toISOString() },
+      });
+    }
+  }
   async function account(peer: Peer, command: CommandOf<`account.${string}` & Command['type']>) {
     if (!options.claude) throw new DomainError('native_unavailable', '离线模拟没有原生账号。');
     if (command.type === 'account.status') {
@@ -791,7 +837,7 @@ export function createProxyServer(options: ServerOptions) {
           `无法保存 setup token：${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      quotas.clear();
+      resetQuotas();
       await publishAccount();
       return;
     }
@@ -805,7 +851,7 @@ export function createProxyServer(options: ServerOptions) {
           `退出登录失败：${error instanceof Error ? error.message : String(error)}`,
         );
       }
-      quotas.clear();
+      resetQuotas();
       await publishAccount();
       return;
     }
@@ -821,7 +867,6 @@ export function createProxyServer(options: ServerOptions) {
             if (succeeded && token && !current.process.cancelled) {
               try {
                 configureSetupToken(token);
-                quotas.clear();
               } catch (error) {
                 succeeded = false;
                 notice = `令牌已生成但无法保存：${error instanceof Error ? error.message : String(error)}`;
@@ -833,7 +878,10 @@ export function createProxyServer(options: ServerOptions) {
                 error: notice,
               });
             }
-            if (succeeded) completeOnboarding();
+            if (succeeded) {
+              resetQuotas();
+              completeOnboarding();
+            }
             track(publishAccount(undefined, notice).catch(() => {}));
           },
           (text) => {
@@ -863,7 +911,7 @@ export function createProxyServer(options: ServerOptions) {
     const active =
       runs.get(command.sessionId) ?? [...runs.values()].find((run) => run.controls.refresh);
     if (active?.controls.refresh && !mutations.size) {
-      await active.controls.refresh(command.quota);
+      await active.controls.refresh();
       return;
     }
     // A terminal's session is read by a CLI of its own that does not take it up (its figures stay as they were).
@@ -882,7 +930,7 @@ export function createProxyServer(options: ServerOptions) {
         nativeRoot(command.sessionId),
         command.sessionId,
         controller.signal,
-        { asked: command.quota, previous: store.lastMetrics(command.sessionId)?.usage, resume },
+        { previous: store.lastMetrics(command.sessionId)?.usage, resume },
       );
       for (const read of events) {
         const payload: EventPayload =
@@ -1405,12 +1453,16 @@ export function createProxyServer(options: ServerOptions) {
       command.type === 'session.compact' ? '/compact' : continued ? CONTINUE : command.text;
     const scenario = command.type === 'message.send' ? command.scenario : 'chat';
     const attachments = command.type === 'message.send' ? (command.attachments ?? []) : [];
+    const scheduled = command.type === 'message.send' ? command.scheduled : undefined;
+    const priority = command.type === 'message.send' ? command.priority : undefined;
     // A repeated request ID is the same message arriving again, not a second message.
     const existing = store.userMessage(command.sessionId, command.requestId);
     if (existing?.payload.type === 'message.user') {
       if (
         existing.payload.text !== text ||
         existing.payload.scenario !== scenario ||
+        existing.payload.scheduled !== scheduled ||
+        existing.payload.priority !== priority ||
         JSON.stringify(existing.payload.attachments ?? []) !== JSON.stringify(attachments)
       )
         throw new DomainError('request_conflict', '请求 ID 已被其他内容使用。');
@@ -1426,6 +1478,7 @@ export function createProxyServer(options: ServerOptions) {
       throw new DomainError('attachment_device', '只能向本机执行的会话添加这台电脑上的文件。');
     const prompt = messageText(text, attachments);
     if (session.activeRun) {
+      if (scheduled) throw new DomainError('run_active', '当前会话正在运行。');
       const active = runs.get(command.sessionId);
       if (!options.claude || command.type !== 'message.send' || !active?.input)
         throw new DomainError('run_active', '当前会话正在运行。');
@@ -1439,8 +1492,14 @@ export function createProxyServer(options: ServerOptions) {
         text,
         scenario,
         ...(attachments.length ? { attachments } : {}),
+        ...(priority ? { priority } : {}),
       });
-      active.input.submit(command.requestId, store.notice(command.sessionId) + prompt);
+      active.input.submit(
+        command.requestId,
+        store.notice(command.sessionId) + prompt,
+        undefined,
+        priority,
+      );
       // A message sent while Claude waits on its question is the user's answer in the chat instead.
       for (const approvalId of [...active.questions])
         answerApproval(active, approvalId, false, undefined, 'replied_in_chat', peer?.id);
@@ -1463,6 +1522,7 @@ export function createProxyServer(options: ServerOptions) {
       answered: new Set(),
       controls: {},
       stats: inOrder(),
+      ...(scheduled ? { scheduled } : {}),
     };
     runs.set(command.sessionId, run);
     if (options.claude) run.input = new NativeInput(run.sessionId, (event) => emit(run, event));
@@ -1473,11 +1533,18 @@ export function createProxyServer(options: ServerOptions) {
       scenario,
       ...(attachments.length ? { attachments } : {}),
       ...(continued ? { continued } : {}),
+      ...(scheduled ? { scheduled } : {}),
+      ...(priority ? { priority } : {}),
     });
     emit(run, { type: 'run.status', status: 'running', connectionId: run.connectionId });
     // What Claude's system prompt no longer has right is told to it with this message; the transcript shows the
     // user's own text.
-    run.input?.submit(command.requestId, store.notice(command.sessionId) + prompt);
+    run.input?.submit(
+      command.requestId,
+      store.notice(command.sessionId) + prompt,
+      scheduled,
+      priority,
+    );
     track(
       options.claude
         ? native(run)
@@ -1572,13 +1639,22 @@ export function createProxyServer(options: ServerOptions) {
     unanswered: Unanswered | undefined,
     connectionId = run.connectionId,
     executionMode?: PlanExecutionMode,
+    cancelled = false,
   ) {
     const approval = run.approvals.get(approvalId);
     if (!approval) return false;
     run.approvals.delete(approvalId);
     run.answered.add(approvalId);
-    approval.decide(allowed, answers, unanswered, executionMode);
-    if (!run.approvals.size) emit(run, { type: 'run.status', status: 'running', connectionId });
+    approval.decide(allowed, answers, unanswered, executionMode, cancelled);
+    if (!run.controller.signal.aborted && runs.get(run.sessionId) === run)
+      emit(run, {
+        type: 'run.status',
+        status: run.approvals.size ? 'awaiting_approval' : 'running',
+        connectionId,
+        ...(run.approvals.size
+          ? { waiting: run.questions.size ? ('question' as const) : ('approval' as const) }
+          : {}),
+      });
     return true;
   }
 
@@ -1666,9 +1742,6 @@ export function createProxyServer(options: ServerOptions) {
       case 'usage.summary':
         send(peer, { type: 'usage.summary', requestId: command.requestId, ...usage.summary() });
         return undefined;
-      case 'quota.watch':
-        peer.quotaWanted = command.active;
-        return undefined;
       case 'session.stats':
         store.get(command.sessionId);
         send(peer, {
@@ -1731,8 +1804,12 @@ export function createProxyServer(options: ServerOptions) {
     }
     const { session } = store.get(command.sessionId);
     // Native status reads leave the stored history available, including to other windows.
-    const readingHistory =
-      command.type === 'session.subscribe' || command.type === 'session.history';
+    const readingHistory = [
+      'session.subscribe',
+      'session.history',
+      'session.outline',
+      'session.read',
+    ].includes(command.type);
     if (
       mutations.has(command.sessionId) &&
       !(readingHistory && mutations.get(command.sessionId) === 'status')
@@ -1781,6 +1858,57 @@ export function createProxyServer(options: ServerOptions) {
           },
         ]);
         return command.sessionId;
+      case 'session.outline':
+      case 'session.read': {
+        const lane = command.type === 'session.outline' ? 'outline' : command.purpose;
+        peer.reads ??= {};
+        peer.reads[lane]?.controller.abort();
+        peer.reads[lane]?.delivery.cancel();
+        const read = {
+          requestId: command.requestId,
+          delivery: new HistoryDelivery((message) => send(peer, message)),
+          controller: new AbortController(),
+        };
+        peer.reads[lane] = read;
+        try {
+          const result =
+            command.type === 'session.outline'
+              ? await store.outline(
+                  command.sessionId,
+                  command.requestId,
+                  command.afterSequence,
+                  read.controller.signal,
+                )
+              : store.read(
+                  command.sessionId,
+                  command.requestId,
+                  command.direction,
+                  command.sequence,
+                  command.throughSequence,
+                );
+          if (peer.reads[lane] !== read)
+            throw new DomainError('history_cancelled', '历史读取已取消。');
+          if (
+            result.type === 'session.read' &&
+            command.type === 'session.read' &&
+            command.throughSequence === undefined
+          ) {
+            const run = runs.get(command.sessionId);
+            if (run?.open)
+              result.fragment = {
+                sessionId: run.sessionId,
+                runId: run.id,
+                sequence: result.throughSequence + 1,
+                createdAt: result.capturedAt,
+                payload: { ...run.open },
+              };
+          }
+          await read.delivery.deliver(command.requestId, command.sessionId, [result]);
+        } finally {
+          if (peer.reads[lane] === read) delete peer.reads[lane];
+        }
+        return command.sessionId;
+      }
       case 'run.cancel':
       case 'run.task.stop':
       case 'run.task.background':
@@ -2108,6 +2236,11 @@ export function createProxyServer(options: ServerOptions) {
   function release(peer: Peer) {
     peers.delete(peer);
     peer.history?.cancel();
+    for (const read of Object.values(peer.reads ?? {})) {
+      read.controller.abort();
+      read.delivery.cancel();
+    }
+    peer.reads = {};
     if (login?.owner === peer) login.process.cancel();
     for (const terminal of terminals.values())
       if (terminal.owner !== peer) continue;
@@ -2284,9 +2417,19 @@ export function createProxyServer(options: ServerOptions) {
         }
         const historyControl = historyControlSchema.safeParse(value);
         if (historyControl.success) {
-          if (historyControl.data.type === 'session.history.next')
-            peer.history?.next(historyControl.data.requestId);
-          else peer.history?.cancel(historyControl.data.requestId);
+          const { type, requestId } = historyControl.data;
+          if (type === 'session.history.next') peer.history?.next(requestId);
+          else peer.history?.cancel(requestId);
+          for (const lane of ['outline', 'view', 'export'] as const) {
+            const read = peer.reads?.[lane];
+            if (!read || read.requestId !== requestId) continue;
+            if (type === 'session.history.next') read.delivery.next(requestId);
+            else {
+              read.controller.abort();
+              read.delivery.cancel(requestId);
+              delete peer.reads![lane];
+            }
+          }
           return;
         }
         const command = commandSchema.safeParse(value);

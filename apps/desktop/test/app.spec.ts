@@ -347,6 +347,13 @@ test('a session forks whole, and an earlier message is edited in a fork that lea
 test('a scheduled task is edited, sent to its session when due, and can open a session of its own', async ({
   page,
 }) => {
+  const sent: { scheduled?: string }[] = [];
+  page.on('websocket', (socket) =>
+    socket.on('framesent', ({ payload }) => {
+      const frame = JSON.parse(String(payload));
+      if (frame.type === 'message.send') sent.push(frame);
+    }),
+  );
   await page.clock.install();
   await page.goto('/');
   await login(page);
@@ -379,6 +386,7 @@ test('a scheduled task is edited, sent to its session when due, and can open a s
   await page.clock.fastForward('31:00');
   await expect(row).toContainText('已发送');
   await expect(row).toContainText('不会再运行');
+  expect(sent.map((frame) => frame.scheduled)).toEqual(['scheduled']);
   await page.screenshot({ path: resolve(screenshots, 'schedule-list.png') });
   await page.getByRole('button', { name: '会话', exact: true }).click();
   await settled(page);
@@ -393,6 +401,7 @@ test('a scheduled task is edited, sent to its session when due, and can open a s
   await expect(row).toContainText('新会话 · 中文项目');
   await page.getByRole('button', { name: `立即运行 ${name}`, exact: true }).click();
   await expect(row).toContainText('已发送');
+  await expect.poll(() => sent.map((frame) => frame.scheduled)).toEqual(['scheduled', 'manual']);
   // The session being read keeps its place.
   await page.getByRole('button', { name: '会话', exact: true }).click();
   await expect(
