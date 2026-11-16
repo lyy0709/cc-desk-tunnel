@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { fileAttachmentSchema } from '@cc-desk-tunnel/protocol';
+import { fileAttachmentSchema, pathKey } from '@cc-desk-tunnel/protocol';
 import type { FileAttachment } from '@cc-desk-tunnel/protocol';
 
 // Unsent text is the user's work: it is kept per session and written to disk shortly after every edit,
@@ -10,11 +10,63 @@ export type Draft = {
   // In-flight local reads belong to the draft's session, but do not survive a window restart.
   adding?: number;
   attachmentError?: string;
+  insertions?: { id: string; offset: number }[];
+  cursor?: number;
 };
 export type Drafts = Record<string, Draft>;
 export const emptyDraft: Draft = { text: '', attachments: [] };
 const storageKey = 'proxy-drafts';
 const delay = 300;
+
+// Keep a pending file pick at its place while the user edits, including after switching sessions.
+export function changeDraftText(draft: Draft, text: string): Draft {
+  if (!draft.insertions?.length) return { ...draft, text, cursor: undefined };
+  let start = 0;
+  while (start < draft.text.length && start < text.length && draft.text[start] === text[start])
+    start++;
+  let oldEnd = draft.text.length,
+    newEnd = text.length;
+  while (oldEnd > start && newEnd > start && draft.text[oldEnd - 1] === text[newEnd - 1]) {
+    oldEnd--;
+    newEnd--;
+  }
+  return {
+    ...draft,
+    text,
+    cursor: undefined,
+    insertions: draft.insertions.map((point) => ({
+      ...point,
+      offset:
+        point.offset <= start
+          ? point.offset
+          : point.offset >= oldEnd
+            ? point.offset + newEnd - oldEnd
+            : newEnd,
+    })),
+  };
+}
+
+export function insertDraftFiles(draft: Draft, files: FileAttachment[], offset: number): Draft {
+  const key = (file: FileAttachment) => `${file.deviceId}:${pathKey(file.path)}`;
+  const attachments = new Map(draft.attachments.map((file) => [key(file), file]));
+  const used = new Set(draft.attachments.map((file) => file.reference));
+  let number = 1;
+  const references = new Set<string>();
+  for (const added of files) {
+    const existing = attachments.get(key(added)) ?? added;
+    while (used.has(number) || draft.text.includes(`[文件 #${number}]`)) number++;
+    const file = existing.reference ? existing : { ...existing, reference: number };
+    used.add(file.reference);
+    attachments.set(key(file), file);
+    references.add(`[文件 #${file.reference}]`);
+  }
+  const text = [...references].join(' ');
+  return {
+    ...changeDraftText(draft, draft.text.slice(0, offset) + text + draft.text.slice(offset)),
+    attachments: [...attachments.values()],
+    cursor: offset + text.length,
+  };
+}
 
 export function cleanDrafts(value: unknown): Drafts {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
@@ -111,8 +163,7 @@ export function useDrafts() {
   const setDraft = useCallback(
     (sessionId: string, text: string, attachments?: FileAttachment[]) =>
       updateDraft(sessionId, (current) => ({
-        ...current,
-        text,
+        ...changeDraftText(current, text),
         attachments: attachments ?? current.attachments,
       })),
     [updateDraft],

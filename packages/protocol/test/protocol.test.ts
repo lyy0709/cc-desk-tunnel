@@ -111,6 +111,27 @@ test('file cards serialize to ordinary text and share the existing combined prom
     `正文\n\n${attachments.map((file) => JSON.stringify(file.path)).join('\n')}`,
   );
   assert.equal(messageText('老消息\n'), '老消息\n');
+  const inline = attachments.map((file, index) => ({ ...file, reference: index + 1 }));
+  assert.equal(
+    messageText('先看[文件 #2]，再改[文件 #1]。对照[文件 #2]', inline),
+    `先看${JSON.stringify(inline[1].path)}，再改${JSON.stringify(inline[0].path)}。对照${JSON.stringify(inline[1].path)}`,
+  );
+  assert.equal(
+    messageText('字面量[文件 #9]', inline),
+    `字面量[文件 #9]\n\n${messageText('', attachments)}`,
+  );
+  assert.equal(
+    commandSchema.safeParse({
+      ...command,
+      attachments: inline.map((file) => ({ ...file, reference: 1 })),
+    }).success,
+    false,
+  );
+  assert.equal(
+    commandSchema.safeParse({ ...command, text: '[文件 #1]'.repeat(1000), attachments: inline })
+      .success,
+    false,
+  );
   const references = messageText('', attachments).length;
   assert.ok(
     commandSchema.safeParse({ ...command, text: 'a'.repeat(16000 - references - 2) }).success,

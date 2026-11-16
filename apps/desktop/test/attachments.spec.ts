@@ -285,7 +285,7 @@ async function open(page: Page, { desktop = true, history = 0, foreign = false }
 
 const add = (page: Page) => page.getByRole('button', { name: '添加文件', exact: true }).click();
 
-test('file cards leave the text alone and preview locally without executing scripts', async ({
+test('file cards insert references and preview locally without executing scripts', async ({
   page,
 }) => {
   const f = await open(page);
@@ -294,7 +294,7 @@ test('file cards leave the text alone and preview locally without executing scri
   await add(page);
   const cards = page.locator('.composer .attachment-card');
   await expect(cards).toHaveCount(2);
-  await expect(body).toHaveValue('检查这两个文件');
+  await expect(body).toHaveValue('检查这两个文件[文件 #1] [文件 #2]');
   await add(page);
   await expect(cards).toHaveCount(2);
   const calls = await page.evaluate(() => (window as any).fileCalls.length);
@@ -337,6 +337,54 @@ test('file cards leave the text alone and preview locally without executing scri
   await page.getByRole('button', { name: '移除 missing.txt', exact: true }).click();
   await expect(page.locator('.composer [role=alert]')).toHaveCount(0);
   expect(f.requests.filter((request) => request.type === 'message.send')).toHaveLength(0);
+});
+
+test('an inline attachment stays between sentences through reading, sending, copy and editing', async ({
+  page,
+}) => {
+  const f = await open(page);
+  const body = page.getByRole('textbox', { name: '消息', exact: true });
+  await body.fill('先检查。再修改。');
+  await body.evaluate((box: HTMLTextAreaElement) => box.setSelectionRange(3, 3));
+  await page.evaluate(() => {
+    (window as any).holdChoose = true;
+  });
+  await add(page);
+  // The picker result arrives after an edit before the saved insertion point.
+  await body.evaluate((box: HTMLTextAreaElement) => box.setSelectionRange(0, 0));
+  await body.pressSequentially('请');
+  await page.evaluate(() => (window as any).finishChoose(['/fixtures/tcpfit.sh']));
+  await expect(body).toHaveValue('请先检查[文件 #1]。再修改。');
+  expect(await body.evaluate((box: HTMLTextAreaElement) => box.selectionStart)).toBe(1);
+  await page.getByRole('button', { name: '移除 tcpfit.sh', exact: true }).click();
+  await expect(body).toHaveValue('请先检查。再修改。');
+  await body.evaluate((box: HTMLTextAreaElement) => box.setSelectionRange(4, 4));
+  await page.evaluate(() => {
+    (window as any).holdChoose = false;
+    (window as any).pickedFiles = ['/fixtures/tcpfit.sh'];
+  });
+  await add(page);
+  await expect(body).toHaveValue('请先检查[文件 #1]。再修改。');
+  expect(await body.evaluate((box: HTMLTextAreaElement) => box.selectionStart)).toBe(
+    '请先检查[文件 #1]'.length,
+  );
+  await page.getByRole('button', { name: '发送消息', exact: true }).click();
+  expect(f.requests.filter((request) => request.type === 'message.send').at(-1).text).toBe(
+    '请先检查[文件 #1]。再修改。',
+  );
+  await page
+    .locator('.message.user')
+    .getByRole('button', { name: '复制消息', exact: true })
+    .click();
+  expect(await page.evaluate(() => (window as any).copied)).toBe(
+    '请先检查"/fixtures/tcpfit.sh"。再修改。',
+  );
+  await page
+    .locator('.message.user')
+    .getByRole('button', { name: '编辑重发', exact: true })
+    .click();
+  await expect(body).toHaveValue('请先检查[文件 #1]。再修改。');
+  await expect(page.locator('.composer .attachment-card')).toHaveCount(1);
 });
 
 test('pending selections stay in their originating draft and recover after a reload', async ({
@@ -424,7 +472,13 @@ test('plan, failed sends, history, copy, search and edit-fork retain attachment 
   const sent = f.requests.filter((request) => request.type === 'message.send').at(-1);
   expect(sent.text).toBe('');
   expect(sent.attachments).toEqual([
-    { path: '/fixtures/tcpfit.sh', name: 'tcpfit.sh', size: 1200, deviceId: f.device.id },
+    {
+      path: '/fixtures/tcpfit.sh',
+      name: 'tcpfit.sh',
+      size: 1200,
+      deviceId: f.device.id,
+      reference: 1,
+    },
   ]);
   await expect(page.locator('.composer .attachment-card')).toHaveCount(0);
   await expect(page.locator('.message.user .attachment-card')).toHaveCount(1);

@@ -22,9 +22,9 @@ import type {
   PermissionMode,
   Session,
 } from '@cc-desk-tunnel/protocol';
-import { pathKey } from '@cc-desk-tunnel/protocol';
 import type { FileAttachment } from '@cc-desk-tunnel/protocol';
 import type { Draft } from './drafts.ts';
+import { changeDraftText, insertDraftFiles } from './drafts.ts';
 import Attachments from './Attachments.tsx';
 import { folderName } from './paths.ts';
 import { slashCommands } from './commands.ts';
@@ -135,7 +135,7 @@ export default function Composer({
   stop: () => void;
 }) {
   const input = useRef<HTMLTextAreaElement>(null);
-  const setDraft = (text: string) => updateDraft((current) => ({ ...current, text }));
+  const setDraft = (text: string) => updateDraft((current) => changeDraftText(current, text));
   const canAttach = !!window.desktop && !!attachmentDeviceId && !inputDisabled;
   const branch = useBranch(localProject ? session.projectPath : null, !!session.activeRun);
   const toolbar = useRef<HTMLDivElement>(null);
@@ -240,14 +240,20 @@ export default function Composer({
     if (!input.current) return;
     input.current.style.height = 'auto';
     input.current.style.height = `${input.current.scrollHeight}px`;
+    if (draft.cursor !== undefined) input.current.setSelectionRange(draft.cursor, draft.cursor);
   }, [draft.text, session.id]);
   async function attach(source: Promise<string[]> | File[]) {
     if (!canAttach) return;
     const owner = attachmentDeviceId!;
+    const point = {
+      id: crypto.randomUUID(),
+      offset: input.current?.selectionStart ?? draft.text.length,
+    };
     updateDraft((current) => ({
       ...current,
       adding: (current.adding ?? 0) + 1,
       attachmentError: '',
+      insertions: [...(current.insertions ?? []), point],
     }));
     try {
       const found: FileAttachment[] = [];
@@ -271,19 +277,18 @@ export default function Composer({
           errors.push(`${name}：${error instanceof Error ? error.message : '添加失败'}`);
         }
       }
+      const cursor = input.current?.selectionStart;
       updateDraft((current) => {
-        const keys = new Set(
-          current.attachments.map((file) => `${file.deviceId}:${pathKey(file.path)}`),
-        );
-        const added = found.filter((file) => {
-          const key = `${file.deviceId}:${pathKey(file.path)}`;
-          if (keys.has(key)) return false;
-          keys.add(key);
-          return true;
-        });
+        const offset = current.insertions!.find((item) => item.id === point.id)!.offset;
+        const next = insertDraftFiles(current, found, offset);
         return {
-          ...current,
-          attachments: [...current.attachments, ...added],
+          ...next,
+          cursor:
+            cursor === undefined
+              ? next.cursor
+              : cursor < offset
+                ? cursor
+                : cursor + next.text.length - current.text.length,
           attachmentError: errors.join('\n'),
         };
       });
@@ -294,7 +299,11 @@ export default function Composer({
         attachmentError: error instanceof Error ? error.message : '添加文件失败。',
       }));
     } finally {
-      updateDraft((current) => ({ ...current, adding: current.adding! - 1 }));
+      updateDraft((current) => ({
+        ...current,
+        adding: current.adding! - 1,
+        insertions: current.insertions!.filter((item) => item.id !== point.id),
+      }));
     }
   }
   return (
@@ -377,7 +386,12 @@ export default function Composer({
             disabled={inputDisabled}
             remove={(file) =>
               updateDraft((current) => ({
-                ...current,
+                ...changeDraftText(
+                  current,
+                  file.reference
+                    ? current.text.replaceAll(`[文件 #${file.reference}]`, '')
+                    : current.text,
+                ),
                 attachments: current.attachments.filter((item) => item !== file),
                 attachmentError: '',
               }))

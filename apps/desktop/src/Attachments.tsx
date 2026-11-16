@@ -196,6 +196,7 @@ const AttachmentCard = memo(function AttachmentCard({
       <span className="attachment-label" data-search-content>
         <strong>{file.name}</strong>
         <small>
+          {file.reference && `#${file.reference} · `}
           {broken ? '无法预览图片' : fileType(file.name)}
           {file.size !== undefined && ` · ${fileSize(file.size)}`}
         </small>

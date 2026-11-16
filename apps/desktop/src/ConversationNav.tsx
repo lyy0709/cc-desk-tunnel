@@ -35,7 +35,16 @@ export default function ConversationNav({
   const selected = Math.min(preview ?? active, last);
   const turn = turns[selected];
   const title =
-    firstLine(turn.question?.text.slice(0, 1000) ?? '') ||
+    firstLine(
+      turn.question?.text
+        .slice(0, 1000)
+        .replace(
+          /\[文件 #(\d+)\]/g,
+          (token, number) =>
+            turn.question?.attachments?.find((file) => file.reference === Number(number))?.name ??
+            token,
+        ) ?? '',
+    ) ||
     turn.question?.attachments?.map((file) => file.name).join('、') ||
     `第 ${selected + 1} 轮`;
   const answer = turn.answer ?? turn.steps.findLast((step) => step.kind === 'assistant');

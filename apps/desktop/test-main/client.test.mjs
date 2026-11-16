@@ -5,7 +5,7 @@ import { ProxyClient, RequestInterruptedError } from '../src/client.ts';
 import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
 import { conversation, transcript } from '../src/transcript.ts';
 import { describe, duration, summarize } from '../src/activity.ts';
-import { cleanDrafts, withoutSentDraft } from '../src/drafts.ts';
+import { cleanDrafts, withoutSentDraft, changeDraftText, insertDraftFiles } from '../src/drafts.ts';
 import {
   describeSchedule,
   formatTasks,
@@ -50,6 +50,31 @@ test('a send receipt only clears the captured text and references, keeping newly
   assert.equal(
     withoutSentDraft({ ...warned, attachmentError: '新的添加错误' }, warned).attachmentError,
     '新的添加错误',
+  );
+});
+
+test('file references keep their insertion point during edits and deduplicate cards, not references', () => {
+  const file = { name: 'code.ts', path: '/tmp/code.ts', deviceId: randomUUID() };
+  let draft = {
+    text: '先看这里。再检查结果。',
+    attachments: [],
+    insertions: [{ id: 'pick', offset: 4 }],
+  };
+  draft = changeDraftText(draft, '请先看这里。再检查结果。');
+  assert.equal(draft.insertions[0].offset, 5);
+  const added = insertDraftFiles(draft, [file], draft.insertions[0].offset);
+  assert.equal(added.text, '请先看这里[文件 #1]。再检查结果。');
+  assert.equal(added.cursor, '请先看这里[文件 #1]'.length);
+  const again = insertDraftFiles(added, [file], added.text.length);
+  assert.equal(again.attachments.length, 1);
+  assert.equal(again.text, added.text + '[文件 #1]');
+  const restored = cleanDrafts({ session: again }).session;
+  assert.equal(restored.insertions, undefined);
+  assert.equal(restored.cursor, undefined);
+  assert.equal(restored.attachments[0].reference, 1);
+  assert.equal(
+    insertDraftFiles({ text: '[文件 #1]', attachments: [] }, [file], 0).attachments[0].reference,
+    2,
   );
 });
 

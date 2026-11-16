@@ -59,13 +59,28 @@ export const fileAttachmentSchema = z
     name: z.string().min(1).max(1024),
     size: z.number().int().nonnegative().optional(),
     deviceId: id,
+    reference: z.number().int().positive().optional(),
   })
   .strict();
 export type FileAttachment = z.infer<typeof fileAttachmentSchema>;
 // Cards are presentation metadata. The native process still receives ordinary text and file references.
 export function messageText(text: string, attachments: readonly FileAttachment[] = []) {
   if (!attachments.length) return text;
-  return [text, attachments.map((file) => JSON.stringify(file.path)).join('\n')]
+  const references = new Map(attachments.map((file) => [file.reference, file]));
+  const used = new Set<FileAttachment>();
+  const body = text.replace(/\[文件 #(\d+)\]/g, (token, number) => {
+    const file = references.get(Number(number));
+    if (!file) return token;
+    used.add(file);
+    return JSON.stringify(file.path);
+  });
+  return [
+    body,
+    attachments
+      .filter((file) => !used.has(file))
+      .map((file) => JSON.stringify(file.path))
+      .join('\n'),
+  ]
     .filter(Boolean)
     .join('\n\n');
 }
@@ -797,7 +812,13 @@ export const commandSchema = z.discriminatedUnion('type', [
     .refine((value) => {
       const length = messageText(value.text, value.attachments).length;
       return length > 0 && length <= 16000;
-    }, '正文与文件路径合计须为 1–16000 字符'),
+    }, '正文与文件路径合计须为 1–16000 字符')
+    .refine((value) => {
+      const references = (value.attachments ?? []).flatMap((file) =>
+        file.reference ? [file.reference] : [],
+      );
+      return new Set(references).size === references.length;
+    }, '附件引用编号不能重复'),
   z.object({ type: z.literal('run.cancel'), ...request, sessionId: id, runId: id }).strict(),
   // Takes up a session whose last turn was stopped or cut off, without the user writing a message.
   z.object({ type: z.literal('run.continue'), ...request, sessionId: id }).strict(),

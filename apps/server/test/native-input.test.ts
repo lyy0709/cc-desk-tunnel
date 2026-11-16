@@ -25,13 +25,15 @@ function result(ids: string[], queued = 0) {
 
 test('attachment presentation metadata never becomes a custom native message field', async () => {
   const { input } = fixture();
-  const attachments = [{ name: '脚本.sh', path: '/tmp/中文 "脚本".sh', deviceId: randomUUID() }];
-  input.submit(randomUUID(), messageText('检查脚本', attachments));
+  const attachments = [
+    { name: '脚本.sh', path: '/tmp/中文 "脚本".sh', deviceId: randomUUID(), reference: 1 },
+  ];
+  input.submit(randomUUID(), messageText('先检查[文件 #1]，再修改。', attachments));
   const stream = input.stream();
   const native = (await stream.next()).value!;
   assert.deepEqual(native.message, {
     role: 'user',
-    content: '检查脚本\n\n"/tmp/中文 \\"脚本\\".sh"',
+    content: '先检查"/tmp/中文 \\"脚本\\".sh"，再修改。',
   });
   assert.equal('attachments' in native, false);
   input.close();
