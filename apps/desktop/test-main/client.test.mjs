@@ -419,12 +419,19 @@ test('earlier pages prepend in one batch while preserving the newest reconnect c
   const loading = client.loadEarlier(session.id);
   assert.equal(socket.sent.at(-1).type, 'session.history');
   assert.equal(socket.sent.at(-1).beforeSequence, 51);
-  snapshot(session, [event(session.id, 50)], {
+  const requestId = socket.sent.at(-1).requestId;
+  // A complete snapshot finishes this read even if the subsequent acknowledgement is lost.
+  socket.message({
+    type: 'session.snapshot',
+    requestId,
+    session,
+    events: [event(session.id, 50)],
     mode: 'prepend',
     firstSequence: 1,
     lastSequence: 50,
     hasEarlier: false,
   });
+  assert.equal(client.pending.has(requestId), false);
   await loading;
   assert.equal(client.state.history[session.id].firstSequence, 1);
   assert.equal(client.state.history[session.id].lastSequence, 100);

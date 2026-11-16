@@ -211,6 +211,38 @@ test('production browser logs in with TOTP, sends no desktop identity, and expos
   });
 });
 
+test('narrow browser history closes its drawer and restores a session draft through settings', async ({
+  page,
+}) => {
+  await page.setViewportSize({ width: 390, height: 844 });
+  await browserFixture(page, true, true);
+  await page.getByRole('button', { name: '展开会话列表', exact: true }).click();
+  await page.getByRole('button', { name: '展开其他设备的会话', exact: true }).click();
+  await page.locator('.session-select').filter({ hasText: '阅读测试' }).click();
+  const draft = page.getByRole('textbox', { name: '消息', exact: true });
+  await draft.fill('保留这份草稿');
+  await page.getByRole('button', { name: '展开会话列表', exact: true }).click();
+  await page.goBack();
+  await expect(page.locator('.shell')).toHaveClass(/side-closed/);
+  await expect(draft).toHaveValue('保留这份草稿');
+  await page.getByRole('button', { name: '展开会话列表', exact: true }).click();
+  await page.getByRole('button', { name: '设置与账号', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '设置', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: '外观', exact: true }).click();
+  await expect(page.getByRole('radiogroup', { name: '主题', exact: true })).toBeVisible();
+  await page.goBack();
+  await expect(page.getByRole('heading', { name: '设置', exact: true })).toBeVisible();
+  await page.goBack();
+  await expect(draft).toHaveValue('保留这份草稿');
+  await page.goForward();
+  await expect(page.getByRole('heading', { name: '设置', exact: true })).toBeVisible();
+  await page.reload();
+  await expect(page.getByRole('heading', { name: '设置', exact: true })).toBeVisible();
+  await page.goForward();
+  await expect(page.getByRole('radiogroup', { name: '主题', exact: true })).toBeVisible();
+  expect(await page.evaluate(() => JSON.stringify(history.state))).not.toContain('保留这份草稿');
+});
+
 test('browser retries an offline connection but returns to login after an expired cookie on reconnect', async ({
   page,
 }) => {
@@ -528,6 +560,7 @@ for (const browser of [false, true])
         Object.defineProperty(window, 'desktop', {
           configurable: true,
           value: {
+            saveDrafts: async () => {},
             copyText: async (text: string) => {
               clipboard.desktopCalls++;
               await write(text);

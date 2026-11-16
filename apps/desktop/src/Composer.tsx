@@ -138,6 +138,35 @@ export default function Composer({
   const setDraft = (text: string) => updateDraft((current) => ({ ...current, text }));
   const canAttach = !!window.desktop && !!attachmentDeviceId && !inputDisabled;
   const branch = useBranch(localProject ? session.projectPath : null, !!session.activeRun);
+  const toolbar = useRef<HTMLDivElement>(null);
+  useLayoutEffect(() => {
+    const bar = toolbar.current!;
+    const fit = () => {
+      bar.classList.remove('compact-permission');
+      bar.classList.add('measuring');
+      bar.classList.toggle(
+        'compact-permission',
+        bar.lastElementChild!.getBoundingClientRect().right +
+          parseFloat(getComputedStyle(bar).paddingRight) >
+          bar.getBoundingClientRect().right,
+      );
+      bar.classList.remove('measuring');
+    };
+    fit();
+    const observer = new ResizeObserver(fit);
+    observer.observe(bar);
+    for (const child of bar.children) observer.observe(child);
+    return () => observer.disconnect();
+  }, [
+    session,
+    native,
+    capabilities,
+    nativeSession,
+    !!resume,
+    !!draft.text.trim(),
+    !!draft.attachments.length,
+    !!draft.adding,
+  ]);
   const [dropping, setDropping] = useState(false);
   // The command menu: this window's own actions, then Claude Code's commands that fit what follows the slash. Enter
   // runs the one picked; Tab or a click puts a command in the box, to be given its arguments.
@@ -418,7 +447,7 @@ export default function Composer({
             }
           }}
         />
-        <div className="composer-toolbar">
+        <div className="composer-toolbar" ref={toolbar}>
           {window.desktop && (
             <IconButton
               title={attachmentDeviceId ? '添加文件' : '只能向本机执行的会话添加文件'}

@@ -585,6 +585,8 @@ test('Electron previews actual local images and handles 50 mixed attachments wit
     await application.evaluate(({ BrowserWindow }) => {
       BrowserWindow.getAllWindows()[0].setSize(440, 760);
     });
+    await expect(page.locator('.shell')).toHaveClass(/side-closed/);
+    await expect(page.locator('.sidebar')).toBeHidden();
     await expect(page.getByRole('textbox', { name: '消息', exact: true })).toBeInViewport();
     expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(
       true,
