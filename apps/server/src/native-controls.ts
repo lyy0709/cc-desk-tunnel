@@ -98,17 +98,25 @@ export function statusLineQuota(status: unknown): Windows {
 // settings sign in otherwise (an API key, another token) keeps apart, and a run still going under a login since
 // replaced writes to its own, not to the new one's.
 export class ObservedQuotas {
-  private readings = new Map<string, ObservedQuota>();
-  of(login: string) {
-    return this.readings.get(login) ?? null;
+  private readings = new Map<string, { reading: ObservedQuota; times: Map<string, number> }>();
+  of(login: string, after?: number): ObservedQuota | null {
+    const held = this.readings.get(login);
+    if (!held) return null;
+    if (after === undefined) return held.reading;
+    const windows = held.reading.windows.filter((window) => held.times.get(window.name)! > after);
+    return windows.length ? { ...held.reading, windows } : null;
   }
   observe(login: string, event: SDKRateLimitEvent, now = Date.now()) {
-    const reading = observedQuota(event, this.of(login), now);
-    if (reading) this.readings.set(login, reading);
+    const reading = observedQuota(event, null, now);
+    if (reading) this.observeWindows(login, reading.windows, now);
   }
   observeWindows(login: string, windows: Windows, now = Date.now()) {
     const reading = merged(windows, this.of(login), now);
-    if (reading) this.readings.set(login, reading);
+    if (reading) {
+      const times = new Map(this.readings.get(login)?.times);
+      for (const window of windows) times.set(window.name, now);
+      this.readings.set(login, { reading, times });
+    }
   }
   // What was heard before the login was known becomes that login's, unless it has its own.
   adopt(from: string, to: string) {
@@ -254,7 +262,11 @@ export class Quotas {
           ),
         }
       : held;
-    const observed = unexpired(this.observed.of(login), now);
+    // A single-window event must not promote older observations of the other windows over a newer query.
+    const observed = unexpired(
+      this.observed.of(login, read?.available ? Date.parse(read.measuredAt!) : undefined),
+      now,
+    );
     if (!observed) return read?.available && !read.windows.length ? null : read;
     if (!read?.available) return { available: true, ...observed };
     if (observed.measuredAt <= read.measuredAt!) return read;

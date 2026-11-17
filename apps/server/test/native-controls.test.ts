@@ -391,6 +391,47 @@ test('what the replies carry stands in where the quota is not read or does not a
   assert.equal(read.of('a', now + 1000)?.measuredAt, new Date(now + 1000).toISOString());
 });
 
+test('partial observations never promote older windows over a newer query, including while it is pending', async () => {
+  for (const duringRead of [false, true]) {
+    const quotas = new Quotas();
+    quotas.observe('a', daily, 0);
+    quotas.observe('a', weekly, 0);
+    let release;
+    const query = {
+      usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET: () =>
+        new Promise((resolve) => {
+          release = () =>
+            resolve({
+              rate_limits_available: true,
+              rate_limits: {
+                five_hour: { utilization: 37, resets_at: '2026-10-25T15:30:00Z' },
+                seven_day: { utilization: 50, resets_at: '2026-10-30T02:00:00Z' },
+              },
+            });
+        }),
+    } as unknown as Query;
+    const reading = quotas.through('a', query, { now: 1000 });
+    await new Promise((resolve) => setImmediate(resolve));
+    if (!duringRead) {
+      release!();
+      await reading;
+    }
+    quotas.observe('a', rateLimitEvent({ ...weekly.rate_limit_info, utilization: 0.51 }), 2000);
+    if (duringRead) {
+      release!();
+      await reading;
+    }
+    assert.deepEqual(
+      quotas.of('a', 2000)?.windows.map(({ name, utilization }) => [name, utilization]),
+      [
+        ['five_hour', 37],
+        ['seven_day', 51],
+      ],
+    );
+    assert.equal(quotas.of('a', 2000)?.measuredAt, new Date(2000).toISOString());
+  }
+});
+
 test('failed quota reads keep their timestamp, expire on reset and clear with the account', async () => {
   let failure: 'error' | 'timeout' | null = null;
   const query = {
