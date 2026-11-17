@@ -64,8 +64,7 @@ test('commands go with what they do and take, without those bound to the CLI ter
 });
 
 test('context comes from the native summary and is distinct from cumulative usage totals', async () => {
-  let detail: unknown,
-    reads = 0;
+  let detail: unknown, skip: unknown;
   const query = {
     async getContextUsage(options: unknown) {
       detail = options;
@@ -78,8 +77,8 @@ test('context comes from the native summary and is distinct from cumulative usag
       };
     },
     async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET(options: unknown) {
-      reads++;
-      throw new Error('Experimental quota query must not run');
+      skip = options;
+      return { rate_limits_available: false, rate_limits: null };
     },
   } as unknown as Query;
   const result = {
@@ -107,8 +106,8 @@ test('context comes from the native summary and is distinct from cumulative usag
   assert.equal(metrics.usage?.inputTokens, 100000);
   assert.equal(metrics.usage?.costUsd, 0.5);
   assert.deepEqual(detail, { detail: 'summary' });
-  assert.equal(reads, 0);
-  assert.equal(metrics.rateLimits, null);
+  assert.deepEqual(skip, { skipBehaviors: true });
+  assert.equal(metrics.rateLimits?.available, false);
 });
 
 test('unavailable native telemetry stays unavailable rather than fabricating quotas or context', async () => {
@@ -126,7 +125,7 @@ test('unavailable native telemetry stays unavailable rather than fabricating quo
     context: null,
     usage: null,
     rateLimits: null,
-    errors: { context: '原生接口读取失败' },
+    errors: { context: '原生接口读取失败', usage: '原生接口读取失败' },
   });
   assert.equal(resultUsage({} as SDKResultMessage), null);
 });
@@ -143,11 +142,11 @@ test('optional native telemetry has a bounded wait and cannot hold a completed t
   const metrics = await nativeMetrics(query, undefined, { timeoutMs: 10 });
   assert.ok(metrics.type === 'native.metrics');
   assert.equal(metrics.context, null);
-  assert.equal(metrics.rateLimits, null);
+  assert.equal(metrics.rateLimits?.available, false);
   assert.equal(metrics.errors?.context, '原生接口读取超时');
 });
 
-test('refresh preserves known result totals and observed quota without invoking account endpoints', async () => {
+test('refresh preserves its own result totals when the shared quota reading has no session totals', async () => {
   const calls: string[] = [];
   const query = new Proxy(
     {},
@@ -172,11 +171,251 @@ test('refresh preserves known result totals and observed quota without invoking 
     windows: [{ name: 'five_hour', utilization: 7, resetsAt: '2026-10-03T02:00:00Z' }],
     measuredAt: '2026-10-03T01:00:00Z',
   };
-  const metrics = await nativeMetrics(query, undefined, { previous, rateLimits });
+  const metrics = await nativeMetrics(query, undefined, {
+    previous,
+    quota: async () => ({ rateLimits }),
+  });
   assert.ok(metrics.type === 'native.metrics');
   assert.deepEqual(metrics.usage, previous);
   assert.deepEqual(metrics.rateLimits, rateLimits);
   assert.deepEqual(calls, ['getContextUsage']);
+});
+
+test('native additive quota arrays cannot hide all account and context metrics', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-01T00:00:00Z') });
+  const query = {
+    async getContextUsage() {
+      return {
+        model: 'opus',
+        totalTokens: 1000,
+        rawMaxTokens: 1000000,
+        percentage: 0.1,
+        categories: [],
+      };
+    },
+    async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+      return {
+        rate_limits_available: true,
+        session: {
+          total_cost_usd: 0.3,
+          model_usage: {
+            opus: {
+              inputTokens: 100,
+              outputTokens: 20,
+              cacheReadInputTokens: 30,
+              cacheCreationInputTokens: 40,
+            },
+          },
+        },
+        rate_limits: {
+          five_hour: { utilization: 3, resets_at: '2026-10-03T02:00:00Z' },
+          seven_day: { utilization: 0, resets_at: '2026-10-10T02:00:00Z' },
+          limits: [{ type: 'five_hour', status: 'allowed', utilization: 0.03 }],
+          spend: { balance: 0 },
+          future: [1, 2, 3],
+        },
+      };
+    },
+  } as unknown as Query;
+  const metrics = await nativeMetrics(query);
+  assert.ok(metrics.type === 'native.metrics');
+  assert.equal(metrics.context?.windowTokens, 1000000);
+  assert.equal(metrics.usage?.inputTokens, 100);
+  assert.equal(metrics.rateLimits?.windows.length, 2);
+  assert.equal(metrics.rateLimits?.windows[0].utilization, 3);
+});
+
+test('the service reads the quota once a minute for every run under a login, and only while it is wanted', async () => {
+  let reads = 0,
+    spent = 0;
+  let answer = () => {};
+  const query = {
+    async getContextUsage() {
+      throw new Error('unsupported');
+    },
+    async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+      reads++;
+      await new Promise<void>((resolve) => (answer = resolve));
+      return {
+        rate_limits_available: true,
+        rate_limits: { five_hour: { utilization: 24, resets_at: '2026-10-05T20:20:00Z' } },
+        session: { total_cost_usd: ++spent, model_usage: {} },
+      };
+    },
+  } as unknown as Query;
+  // The CLI is asked a moment after the read starts.
+  const settle = async () => {
+    await new Promise((resolve) => setImmediate(resolve));
+    answer();
+  };
+  const quotas = new Quotas(60_000);
+  const first = quotas.through('a', query, { now: 0 });
+  const joined = quotas.through('a', query, { now: 10, asked: true });
+  await settle();
+  assert.equal((await first).usage?.session?.total_cost_usd, 1);
+  assert.equal((await joined).usage, undefined, 'a read under way is waited for, not repeated');
+  assert.equal((await joined).rateLimits?.windows[0]?.utilization, 24);
+  assert.equal((await quotas.through('a', query, { now: 30_000 })).usage, undefined);
+  assert.equal(reads, 1, 'one read a minute serves every run');
+  const other = quotas.through('b', query, { now: 30_000 });
+  await settle();
+  await other;
+  assert.equal(reads, 2, 'another login has its own');
+  quotas.wanted = () => false;
+  assert.equal((await quotas.through('a', query, { now: 120_000 })).usage, undefined);
+  assert.equal(reads, 2, 'no client wants it kept current');
+  const asked = quotas.through('a', query, { now: 120_000, asked: true });
+  await settle();
+  assert.ok((await asked).usage, 'the user asked');
+  assert.equal(reads, 3);
+  // Totals come only with this CLI's own answer; otherwise the session keeps those it had.
+  const previous = {
+    costUsd: 9,
+    inputTokens: 1,
+    outputTokens: 1,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    measuredAt: '2026-10-03T00:00:00Z',
+  };
+  const kept = await nativeMetrics(query, undefined, {
+    quota: (query) => quotas.through('a', query, { now: 130_000 }),
+    previous,
+  });
+  assert.ok(kept.type === 'native.metrics');
+  assert.deepEqual(kept.usage, previous);
+  assert.equal(kept.rateLimits?.windows[0]?.utilization, 24);
+});
+
+test('native quota windows retain reset times and per-model rows without exposing spend credentials', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-01T00:00:00Z') });
+  const query = {
+    async getContextUsage() {
+      return null;
+    },
+    async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+      return {
+        rate_limits_available: true,
+        rate_limits: {
+          five_hour: { utilization: 37, resets_at: '2026-10-02T15:00:00Z' },
+          seven_day: { utilization: 12, resets_at: '2026-10-09T15:00:00Z' },
+          model_scoped: [
+            { display_name: 'Fable', utilization: 41, resets_at: '2026-10-09T15:00:00Z' },
+            { display_name: 'Test model', utilization: null, resets_at: null },
+          ],
+          extra_usage: { is_enabled: true, used_credits: 1234 },
+        },
+      };
+    },
+  } as unknown as Query;
+  const metrics = await nativeMetrics(query);
+  assert.ok(metrics.type === 'native.metrics');
+  assert.deepEqual(metrics.rateLimits?.windows, [
+    { name: 'five_hour', utilization: 37, resetsAt: '2026-10-02T15:00:00Z' },
+    { name: 'seven_day', utilization: 12, resetsAt: '2026-10-09T15:00:00Z' },
+    { name: 'seven_day:Fable', utilization: 41, resetsAt: '2026-10-09T15:00:00Z' },
+    { name: 'seven_day:Test model', utilization: null, resetsAt: null },
+  ]);
+});
+
+test('what the replies carry stands in where the quota is not read or does not apply', async (t) => {
+  t.mock.timers.enable({ apis: ['Date'], now: new Date('2026-10-01T00:00:00Z') });
+  const query = (available: boolean) =>
+    ({
+      async getContextUsage() {
+        throw new Error('unsupported');
+      },
+      async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+        return {
+          rate_limits_available: available,
+          rate_limits: available
+            ? { five_hour: { utilization: 7, resets_at: '2026-10-03T02:00:00Z' } }
+            : null,
+        };
+      },
+    }) as unknown as Query;
+  const now = Date.now();
+  const later = Math.floor(now / 1000) + 3600;
+  const event = (utilization: number, resetsAt = later) =>
+    rateLimitEvent({ status: 'allowed', unifiedWindows: { five_hour: { utilization, resetsAt } } });
+  // Not read: only what the replies carried, or nothing.
+  const passive = new Quotas();
+  passive.wanted = () => false;
+  assert.equal((await passive.through('a', query(true), { now })).rateLimits, null);
+  passive.observe('a', event(0.02), now);
+  const carried = (await passive.through('a', query(true), { now })).rateLimits;
+  assert.deepEqual(carried?.windows, [
+    { name: 'five_hour', utilization: 2, resetsAt: new Date(later * 1000).toISOString() },
+  ]);
+  // The CLI says the plan quota does not apply, as with a long-lived token: the replies stand in.
+  const token = new Quotas();
+  token.observe('a', event(0.02), now);
+  assert.equal((await token.through('a', query(false), { now })).rateLimits?.available, true);
+  // A new setup token may have the same public identity. Its old readings must not survive an account change.
+  token.clear();
+  assert.equal(token.of('a', now), null);
+  assert.equal((await token.through('a', query(false), { now })).rateLimits?.available, false);
+  // A reading whose windows have all reset leaves the native answer as it is.
+  const stale = new Quotas();
+  stale.observe('a', event(0.9, later - 7200), now);
+  assert.equal((await stale.through('a', query(false), { now })).rateLimits?.available, false);
+  // The replies since a read replace its windows at once; the rows only a read gives stay.
+  const read = new Quotas();
+  read.observe('a', event(0.02), now - 1000);
+  const withModels = {
+    ...query(true),
+    async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+      return {
+        rate_limits_available: true,
+        rate_limits: {
+          five_hour: { utilization: 7, resets_at: '2026-10-03T02:00:00Z' },
+          model_scoped: [{ display_name: 'Fable', utilization: 3, resets_at: null }],
+        },
+      };
+    },
+  } as unknown as Query;
+  assert.deepEqual(
+    (await read.through('a', withModels, { now })).rateLimits?.windows.map(
+      (window) => window.utilization,
+    ),
+    [7, 3],
+    'replies older than the read do not replace it',
+  );
+  read.observe('a', event(0.5), now + 1000);
+  assert.deepEqual(
+    read.of('a', now + 1000)?.windows.map((window) => [window.name, window.utilization]),
+    [
+      ['five_hour', 50],
+      ['seven_day:Fable', 3],
+    ],
+  );
+  assert.equal(read.of('a', now + 1000)?.measuredAt, new Date(now + 1000).toISOString());
+});
+
+test('failed quota reads keep their timestamp, expire on reset and clear with the account', async () => {
+  let failure: 'error' | 'timeout' | null = null;
+  const query = {
+    async usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET() {
+      if (failure === 'error') throw new Error('unavailable');
+      if (failure === 'timeout') return new Promise(() => {});
+      return {
+        rate_limits_available: true,
+        rate_limits: { five_hour: { utilization: 37, resets_at: new Date(10000).toISOString() } },
+      };
+    },
+  } as unknown as Query;
+  const quotas = new Quotas();
+  const first = await quotas.through('a', query, { now: 0 });
+  failure = 'error';
+  const failed = await quotas.through('a', query, { now: 1000, asked: true });
+  assert.equal(failed.error, '原生接口读取失败');
+  assert.deepEqual(failed.rateLimits, first.rateLimits);
+  failure = 'timeout';
+  const timedOut = await quotas.through('a', query, { now: 2000, asked: true, timeoutMs: 10 });
+  assert.equal(timedOut.error, '原生接口读取超时');
+  assert.deepEqual(timedOut.rateLimits, first.rateLimits);
+  assert.equal(quotas.of('a', 10000), null);
+  quotas.clear();
+  assert.equal(quotas.of('a', 0), null);
 });
 
 test('a resolved native model remains native instead of appearing as provider configuration', () => {
@@ -270,7 +509,9 @@ test('context refresh leaves observation timestamps and per-model public windows
         release = () => resolve(null);
       }),
   } as unknown as Query;
-  const first = nativeMetrics(query, undefined, { rateLimits: quotas.of('a', 0) });
+  const first = nativeMetrics(query, undefined, {
+    quota: async () => ({ rateLimits: quotas.of('a', 0) }),
+  });
   await new Promise((resolve) => setImmediate(resolve));
   quotas.observe(
     'a',
@@ -297,15 +538,21 @@ test('context refresh leaves observation timestamps and per-model public windows
   );
 });
 
-test('unpublished quota fields are ignored even when they contradict the public event', () => {
-  const extra = {
-    unifiedWindows: { five_hour: { utilization: 1, resetsAt: 1792942200 } },
-    secret: 'not-public',
-  };
-  assert.equal(observedQuota(rateLimitEvent({ status: 'allowed', ...extra }), null, 0), null);
+test('normal replies carry full quota windows before the public warning fields are present', () => {
   assert.deepEqual(
-    observedQuota(rateLimitEvent({ ...daily.rate_limit_info, ...extra }), null, 0),
-    observedQuota(daily, null, 0),
+    observedQuota(
+      rateLimitEvent({
+        status: 'allowed',
+        unifiedWindows: {
+          five_hour: { utilization: 0.02, resetsAt: 1792942200 },
+          seven_day: { utilization: 0.44, resetsAt: 1793325600 },
+        },
+        secret: 'must-not-leave-sdk',
+      }),
+      null,
+      0,
+    ),
+    observedQuota(weekly, observedQuota(daily, null, 0), 0),
   );
 });
 

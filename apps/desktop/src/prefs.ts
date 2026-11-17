@@ -62,6 +62,8 @@ export type Prefs = {
   stats: { enabled: boolean; summary: Record<string, boolean> };
   // Whether the quota used is shown beside the message box.
   quota: boolean;
+  // Keep the account quota current during runs; otherwise only the replies update it.
+  quotaReads: boolean;
   followup: MessagePriority;
   // How much of the work behind a reply is shown.
   view: TranscriptView;
@@ -93,6 +95,7 @@ const defaults: Prefs = {
   bypassPermissions: false,
   stats: { enabled: false, summary: {} },
   quota: false,
+  quotaReads: true,
   followup: 'next',
   view: defaultView,
   sessionBar: { enabled: false, summary: {} },
@@ -141,6 +144,7 @@ function read(saved: any = shared('prefs') ?? stored()): Prefs {
       ) as ConnectionWaits,
       bypassPermissions: saved.bypassPermissions === true,
       quota: saved.quota === true,
+      quotaReads: saved.quotaReads !== false,
       followup:
         followupModes.find((entry) => entry.priority === saved.followup)?.priority ?? 'next',
       view: {

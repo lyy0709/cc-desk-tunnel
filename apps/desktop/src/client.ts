@@ -82,6 +82,7 @@ export class RequestInterruptedError extends Error {
       'account.status',
       'usage.summary',
       'usage.query',
+      'quota.watch',
       'session.stats',
       'settings.get',
       'compaction.get',
@@ -608,7 +609,9 @@ export class ProxyClient {
         this.outlineReads.get(message.sessionId)?.abort();
         if (this.state.reading?.page.session.id === message.sessionId) this.viewRead?.abort();
         for (const [id, request] of this.pending) {
-          if (request.sessionId !== message.sessionId) continue;
+          // The deletion broadcast precedes its success receipt; that request must still receive the receipt.
+          if (request.sessionId !== message.sessionId || request.type === 'session.delete')
+            continue;
           clearTimeout(request.timer);
           this.pending.delete(id);
           request.reject(new Error('会话已删除。'));

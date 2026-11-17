@@ -14,7 +14,7 @@ import {
   tunnelCredentialsSchema,
 } from '../src/index.ts';
 
-test('scheduled provenance is a bounded optional marker and obsolete quota controls are rejected', () => {
+test('scheduled provenance is a bounded optional marker', () => {
   const command = {
     type: 'message.send',
     requestId: randomUUID(),
@@ -26,19 +26,18 @@ test('scheduled provenance is a bounded optional marker and obsolete quota contr
     assert.equal(commandSchema.safeParse({ ...command, scheduled }).success, true);
   assert.equal(commandSchema.safeParse({ ...command, scheduled: 'peer' }).success, false);
   assert.equal(commandSchema.safeParse({ ...command, origin: { kind: 'human' } }).success, false);
-  assert.equal(
-    commandSchema.safeParse({ type: 'quota.watch', requestId: randomUUID(), active: true }).success,
-    false,
-  );
-  assert.equal(
-    commandSchema.safeParse({
-      type: 'session.status',
-      requestId: randomUUID(),
-      sessionId: command.sessionId,
-      quota: true,
-    }).success,
-    false,
-  );
+});
+
+test('quota controls accept only a boolean preference or explicit refresh', () => {
+  const watch = { type: 'quota.watch', requestId: randomUUID(), active: true };
+  const status = { type: 'session.status', requestId: randomUUID(), sessionId: randomUUID() };
+  assert.equal(commandSchema.safeParse(watch).success, true);
+  assert.equal(commandSchema.safeParse({ ...watch, active: false }).success, true);
+  assert.equal(commandSchema.safeParse({ ...status, quota: true }).success, true);
+  assert.equal(commandSchema.safeParse({ ...status, quota: false }).success, true);
+  assert.equal(commandSchema.safeParse({ ...watch, active: 'true' }).success, false);
+  assert.equal(commandSchema.safeParse({ ...status, quota: 'true' }).success, false);
+  assert.equal(commandSchema.safeParse({ ...watch, interval: 1 }).success, false);
 });
 
 test('manual message priority is bounded and does not change scheduled provenance', () => {

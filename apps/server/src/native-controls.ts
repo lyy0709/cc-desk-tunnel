@@ -14,8 +14,12 @@ import type {
 } from '@cc-desk-tunnel/protocol';
 
 type ContextUsage = Awaited<ReturnType<Query['getContextUsage']>>;
+type UsageReading = Awaited<
+  ReturnType<Query['usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET']>
+>;
 type Windows = NonNullable<Metrics['rateLimits']>['windows'];
 export type ObservedQuota = { windows: Windows; measuredAt: string };
+type UnifiedWindow = { utilization?: number; resetsAt?: number };
 
 // Who the CLI is signed in as. A reading seen under one login says nothing about another.
 export function loginOf(account: NativeCapabilities['account']) {
@@ -30,23 +34,32 @@ export function loginOf(account: NativeCapabilities['account']) {
   ]);
 }
 
-// Quota comes only from the public event fields, in fractions and Unix seconds.
+// The CLI's replies carry all known windows in `unifiedWindows` (an unpublished SDK field). Older events name
+// only one window through the public fields. Utilization is a fraction and resets are Unix seconds.
 export function observedQuota(
   event: SDKRateLimitEvent,
   previous: ObservedQuota | null,
   now = Date.now(),
 ): ObservedQuota | null {
-  const info = event.rate_limit_info;
-  const windows =
-    info.rateLimitType && info.rateLimitType !== 'overage' && Number.isFinite(info.utilization)
+  const info = event.rate_limit_info as SDKRateLimitEvent['rate_limit_info'] & {
+    unifiedWindows?: Record<string, UnifiedWindow | undefined>;
+  };
+  const named: [string, UnifiedWindow | undefined][] = info.unifiedWindows
+    ? Object.entries(info.unifiedWindows)
+    : info.rateLimitType && info.rateLimitType !== 'overage'
+      ? [[info.rateLimitType, info]]
+      : [];
+  const windows = named.flatMap(([name, window]) =>
+    window && Number.isFinite(window.utilization)
       ? [
           {
-            name: info.rateLimitType,
-            utilization: Math.max(0, info.utilization! * 100),
-            resetsAt: info.resetsAt ? new Date(info.resetsAt * 1000).toISOString() : null,
+            name,
+            utilization: Math.max(0, window.utilization! * 100),
+            resetsAt: window.resetsAt ? new Date(window.resetsAt * 1000).toISOString() : null,
           },
         ]
-      : [];
+      : [],
+  );
   return merged(windows, previous, now);
 }
 
@@ -113,15 +126,51 @@ export function unexpired(observed: ObservedQuota | null, now = Date.now()): Obs
   return windows.length ? { ...observed!, windows } : null;
 }
 
-// One account's observations are shared across its sessions. No account endpoint is polled.
+// The CLI's structured /usage answer includes windows not carried in every response, such as per-model limits.
+function planQuota(usage: UsageReading, measuredAt: string): NonNullable<Metrics['rateLimits']> {
+  const windows = usage.rate_limits
+    ? Object.entries(usage.rate_limits).flatMap(([name, value]) => {
+        if (!value || name === 'extra_usage') return [];
+        if (name === 'model_scoped' && Array.isArray(value))
+          return value.map((item) => ({
+            name: `seven_day:${item.display_name}`,
+            utilization: item.utilization,
+            resetsAt: item.resets_at,
+          }));
+        if (!Array.isArray(value) && 'utilization' in value && 'resets_at' in value)
+          return [{ name, utilization: value.utilization, resetsAt: value.resets_at }];
+        return [];
+      })
+    : [];
+  return { available: usage.rate_limits_available, windows, measuredAt };
+}
+
+export type QuotaAnswer = {
+  rateLimits: Metrics['rateLimits'];
+  error?: string;
+  usage?: UsageReading;
+};
+
+// Every session and device shares one account reading. Replies update it for free; while a client wants active
+// reads, the SDK's experimental /usage query fills the gaps at most once a minute. A manual refresh reads anew.
 export class Quotas {
+  wanted: () => boolean = () => true;
+  private readonly interval: number;
   private observed = new ObservedQuotas();
   private limits = new Map<string, SDKRateLimitEvent['rate_limit_info']>();
+  private reads = new Map<
+    string,
+    { at: number; rateLimits: Metrics['rateLimits']; pending?: Promise<unknown> }
+  >();
   private login?: string;
+  constructor(interval = 60_000) {
+    this.interval = interval;
+  }
   // Setup tokens need not expose an account identity, so replacing one can keep the same login key.
   clear() {
     this.observed = new ObservedQuotas();
     this.limits.clear();
+    this.reads.clear();
     this.login = undefined;
   }
   identify(login: string) {
@@ -166,9 +215,60 @@ export class Quotas {
     this.observed.observeWindows(login, windows, now);
     return this.of(login, now);
   }
+  async through(
+    login: string,
+    query: Query,
+    { asked = false, timeoutMs = 5000, now = Date.now() } = {},
+  ): Promise<QuotaAnswer> {
+    this.identify(login);
+    const held = this.reads.get(login);
+    if (held?.pending) await held.pending;
+    else if (asked || (this.wanted() && (!held || now - held.at >= this.interval))) {
+      const measuredAt = new Date(now).toISOString();
+      const entry: { at: number; rateLimits: Metrics['rateLimits']; pending?: Promise<unknown> } = {
+        at: now,
+        rateLimits: held?.rateLimits ?? null,
+      };
+      this.reads.set(login, entry);
+      const pending = optionalStatus(
+        () =>
+          query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET({ skipBehaviors: true }),
+        timeoutMs,
+      );
+      entry.pending = pending;
+      const { value, error } = await pending;
+      entry.pending = undefined;
+      // Failed reads keep the last reading and its original timestamp.
+      if (value) entry.rateLimits = planQuota(value, measuredAt);
+      return { rateLimits: this.of(login, now), error, ...(value ? { usage: value } : {}) };
+    }
+    return { rateLimits: this.of(login, now) };
+  }
   of(login: string, now = Date.now()): Metrics['rateLimits'] {
+    const held = this.reads.get(login)?.rateLimits ?? null;
+    const read = held?.available
+      ? {
+          ...held,
+          windows: held.windows.filter(
+            (window) => !window.resetsAt || Date.parse(window.resetsAt) > now,
+          ),
+        }
+      : held;
     const observed = unexpired(this.observed.of(login), now);
-    return observed ? { available: true, ...observed } : null;
+    if (!observed) return read?.available && !read.windows.length ? null : read;
+    if (!read?.available) return { available: true, ...observed };
+    if (observed.measuredAt <= read.measuredAt!) return read;
+    const carried = new Map(observed.windows.map((window) => [window.name, window]));
+    return {
+      available: true,
+      windows: [
+        ...read.windows.map((window) => carried.get(window.name) ?? window),
+        ...observed.windows.filter(
+          (window) => !read.windows.some((row) => row.name === window.name),
+        ),
+      ],
+      measuredAt: observed.measuredAt,
+    };
   }
 }
 
@@ -291,29 +391,39 @@ function contextSummary(context: ContextUsage | null): Metrics['context'] {
     : null;
 }
 
-// Context is a native summary; usage totals come from results, while refresh keeps the last totals.
+// Only the CLI that was queried may use its /usage session totals; other sessions keep their own last result.
 export async function nativeMetrics(
   query: Query,
   result?: SDKResultMessage,
   {
     timeoutMs = 5000,
-    rateLimits = null,
+    quota = (query) => new Quotas().through('', query, { asked: true, timeoutMs }),
     previous = null,
   }: {
     timeoutMs?: number;
-    rateLimits?: Metrics['rateLimits'];
+    quota?: (query: Query) => Promise<QuotaAnswer>;
     previous?: Metrics['usage'];
   } = {},
 ): Promise<EventPayload> {
-  const contextStatus = await optionalStatus(
-    () => query.getContextUsage({ detail: 'summary' }),
-    timeoutMs,
-  );
+  const [contextStatus, answer] = await Promise.all([
+    optionalStatus(() => query.getContextUsage({ detail: 'summary' }), timeoutMs),
+    quota(query),
+  ]);
+  const totals =
+    result ??
+    (answer.usage?.session
+      ? ({
+          total_cost_usd: answer.usage.session.total_cost_usd,
+          modelUsage: answer.usage.session.model_usage,
+        } as SDKResultMessage)
+      : undefined);
   return eventPayloadSchema.parse({
     type: 'native.metrics',
     context: contextSummary(contextStatus.value),
-    usage: result ? resultUsage(result) : previous,
-    rateLimits,
-    ...(contextStatus.error ? { errors: { context: contextStatus.error } } : {}),
+    usage: totals ? resultUsage(totals) : previous,
+    rateLimits: answer.rateLimits,
+    ...(contextStatus.error || answer.error
+      ? { errors: { context: contextStatus.error, usage: answer.error } }
+      : {}),
   });
 }

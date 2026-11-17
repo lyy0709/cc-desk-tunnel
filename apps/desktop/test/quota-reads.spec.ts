@@ -5,7 +5,7 @@ import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
 import type { Session } from '@cc-desk-tunnel/protocol';
 import { screenshots } from './helpers.ts';
 
-test('quota display uses observations, expires while idle and never requests a quota read', async ({
+test('quota display watches per preference, refreshes on request and expires while idle', async ({
   page,
 }) => {
   const now = new Date().toISOString();
@@ -21,7 +21,7 @@ test('quota display uses observations, expires while idle and never requests a q
     updatedAt: now,
     activeRun: null,
   };
-  const requests: { type: string; quota?: boolean }[] = [];
+  const requests: { type: string; quota?: boolean; active?: boolean }[] = [];
   let publish: (value: unknown) => void = () => {};
   await page.clock.install({ time: new Date(now) });
   await page.addInitScript(() =>
@@ -57,9 +57,9 @@ test('quota display uses observations, expires while idle and never requests a q
   await page.getByRole('menuitem', { name: '设置', exact: true }).click();
   const sections = page.getByRole('navigation', { name: '设置分类' });
   await sections.getByRole('button', { name: '账号与额度', exact: true }).click();
-  await expect(
-    page.getByRole('switch', { name: '运行中每分钟读取一次额度', exact: true }),
-  ).toHaveCount(0);
+  const watch = page.getByRole('switch', { name: '运行中每分钟读取一次额度', exact: true });
+  await expect(watch).toBeChecked();
+  expect(requests.some((message) => message.type === 'quota.watch' && message.active)).toBe(true);
   await expect(page.getByText('尚无额度数据', { exact: true })).toBeVisible();
   publish({
     type: 'session.event',
@@ -98,17 +98,16 @@ test('quota display uses observations, expires while idle and never requests a q
   await expect(page.getByText('尚无额度数据', { exact: true })).toBeVisible();
   await page.screenshot({ path: join(screenshots, 'quota-expired-dark-narrow.png') });
   expect(requests.slice(count).filter((message) => message.type !== 'usage.summary')).toEqual([]);
+  await watch.click();
+  await expect(watch).not.toBeChecked();
+  await expect
+    .poll(() => requests.filter((message) => message.type === 'quota.watch').at(-1)?.active)
+    .toBe(false);
   const beforeRefresh = requests.filter((message) => message.type === 'session.status').length;
   await page.getByRole('button', { name: '刷新账号信息', exact: true }).click();
   await expect
     .poll(() => requests.filter((message) => message.type === 'session.status').length)
     .toBe(beforeRefresh + 1);
-  expect(
-    requests
-      .filter((message) => message.type === 'session.status')
-      .every((message) => !('quota' in message)),
-  ).toBe(true);
-  expect(
-    requests.some((message) => message.type === 'quota.watch' || message.type === 'message.send'),
-  ).toBe(false);
+  expect(requests.filter((message) => message.type === 'session.status').at(-1)?.quota).toBe(true);
+  expect(requests.some((message) => message.type === 'message.send')).toBe(false);
 });

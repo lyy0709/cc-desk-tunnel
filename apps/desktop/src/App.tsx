@@ -789,6 +789,11 @@ export function App({
   useEffect(() => {
     if (nativeMode && connected) void client.request({ type: 'compaction.get' }).catch(() => {});
   }, [nativeMode, connected]);
+  // Resend this preference on every connection; all clients share the service's account reading.
+  useEffect(() => {
+    if (nativeMode && connected)
+      void client.request({ type: 'quota.watch', active: prefs.quotaReads }).catch(() => {});
+  }, [nativeMode, connected, prefs.quotaReads]);
   useEffect(() => {
     if (
       !accountOpen ||
@@ -945,11 +950,11 @@ export function App({
         setCcdtNeeded(opened.status === 'outdated' ? { installed: opened.installed } : {});
     });
   }
-  async function refreshStatus(sessionId = selected?.id ?? sessions[0]?.id) {
+  async function refreshStatus(sessionId = selected?.id ?? sessions[0]?.id, quota = false) {
     if (!sessionId || refreshing) return;
     setRefreshing(true);
     try {
-      await client.request({ type: 'session.status', sessionId });
+      await client.request({ type: 'session.status', sessionId, ...(quota ? { quota } : {}) });
     } catch (error) {
       setError(
         error instanceof RequestInterruptedError
@@ -1947,7 +1952,7 @@ export function App({
               disabled={!state.sessions.length || !connected || refreshing}
               error={currentError}
               refresh={() => {
-                void refreshStatus();
+                void refreshStatus(undefined, true);
               }}
             />
           }

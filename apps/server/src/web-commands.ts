@@ -21,6 +21,7 @@ export const browserCommands = new Set<Command['type']>([
   'approval.reply',
   'usage.summary',
   'usage.query',
+  'quota.watch',
   'account.status',
   'compaction.get',
   'web.settings.get',

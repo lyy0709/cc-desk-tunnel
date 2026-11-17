@@ -85,6 +85,7 @@ test('desktop login, chat, allow/deny, stop, errors and delete', async ({ page }
   await page.getByRole('menuitem', { name: '删除', exact: true }).click();
   await page.getByRole('dialog').getByRole('button', { name: '删除', exact: true }).click();
   await expect(row).toHaveCount(0);
+  await expect(page.getByRole('dialog', { name: '删除会话', exact: true })).toHaveCount(0);
   expect(errors).toEqual([]);
 });
 
@@ -222,6 +223,7 @@ test('Electron loads the built UI with sandbox and closes its execution connecti
     await page.getByRole('menuitem', { name: '删除', exact: true }).click();
     await page.getByRole('dialog').getByRole('button', { name: '删除', exact: true }).click();
     await expect(plain).toHaveCount(0);
+    await expect(page.getByRole('dialog', { name: '删除会话', exact: true })).toHaveCount(0);
     await expect.poll(() => existsSync(resolve(documents, 'CC Desk Tunnel', day))).toBe(false);
     await application.evaluate(({ dialog }) => {
       dialog.showOpenDialog = async () => ({ canceled: true, filePaths: [] });

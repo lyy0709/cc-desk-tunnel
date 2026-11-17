@@ -618,6 +618,27 @@ test('login only receives the session directory; content is loaded when selected
   assert.equal(client.state.events[sessions[5].id].length, 1);
 });
 
+test('a deletion broadcast cancels session reads but waits for the delete request receipt', async (t) => {
+  const { client, socket, sessions } = fixture(t);
+  const session = sessions[0];
+  const reading = assert.rejects(
+    client.request({ type: 'session.stats', sessionId: session.id }),
+    /会话已删除/,
+  );
+  const deleting = client.request({ type: 'session.delete', sessionId: session.id });
+  const requestId = socket.sent.at(-1).requestId;
+  const outcome = deleting.catch((error) => error);
+  socket.message({ type: 'session.deleted', sessionId: session.id });
+  await reading;
+  assert.equal(
+    client.state.sessions.some((item) => item.id === session.id),
+    false,
+  );
+  assert.equal(client.pending.has(requestId), true);
+  socket.message({ type: 'response', requestId, ok: true, sessionId: session.id });
+  assert.deepEqual(await outcome, { type: 'response', requestId, ok: true, sessionId: session.id });
+});
+
 test('stream notifications are batched and pending events cannot cross a disconnect or deletion', async (t) => {
   const { client, socket, sessions, snapshot } = fixture(t);
   const session = sessions[0];

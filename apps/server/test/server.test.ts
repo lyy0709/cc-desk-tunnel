@@ -19,6 +19,24 @@ const token = 'offline-test-' + randomUUID();
 // One computer unless a test is about several.
 const device = { id: randomUUID(), name: '测试设备' };
 
+test('quota watching is enabled while any connected client asks for it', async (t) => {
+  const f = await fixture(t);
+  const first = await f.connect();
+  const second = await f.connect();
+  assert.equal(quotas.wanted(), false);
+  for (const [client, active, wanted] of [
+    [first, true, true],
+    [second, false, true],
+    [first, false, false],
+    [second, true, true],
+    [second, false, false],
+  ] as const) {
+    const response = await client.request({ type: 'quota.watch', active });
+    assert.ok(response.type === 'response' && response.ok);
+    assert.equal(quotas.wanted(), wanted);
+  }
+});
+
 test('message priority persists and a retry cannot silently change delivery', async (t) => {
   const f = await fixture(t);
   const client = await f.connect();
