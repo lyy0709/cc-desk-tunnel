@@ -2,6 +2,8 @@ import { test, expect, _electron } from '@playwright/test';
 import type { Page } from '@playwright/test';
 import {
   connection,
+  connectionArgs,
+  connectionDirectory,
   createSession,
   expandActivity,
   login,
@@ -182,7 +184,11 @@ test('Electron loads the built UI with sandbox and closes its execution connecti
   for (const [name, value] of Object.entries(process.env))
     if (value !== undefined && name !== 'ELECTRON_RUN_AS_NODE') env[name] = value;
   const application = await _electron.launch({
-    args: [resolve('apps/desktop'), '--smoke-test'],
+    args: [
+      resolve('apps/desktop'),
+      '--smoke-test',
+      ...connectionArgs(resolve('.local/ui-test/profile-smoke'), true),
+    ],
     env,
   });
   let sessionTitle = '';
@@ -665,7 +671,8 @@ test('Electron remembers the sign-in, connects on the next launch and stays in t
   rmSync(profile, { recursive: true, force: true });
   const launch = () =>
     _electron.launch({
-      args: [resolve('apps/desktop'), '--smoke-test', `--user-data-dir=${profile}`],
+      // As the sign-in window starts it: signing in by itself once the token is remembered.
+      args: [resolve('apps/desktop'), '--smoke-test', ...connectionArgs(profile), '--sign-in'],
       env,
     });
   let application = await launch();
@@ -677,7 +684,7 @@ test('Electron remembers the sign-in, connects on the next launch and stays in t
   } finally {
     await application.close();
   }
-  const saved = readFileSync(resolve(profile, 'settings.json'), 'utf8');
+  const saved = readFileSync(resolve(connectionDirectory(profile), 'settings.json'), 'utf8');
   expect(saved).not.toContain(connection().token);
   application = await launch();
   try {
@@ -713,7 +720,7 @@ test('Electron remembers the sign-in, connects on the next launch and stays in t
     });
     // The schedule file exists from the first launch, and an edit made outside the window reaches it,
     // byte-order mark or not.
-    const file = resolve(profile, 'schedules.json');
+    const file = resolve(connectionDirectory(profile), 'schedules.json');
     // The window reads the file itself as it starts; the edit below has to come after that. It signs in by
     // itself here, so whichever of the two pages is up tells that it has started.
     await expect(page.locator('.login-page, .shell')).toBeVisible();

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
 import type { Session, SessionEvent, EventPayload } from '@cc-desk-tunnel/protocol';
-import { login, screenshots } from './helpers.ts';
+import { connectionArgs, login, screenshots } from './helpers.ts';
 
 async function open(page: Page, { desktop = true, history = 0, foreign = false } = {}) {
   const device = { id: randomUUID(), name: '附件测试电脑', platform: 'darwin' as const };
@@ -585,7 +585,7 @@ test('Electron previews actual local images and handles 50 mixed attachments wit
     ),
   );
   const application = await _electron.launch({
-    args: [resolve('apps/desktop'), '--smoke-test', `--user-data-dir=${profile}`],
+    args: [resolve('apps/desktop'), '--smoke-test', ...connectionArgs(profile)],
     env,
   });
   try {
