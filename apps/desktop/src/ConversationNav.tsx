@@ -1,26 +1,23 @@
 import { useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import type { RefObject } from 'react';
-import { ChevronUp } from 'lucide-react';
-import type { Turn } from './transcript.ts';
-import { firstLine } from './transcriptView.ts';
-import { IconButton } from './ui.tsx';
+import type { OutlineEntry } from '@cc-desk-tunnel/protocol';
 
-// A small map of the loaded turns. Scrolling only updates this map, not the transcript.
+// A small map of the whole conversation. Scrolling only updates this map, not the transcript.
 export default function ConversationNav({
   turns,
   root,
   scroll,
-  partial,
-  loading,
-  loadEarlier,
+  windowKey,
+  read,
+  error,
   navigate,
 }: {
-  turns: Turn[];
+  turns: OutlineEntry[];
   root: RefObject<HTMLDivElement | null>;
   scroll: RefObject<HTMLDivElement | null>;
-  partial: boolean;
-  loading: boolean;
-  loadEarlier: () => void;
+  windowKey: string;
+  read: (entry: OutlineEntry) => Promise<void>;
+  error: (message: string) => void;
   navigate: () => void;
 }) {
   const track = useRef<HTMLDivElement>(null);
@@ -34,28 +31,29 @@ export default function ConversationNav({
   const last = turns.length - 1;
   const selected = Math.min(preview ?? active, last);
   const turn = turns[selected];
-  const title =
-    firstLine(
-      turn.question?.text
-        .slice(0, 1000)
-        .replace(
-          /\[文件 #(\d+)\]/g,
-          (token, number) =>
-            turn.question?.attachments?.find((file) => file.reference === Number(number))?.name ??
-            token,
-        ) ?? '',
-    ) ||
-    turn.question?.attachments?.map((file) => file.name).join('、') ||
-    `第 ${selected + 1} 轮`;
-  const answer = turn.answer ?? turn.steps.findLast((step) => step.kind === 'assistant');
-  const excerpt = answer && 'text' in answer ? firstLine(answer.text.slice(0, 1600)) : '';
-  // Sample the ticks, not the turns: the pointer and arrow keys can still select every loaded turn.
+  const title = turn.question || `第 ${selected + 1} 轮`;
+  const excerpt = turn.answer;
+  const pending = useRef<string | null>(null);
+  const jumpVersion = useRef(0);
+  const [loading, setLoading] = useState(false);
+  const pressed = useRef<number | null>(null);
+  // Sample the ticks, not the turns: the pointer and arrow keys can still select every turn.
   const ticks = Math.min(turns.length, Math.max(2, Math.floor(height / 8)));
 
   useEffect(() => {
     const box = scroll.current!;
     const content = root.current!;
     anchors.current = [...content.querySelectorAll<HTMLElement>('.turn-anchor')];
+    const indices = new Map(turns.map((entry, index) => [entry.id, index]));
+    if (destination.current && !content.contains(destination.current)) destination.current = null;
+    if (pending.current) {
+      const target = anchors.current.find((element) => element.dataset.turnId === pending.current);
+      if (target) {
+        destination.current = target;
+        pending.current = null;
+        target.scrollIntoView({ block: 'start', behavior: 'instant' });
+      }
+    }
     let frame = 0;
     const update = () => {
       frame = 0;
@@ -78,7 +76,9 @@ export default function ConversationNav({
         else high = middle;
       }
       const end = box.scrollHeight - box.scrollTop - box.clientHeight < 2;
-      setActive(end ? all.length - 1 : Math.max(0, low - 1));
+      const anchor = all[end ? all.length - 1 : Math.max(0, low - 1)];
+      const index = anchor && indices.get(anchor.dataset.turnId!);
+      if (index !== undefined) setActive(index);
     };
     const schedule = () => {
       if (!frame) frame = requestAnimationFrame(update);
@@ -102,7 +102,7 @@ export default function ConversationNav({
       observer.disconnect();
       cancelAnimationFrame(frame);
     };
-  }, [turns.length, turns[0].id, root, scroll]);
+  }, [turns, windowKey, root, scroll]);
 
   useLayoutEffect(() => {
     const element = track.current!;
@@ -137,29 +137,31 @@ export default function ConversationNav({
       Math.min(last, Math.round(((y - bounds.top - 8) / (bounds.height - 16)) * last)),
     );
   };
-  const jump = (index: number) => {
+  const jump = async (index: number) => {
     navigate();
     setPreview(null);
-    destination.current = anchors.current[index];
-    // Long animated jumps would render every intervening reply. Move directly to the turn instead.
-    destination.current.scrollIntoView({ block: 'start', behavior: 'instant' });
+    const version = ++jumpVersion.current;
+    const id = turns[index].id;
+    const target = anchors.current.find((element) => element.dataset.turnId === id);
+    pending.current = target ? null : id;
+    destination.current = target ?? null;
+    if (target) target.scrollIntoView({ block: 'start', behavior: 'instant' });
+    setLoading(!target);
+    try {
+      // Selecting a loaded turn also supersedes an earlier jump awaiting its body.
+      await read(turns[index]);
+    } catch (cause) {
+      if (version !== jumpVersion.current) return;
+      pending.current = null;
+      if (!(cause instanceof Error && cause.name === 'AbortError')) error((cause as Error).message);
+    } finally {
+      if (version === jumpVersion.current) setLoading(false);
+    }
   };
 
   return (
     <>
       <nav className="conversation-nav" aria-label="对话轮次导航">
-        {partial && (
-          <IconButton
-            title="导航：加载更早记录"
-            disabled={loading}
-            onClick={() => {
-              navigate();
-              loadEarlier();
-            }}
-          >
-            <ChevronUp />
-          </IconButton>
-        )}
         <div
           className="conversation-nav-track"
           ref={track}
@@ -167,6 +169,7 @@ export default function ConversationNav({
           tabIndex={0}
           aria-label="对话轮次（上下键预览，回车跳转）"
           aria-orientation="vertical"
+          aria-busy={loading}
           aria-valuemin={1}
           aria-valuemax={turns.length}
           aria-valuenow={selected + 1}
@@ -177,7 +180,15 @@ export default function ConversationNav({
             if (event.pointerType !== 'touch') setPreview(indexAt(event.clientY));
           }}
           onPointerLeave={() => setPreview(null)}
-          onClick={(event) => jump(indexAt(event.clientY))}
+          // Click coordinates are rounded to whole pixels; the pointer's preview can distinguish
+          // more turns on a dense directory. Keep that selection through focus and click.
+          onPointerDown={(event) => {
+            pressed.current = indexAt(event.clientY);
+          }}
+          onClick={(event) => {
+            void jump(pressed.current ?? indexAt(event.clientY));
+            pressed.current = null;
+          }}
           onFocus={() => setPreview(active)}
           onBlur={() => setPreview(null)}
           onKeyDown={(event) => {
@@ -207,10 +218,10 @@ export default function ConversationNav({
         <div className="conversation-nav-preview" role="tooltip" id={tooltip} ref={card}>
           <small>
             {selected + 1} / {turns.length}
-            {partial ? ' · 已加载' : ''}
+            {loading ? ' · 正在定位' : ''}
           </small>
           <strong>{title.slice(0, 180)}</strong>
-          <p>{excerpt.slice(0, 300) || (turn.endedAt ? '本轮没有文字回复' : '等待回复')}</p>
+          <p>{excerpt.slice(0, 300) || (turn.ended ? '本轮没有文字回复' : '等待回复')}</p>
         </div>
       )}
     </>

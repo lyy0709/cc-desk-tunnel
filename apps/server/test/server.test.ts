@@ -4,6 +4,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { registerHooks } from 'node:module';
 import type { TestContext } from 'node:test';
 import { WebSocket } from 'ws';
 import { PROTOCOL_VERSION, serverMessageSchema } from '@cc-desk-tunnel/protocol';
@@ -12,10 +13,266 @@ import { readIdleCompaction } from '../src/idle-compaction.ts';
 import { createProxyServer, upgradeHeld } from '../src/server.ts';
 import { SessionStore } from '../src/store.ts';
 import { serviceVersion } from '../src/updates.ts';
+import { quotas } from '../src/claude.ts';
 
 const token = 'offline-test-' + randomUUID();
 // One computer unless a test is about several.
 const device = { id: randomUUID(), name: '测试设备' };
+
+test('quota watching is enabled while any connected client asks for it', async (t) => {
+  const f = await fixture(t);
+  const first = await f.connect();
+  const second = await f.connect();
+  assert.equal(quotas.wanted(), false);
+  for (const [client, active, wanted] of [
+    [first, true, true],
+    [second, false, true],
+    [first, false, false],
+    [second, true, true],
+    [second, false, false],
+  ] as const) {
+    const response = await client.request({ type: 'quota.watch', active });
+    assert.ok(response.type === 'response' && response.ok);
+    assert.equal(quotas.wanted(), wanted);
+  }
+});
+
+test('message priority persists and a retry cannot silently change delivery', async (t) => {
+  const f = await fixture(t);
+  const client = await f.connect();
+  const sessionId = await f.create(client);
+  const command = {
+    type: 'message.send',
+    sessionId,
+    requestId: randomUUID(),
+    text: '下一轮处理',
+    priority: 'later',
+  };
+  client.send(command);
+  const response = await client.wait(
+    (message) => message.type === 'response' && message.requestId === command.requestId,
+  );
+  assert.ok(response.type === 'response' && response.ok);
+  assert.equal(
+    f.server.store.userMessage(sessionId, command.requestId)?.payload.type,
+    'message.user',
+  );
+  const original = f.server.store.userMessage(sessionId, command.requestId)!.payload;
+  assert.ok(
+    original.type === 'message.user' && original.priority === 'later' && !original.scheduled,
+  );
+  const retry = await f.connect();
+  retry.send(command);
+  const same = await retry.wait(
+    (message) => message.type === 'response' && message.requestId === command.requestId,
+  );
+  assert.ok(same.type === 'response' && same.ok);
+  const changed = await f.connect();
+  changed.send({ ...command, priority: 'now' });
+  const conflict = await changed.wait(
+    (message) => message.type === 'response' && message.requestId === command.requestId,
+  );
+  assert.ok(conflict.type === 'response' && !conflict.ok && conflict.code === 'request_conflict');
+});
+
+test('account changes clear current quota and rejection state durably without rearming cached turns', async (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'ccdt-quota-reset-'));
+  const configDirectory = process.env.CLAUDE_CONFIG_DIR;
+  process.env.CLAUDE_CONFIG_DIR = directory;
+  const stub = `
+    export async function accountStatus() { return {loggedIn:true,authMethod:'claude.ai'}; }
+    export async function accountLogout() {}
+    export function configureSetupToken() {}
+    export class NativeLogin {
+      constructor(executable, done, notice, options) {
+        this.method = options.method; this.done = done;
+        this.url = Promise.resolve('https://claude.ai/oauth/authorize?fixture=true');
+      }
+      submit() { this.done(true); }
+      cancel() { this.cancelled = true; }
+    }
+  `;
+  const hooks = registerHooks({
+    resolve(specifier, context, next) {
+      return specifier === './native-account.ts'
+        ? { url: 'data:text/javascript,' + encodeURIComponent(stub), shortCircuit: true }
+        : next(specifier, context);
+    },
+  });
+  const server = createProxyServer({
+    token,
+    dataDir: directory,
+    claude: { executable: '/does-not-exist/claude' },
+    tunnel: {},
+    reverseProxy: true,
+  });
+  const client = new Client(await server.listen(0));
+  t.after(async () => {
+    client.socket.terminate();
+    await server.close();
+    hooks.deregister();
+    quotas.clear();
+    if (configDirectory === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+    else process.env.CLAUDE_CONFIG_DIR = configDirectory;
+    rmSync(directory, { recursive: true, force: true });
+  });
+  await client.open();
+  const session = server.store.create(randomUUID(), '旧账号额度', '/fixture', device);
+  for (const type of ['account.token', 'account.logout', 'account.login'] as const) {
+    quotas.observe('old', {
+      type: 'rate_limit_event',
+      uuid: randomUUID(),
+      session_id: session.id,
+      rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour' },
+    });
+    server.store.append(session.id, randomUUID(), {
+      type: 'native.metrics',
+      context: null,
+      usage: null,
+      cacheTtl: '1h',
+      rateLimits: {
+        available: true,
+        windows: [{ name: 'five_hour', utilization: 100, resetsAt: null }],
+      },
+    });
+    const cached = server.store.lastCachedTurn(session.id);
+    const response = await client.request({
+      type,
+      ...(type === 'account.token' ? { token: 'fixture-token' } : {}),
+    });
+    assert.ok(response.type === 'response' && response.ok);
+    if (type === 'account.login') {
+      await client.wait((message) => message.type === 'account.state' && !!message.login);
+      const code = await client.request({ type: 'account.code', code: 'fixture#state' });
+      assert.ok(code.type === 'response' && code.ok);
+    }
+    assert.equal(quotas.blockedUntil('old', server.store.lastQuota(session.id)), null);
+    assert.deepEqual(server.store.lastCachedTurn(session.id), cached);
+    const reopened = new SessionStore(directory);
+    try {
+      assert.equal(reopened.lastQuota(session.id)?.available, false);
+      assert.equal(reopened.lastMetrics(session.id)?.cacheTtl, undefined);
+    } finally {
+      reopened.close();
+    }
+  }
+});
+
+test(
+  'native approval cancellation removes stale controls and keeps the remaining wait reason',
+  { skip: process.platform === 'win32' },
+  async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), 'ccdt-approval-abort-'));
+    const fixture: any = {};
+    (globalThis as any).__ccdtApprovalFixture = fixture;
+    const stub = `
+    export * from ${JSON.stringify(new URL('../src/claude.ts', import.meta.url).href)};
+    export async function runClaude(options, run) {
+      const fixture = globalThis.__ccdtApprovalFixture;
+      fixture.request = (id, name) => {
+        const controller = new AbortController();
+        run.emit({type:'tool.requested', toolId:id, name, input:'{}', target:'Linux'});
+        const result = run.approve(id, name === 'AskUserQuestion' ? 'question' : 'approval', name,
+          AbortSignal.any([controller.signal, run.signal]));
+        return {controller, result};
+      };
+      fixture.first = fixture.request('first', 'Bash');
+      fixture.question = fixture.request('question', 'AskUserQuestion');
+      await new Promise(resolve => { fixture.finish = resolve; });
+      return run.signal.aborted ? 'cancelled' : 'completed';
+    }
+  `;
+    const hooks = registerHooks({
+      resolve(specifier, context, next) {
+        return specifier === './claude.ts' && context.parentURL?.includes('?approval-cancellation')
+          ? { url: 'data:text/javascript,' + encodeURIComponent(stub), shortCircuit: true }
+          : next(specifier, context);
+      },
+    });
+    const { createProxyServer: createFixtureServer } = (await import(
+      new URL('../src/server.ts?approval-cancellation', import.meta.url).href
+    )) as typeof import('../src/server.ts');
+    const server = createFixtureServer({
+      token,
+      dataDir: directory,
+      claude: { executable: '/does-not-exist/claude' },
+      tunnel: {},
+      reverseProxy: true,
+    });
+    const client = new Client(await server.listen(0));
+    t.after(async () => {
+      fixture.finish?.();
+      client.socket.terminate();
+      await server.close();
+      hooks.deregister();
+      delete (globalThis as any).__ccdtApprovalFixture;
+      rmSync(directory, { recursive: true, force: true });
+    });
+    await client.open();
+    const created = await client.request({ type: 'server.session.create', title: '审批取消' });
+    assert.ok(created.type === 'response' && created.ok && created.sessionId);
+    const sessionId = created.sessionId;
+    await client.request({ type: 'message.send', sessionId, text: 'fixture' });
+    const first = await client.event('approval.requested');
+    const question = await client.event('approval.requested');
+    assert.ok(first.type === 'session.event' && first.event.payload.type === 'approval.requested');
+    assert.ok(
+      question.type === 'session.event' && question.event.payload.type === 'approval.requested',
+    );
+    const runId = first.event.runId;
+    fixture.question.controller.abort();
+    assert.equal((await fixture.question.result).allowed, false);
+    const cancelled = await client.event('approval.resolved');
+    assert.ok(
+      cancelled.type === 'session.event' &&
+        cancelled.event.payload.type === 'approval.resolved' &&
+        cancelled.event.payload.cancelled,
+    );
+    assert.equal(server.store.get(sessionId).session.activeRun?.waiting, 'approval');
+    const stale = await client.request({
+      type: 'approval.reply',
+      sessionId,
+      runId,
+      approvalId: question.event.payload.approvalId,
+      allowed: true,
+    });
+    assert.ok(stale.type === 'response' && !stale.ok && stale.code === 'approval_answered');
+    fixture.first.controller.abort();
+    assert.equal((await fixture.first.result).allowed, false);
+    await client.event('approval.resolved');
+    assert.equal(server.store.get(sessionId).session.activeRun?.status, 'running');
+    const third = fixture.request('third', 'Bash');
+    const approval = await client.event('approval.requested');
+    assert.ok(
+      approval.type === 'session.event' && approval.event.payload.type === 'approval.requested',
+    );
+    await client.request({
+      type: 'approval.reply',
+      sessionId,
+      runId,
+      approvalId: approval.event.payload.approvalId,
+      allowed: true,
+    });
+    assert.equal((await third.result).allowed, true);
+    third.controller.abort();
+    const resolved = server.store
+      .snapshot(sessionId)
+      .events.filter((event) => event.payload.type === 'approval.resolved');
+    assert.equal(resolved.length, 3);
+    fixture.request('fourth', 'Bash');
+    await client.event('approval.requested');
+    await client.request({ type: 'run.cancel', sessionId, runId });
+    fixture.finish();
+    await client.wait(
+      (message) =>
+        message.type === 'session.event' &&
+        message.event.payload.type === 'run.status' &&
+        message.event.payload.status === 'cancelled',
+    );
+    assert.equal(server.store.get(sessionId).session.activeRun, null);
+  },
+);
+
 class Client {
   socket: WebSocket;
   messages: ServerMessage[] = [];
@@ -102,6 +359,49 @@ async function fixture(t: TestContext, stepMs = 2, graceMs?: number) {
   }
   return { directory, server, url, clients, connect, create };
 }
+
+test('scheduled messages retain provenance, reject changed retries and cannot join a busy session', async (t) => {
+  const f = await fixture(t, 1000);
+  const client = await f.connect();
+  const sessionId = await f.create(client);
+  const requestId = randomUUID();
+  const command = {
+    type: 'message.send',
+    sessionId,
+    requestId,
+    text: '任务提示词',
+    scheduled: 'scheduled',
+  };
+  client.send(command);
+  const first = await client.wait(
+    (message) => message.type === 'response' && message.requestId === requestId,
+  );
+  assert.ok(first.type === 'response' && first.ok);
+  assert.equal(f.server.store.userMessage(sessionId, requestId)?.payload.type, 'message.user');
+  client.send(command);
+  const duplicate = await client.wait(
+    (message) => message.type === 'response' && message.requestId === requestId,
+  );
+  assert.ok(duplicate.type === 'response' && duplicate.ok);
+  client.send({ ...command, scheduled: 'manual' });
+  const changed = await client.wait(
+    (message) => message.type === 'response' && message.requestId === requestId,
+  );
+  assert.ok(changed.type === 'response' && !changed.ok && changed.code === 'request_conflict');
+  const busy = await client.request({ ...command, requestId: randomUUID(), scheduled: 'manual' });
+  assert.ok(busy.type === 'response' && !busy.ok && busy.code === 'run_active');
+  const users = f.server.store
+    .snapshot(sessionId)
+    .events.filter(({ payload }) => payload.type === 'message.user');
+  assert.equal(users.length, 1);
+  assert.ok(users[0].payload.type === 'message.user' && users[0].payload.scheduled === 'scheduled');
+  const runId = f.server.store.get(sessionId).session.activeRun!.id;
+  await client.request({ type: 'run.cancel', sessionId, runId });
+  const reopened = new SessionStore(f.directory);
+  const saved = reopened.userMessage(sessionId, requestId)!.payload;
+  assert.ok(saved.type === 'message.user' && saved.scheduled === 'scheduled');
+  reopened.close();
+});
 
 test('requires authentication, rejects wrong token/version/origin and accepts health', async (t) => {
   const f = await fixture(t);
@@ -222,6 +522,17 @@ test('output goes out in fragments and is recorded once it is whole', async (t) 
   await other.request({ type: 'session.subscribe', sessionId, afterSequence: 0 });
   const caught = await fragment(other);
   assert.ok(caught.startsWith(pieces.join('')));
+  await other.request({
+    type: 'session.read',
+    sessionId,
+    purpose: 'export',
+    direction: 'after',
+    sequence: 0,
+  });
+  const captured = await other.wait((message) => message.type === 'session.read');
+  assert.ok(captured.type === 'session.read' && captured.fragment?.payload.type === 'text.delta');
+  const capturedText = captured.fragment.payload.text;
+  assert.ok(capturedText.startsWith(caught));
   await client.wait(
     (message) =>
       message.type === 'session.event' &&
@@ -235,6 +546,19 @@ test('output goes out in fragments and is recorded once it is whole', async (t) 
   assert.equal(recorded.length, 2);
   assert.ok(recorded[0].startsWith(pieces.join('')));
   assert.ok(recorded[1].includes('离线模拟回复'));
+  await other.request({
+    type: 'session.read',
+    sessionId,
+    purpose: 'export',
+    direction: 'after',
+    sequence: 0,
+    throughSequence: captured.throughSequence,
+  });
+  const frozen = await other.wait((message) => message.type === 'session.read');
+  assert.ok(frozen.type === 'session.read');
+  assert.deepEqual(frozen.events, captured.events);
+  assert.equal(frozen.fragment, undefined);
+  assert.equal(captured.fragment.payload.text, capturedText);
 });
 
 for (const allowed of [true, false]) {
@@ -906,6 +1230,80 @@ test('history is identical with negotiated compression and without compression',
     assert.ok(snapshot.type === 'session.snapshot');
     assert.deepEqual(snapshot.events, expected);
   }
+});
+
+test('outline, reading and export use separate delivery lanes without changing the subscription', async (t) => {
+  const f = await fixture(t);
+  const client = await f.connect();
+  const old = await f.create(client);
+  const runId = randomUUID();
+  f.server.store.append(old, runId, {
+    type: 'message.user',
+    messageId: randomUUID(),
+    text: '完整问题',
+    scenario: 'chat',
+  });
+  f.server.store.append(old, runId, {
+    type: 'text.delta',
+    messageId: randomUUID(),
+    text: '完整回答'.repeat(30000),
+  });
+  const current = await f.create(client);
+  const exporting = randomUUID(),
+    viewing = randomUUID(),
+    outline = randomUUID();
+  client.send({
+    type: 'session.read',
+    purpose: 'export',
+    sessionId: old,
+    requestId: exporting,
+    direction: 'after',
+    sequence: 0,
+  });
+  client.send({
+    type: 'session.read',
+    purpose: 'view',
+    sessionId: old,
+    requestId: viewing,
+    direction: 'around',
+    sequence: 1,
+  });
+  client.send({ type: 'session.outline', sessionId: old, requestId: outline });
+  await client.wait(
+    (message) => message.type === 'session.history.part' && message.requestId === exporting,
+  );
+  client.send({ type: 'session.history.cancel', requestId: exporting });
+  const cancelled = await client.wait(
+    (message) => message.type === 'response' && message.requestId === exporting,
+  );
+  assert.ok(
+    cancelled.type === 'response' && !cancelled.ok && cancelled.code === 'history_cancelled',
+  );
+  const directory = await client.wait((message) => message.type === 'session.outline');
+  assert.ok(directory.type === 'session.outline');
+  assert.equal(directory.entries[0].question, '完整问题');
+  const parts: string[] = [];
+  for (;;) {
+    const part = await client.wait(
+      (message) => message.type === 'session.history.part' && message.requestId === viewing,
+    );
+    assert.ok(part.type === 'session.history.part');
+    parts.push(part.data);
+    client.send({ type: 'session.history.next', requestId: viewing });
+    if (part.last) break;
+  }
+  const page = serverMessageSchema.parse(JSON.parse(parts.join(''))[0]);
+  assert.ok(page.type === 'session.read');
+  assert.deepEqual(page.events, f.server.store.snapshot(old).events);
+  const sent = await client.request({
+    type: 'message.send',
+    sessionId: current,
+    text: '仍然订阅当前会话',
+    scenario: 'chat',
+  });
+  assert.ok(sent.type === 'response' && sent.ok);
+  const event = await client.event('message.user');
+  assert.ok(event.type === 'session.event' && event.event.sessionId === current);
 });
 
 test('native model, effort and plan preferences persist while offline compact is rejected', async (t) => {

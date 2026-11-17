@@ -196,7 +196,7 @@ export type Schedules = {
 // went wrong.
 // `report` hears of every run that did not go out.
 export function useSchedules(
-  send: (task: Task, due: number) => Promise<boolean>,
+  send: (task: Task, due: number, reason: 'scheduled' | 'manual') => Promise<boolean>,
   report?: (task: Task, outcome: Outcome) => void,
   enabled = true,
 ) {
@@ -258,9 +258,9 @@ export function useSchedules(
     [record],
   );
   const attempt = useCallback(
-    async (task: Task, due: number) => {
+    async (task: Task, due: number, reason: 'scheduled' | 'manual') => {
       try {
-        if (!(await current.current.send(task, due))) return false;
+        if (!(await current.current.send(task, due, reason))) return false;
         settle(task, 'sent', '已发送');
       } catch (error) {
         settle(task, 'failed', error instanceof Error ? error.message : '发送失败');
@@ -282,7 +282,7 @@ export function useSchedules(
           if (due === null || due > Date.now()) continue;
           // While it cannot be sent it is tried again on every tick, until it is too late to be worth it.
           if (Date.now() - due > grace) settle(task, 'missed', `错过了 ${stamp(due)} 的一次`);
-          else await attempt(task, due);
+          else await attempt(task, due, 'scheduled');
         }
       } finally {
         busy.current = false;
@@ -313,7 +313,7 @@ export function useSchedules(
     last: (task) => progress[task.id]?.last,
     save,
     runNow: async (task) => {
-      if (!(await attempt(task, Date.now())))
+      if (!(await attempt(task, Date.now(), 'manual')))
         settle(task, 'failed', '现在无法发送：未连接，或目标会话正在运行');
     },
   };

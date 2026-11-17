@@ -1,4 +1,4 @@
-import type { TranscriptItem, Work } from './transcript.ts';
+import type { TranscriptItem, Work } from '@cc-desk-tunnel/protocol/transcript';
 
 type Tool = Extract<TranscriptItem, { kind: 'tool' }>;
 export type Category = 'command' | 'edit' | 'read' | 'search' | 'web' | 'agent' | 'other';
@@ -56,11 +56,13 @@ export const isRunning = (tool: Tool) =>
 export function describe(tool: Tool, active: boolean) {
   const category = categoryOf(tool);
   const input = fields(tool.input);
+  const command = category === 'command' && text(input.command).trim() ? text(input.command) : null;
+  const description = category === 'command' ? text(input.description) : '';
   let subject = '';
   let added = 0;
   let removed = 0;
   if (category === 'command')
-    subject = text(input.description) || (text(input.command) || tool.input).trim().split('\n')[0];
+    subject = command?.trim().split('\n')[0] || description || tool.input.trim().split('\n')[0];
   else if (category === 'edit') {
     subject = fileName(input.file_path ?? input.notebook_path);
     const edits = Array.isArray(input.edits) ? (input.edits as Record<string, unknown>[]) : [input];
@@ -76,6 +78,8 @@ export function describe(tool: Tool, active: boolean) {
   const running = active && isRunning(tool);
   return {
     category,
+    command,
+    description,
     verb: outcomes[tool.state] ?? words[category][running ? 0 : 1],
     subject,
     added,

@@ -19,6 +19,7 @@ import type {
 import UsagePanel, { dollars, quotaName, tokens } from './UsagePanel.tsx';
 import type { ProxyClient } from './client.ts';
 import { IconButton, Page, Row, Switch } from './ui.tsx';
+import { useQuota } from './quota.ts';
 import { setPrefs, usePrefs } from './prefs.ts';
 import { copyText } from './copy.tsx';
 
@@ -52,6 +53,7 @@ export default function AccountPanel({
   refresh: () => void;
 }) {
   const account = capabilities?.account;
+  const limits = useQuota(metrics?.rateLimits);
   const { quotaReads } = usePrefs();
   const [working, setWorking] = useState(false);
   const [failure, setFailure] = useState<string | null>(null);
@@ -389,9 +391,9 @@ export default function AccountPanel({
         </button>
       </div>
       <div className="card account-card">
-        {metrics?.rateLimits?.available ? (
+        {limits ? (
           <div className="quota-list">
-            {metrics.rateLimits.windows.map((window, index) => (
+            {limits.windows.map((window, index) => (
               <div className="quota-row" key={`${window.name}:${index}`}>
                 <div>
                   <strong>{quotaName(window.name) ?? window.name}</strong>
@@ -433,19 +435,13 @@ export default function AccountPanel({
                 })()}
               </div>
             ))}
-            {!metrics.rateLimits.windows.length && (
-              <p className="muted">原生接口未返回额度窗口。</p>
-            )}
             <p className="account-updated">
-              {metrics.rateLimits.measuredAt &&
-                `更新于 ${new Date(metrics.rateLimits.measuredAt).toLocaleTimeString('zh-CN')}`}
+              {limits.measuredAt &&
+                `更新于 ${new Date(limits.measuredAt).toLocaleTimeString('zh-CN')}`}
             </p>
           </div>
         ) : (
-          <p className="muted">
-            {metrics?.errors?.usage ??
-              (metrics?.rateLimits ? '当前账号未提供订阅额度' : '等待读取原生额度')}
-          </p>
+          <p className="muted">{metrics?.errors?.usage ?? '尚无额度数据'}</p>
         )}
         <Row
           title="运行中每分钟读取一次额度"

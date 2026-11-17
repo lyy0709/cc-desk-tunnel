@@ -478,6 +478,8 @@ test('background read types do not renew activity; a browser opens no terminal; 
   for (const command of [
     'session.subscribe',
     'session.history',
+    'session.outline',
+    'session.read',
     'session.status',
     'usage.summary',
     'web.settings.get',

@@ -2,6 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import { setImmediate } from 'node:timers/promises';
+import { conversationOutline } from '@cc-desk-tunnel/protocol/transcript';
 import {
   continues,
   isFragment,
@@ -9,7 +11,6 @@ import {
   platformOf,
   snapshotSchema,
   sessionSchema,
-  terminalStatuses,
 } from '@cc-desk-tunnel/protocol';
 import { deviceTerms, systemShell } from './device-terms.ts';
 import type { Execution } from './device-terms.ts';
@@ -25,6 +26,8 @@ import type {
   Session,
   SessionEvent,
   SessionSnapshot,
+  SessionOutline,
+  SessionRead,
 } from '@cc-desk-tunnel/protocol';
 
 type StoredSession = SessionSnapshot & { createRequestId: string };
@@ -89,6 +92,7 @@ export class SessionStore {
         PRIMARY KEY (session_id, sequence)
       );
       CREATE INDEX IF NOT EXISTS events_run ON events(session_id, run_id, sequence);
+      CREATE INDEX IF NOT EXISTS events_kind ON events(session_id, json_extract(data, '$.payload.type'), sequence);
       CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
       CREATE TABLE IF NOT EXISTS native_roots (
         device_id TEXT NOT NULL, path_key TEXT NOT NULL, root TEXT NOT NULL,
@@ -612,6 +616,19 @@ export class SessionStore {
       count += Number(size.count);
       bytes += Number(size.bytes);
     }
+    if (first) {
+      const question = this.database
+        .prepare(
+          `SELECT json_extract(data, '$.payload.continued') AS continued
+        FROM events WHERE session_id = ? AND run_id = (SELECT run_id FROM events WHERE session_id = ? AND sequence = ?)
+        AND json_extract(data, '$.payload.type') = 'message.user' ORDER BY sequence LIMIT 1`,
+        )
+        .get(sessionId, sessionId, first);
+      if (question?.continued)
+        first = this.readingRanges(sessionId, (beforeSequence ?? last + 1) - 1).find(
+          (range) => range.last >= first,
+        )!.first;
+    }
     const events = first ? this.events(sessionId, first - 1, beforeSequence) : [];
     return {
       session,
@@ -626,6 +643,149 @@ export class SessionStore {
         !!this.database
           .prepare('SELECT 1 FROM events WHERE session_id = ? AND sequence < ? LIMIT 1')
           .get(sessionId, first),
+    };
+  }
+
+  // A continuation belongs to the question before it. Keep complete native runs and their continuations
+  // together, including a terminal's multiple questions and state readings between runs.
+  private readingRanges(sessionId: string, through: number) {
+    const questions = this.database
+      .prepare(
+        `
+      SELECT run_id, json_extract(data, '$.payload.continued') AS continued
+      FROM events WHERE session_id = ? AND json_extract(data, '$.payload.type') = 'message.user'
+      AND sequence <= ? ORDER BY sequence
+    `,
+      )
+      .all(sessionId, through);
+    const firstQuestion = new Map<string, boolean>();
+    for (const row of questions)
+      if (!firstQuestion.has(String(row.run_id)))
+        firstQuestion.set(String(row.run_id), !!row.continued);
+    const runs = this.database
+      .prepare(
+        `
+      SELECT run_id, MIN(sequence) AS first, MAX(sequence) AS last FROM events
+      WHERE session_id = ? AND sequence <= ? GROUP BY run_id ORDER BY first
+    `,
+      )
+      .all(sessionId, through);
+    const ranges: { first: number; last: number }[] = [];
+    for (const row of runs) {
+      const previous = ranges.at(-1);
+      if (
+        previous &&
+        (Number(row.first) <= previous.last || firstQuestion.get(String(row.run_id)) !== false)
+      )
+        previous.last = Math.max(previous.last, Number(row.last));
+      else ranges.push({ first: Number(row.first), last: Number(row.last) });
+    }
+    return ranges;
+  }
+
+  async outline(
+    sessionId: string,
+    requestId: string,
+    afterSequence = 0,
+    signal?: AbortSignal,
+  ): Promise<SessionOutline> {
+    this.get(sessionId);
+    const throughSequence = this.lastSequence(sessionId);
+    if (afterSequence > throughSequence)
+      throw new DomainError('invalid_cursor', '历史游标超出范围。');
+    const fromSequence = afterSequence
+      ? (this.readingRanges(sessionId, throughSequence).find((range) => range.last >= afterSequence)
+          ?.first ?? 0)
+      : 0;
+    // Read neither tool bodies nor thinking text into the directory. The projection retains precisely
+    // the events used by the shared turn parser, with enough text for the bounded previews.
+    const query = this.database.prepare(`
+      SELECT sequence, json_set(data,
+        '$.payload.input', '', '$.payload.output', '',
+        '$.payload.text', substr(json_extract(data, '$.payload.text'), 1,
+          CASE WHEN json_extract(data, '$.payload.type') = 'thinking.delta' THEN 1 ELSE 1600 END),
+        '$.payload.message', substr(json_extract(data, '$.payload.message'), 1, 1600)
+      ) AS data FROM events
+      WHERE session_id = ? AND sequence > ? AND sequence <= ?
+      AND json_extract(data, '$.payload.type') IN (
+        'message.user', 'text.delta', 'thinking.delta', 'tool.requested', 'tool.result',
+        'native.notice', 'native.compact', 'run.error', 'run.status'
+      ) ORDER BY sequence LIMIT 512
+    `);
+    const events: SessionEvent[] = [];
+    let cursor = Math.max(0, fromSequence - 1);
+    for (;;) {
+      if (signal?.aborted) throw new DomainError('history_cancelled', '历史读取已取消。');
+      const rows = query.all(sessionId, cursor, throughSequence);
+      for (const row of rows) events.push(JSON.parse(String(row.data)) as SessionEvent);
+      if (rows.length < 512) break;
+      cursor = Number(rows.at(-1)!.sequence);
+      await setImmediate();
+    }
+    this.get(sessionId);
+    return {
+      type: 'session.outline',
+      requestId,
+      sessionId,
+      throughSequence,
+      fromSequence,
+      entries: conversationOutline(events),
+    };
+  }
+
+  read(
+    sessionId: string,
+    requestId: string,
+    direction: 'around' | 'before' | 'after',
+    sequence: number,
+    throughSequence = this.lastSequence(sessionId),
+  ): SessionRead {
+    const { session } = this.get(sessionId);
+    if (throughSequence > this.lastSequence(sessionId) || sequence > throughSequence + 1)
+      throw new DomainError('invalid_cursor', '历史游标超出范围。');
+    const ranges = this.readingRanges(sessionId, throughSequence);
+    let index =
+      direction === 'before'
+        ? ranges.findLastIndex((range) => range.last < sequence)
+        : ranges.findIndex((range) =>
+            direction === 'around' ? range.last >= sequence : range.first > sequence,
+          );
+    const sizeOf = this.database.prepare(`SELECT COUNT(*) AS count, SUM(octet_length(data)) AS bytes
+      FROM events WHERE session_id = ? AND sequence >= ? AND sequence <= ?`);
+    let first = 0,
+      last = 0,
+      count = 0,
+      bytes = 0;
+    while (index >= 0 && index < ranges.length) {
+      const range = ranges[index];
+      const size = sizeOf.get(sessionId, range.first, range.last)!;
+      if (
+        first &&
+        (count + Number(size.count) > pageEvents || bytes + Number(size.bytes) > pageBytes)
+      )
+        break;
+      first = first ? Math.min(first, range.first) : range.first;
+      last = Math.max(last, range.last);
+      count += Number(size.count);
+      bytes += Number(size.bytes);
+      index += direction === 'after' ? 1 : -1;
+    }
+    return {
+      type: 'session.read',
+      requestId,
+      session,
+      events: first ? this.events(sessionId, first - 1, last + 1) : [],
+      firstSequence: first,
+      lastSequence: last,
+      throughSequence,
+      hasEarlier: !!first && ranges[0].first < first,
+      hasLater: !!last && ranges.at(-1)!.last > last,
+      totalEvents: Number(
+        this.database
+          .prepare('SELECT COUNT(*) AS count FROM events WHERE session_id = ? AND sequence <= ?')
+          .get(sessionId, throughSequence)!.count,
+      ),
+      capturedAt: new Date().toISOString(),
     };
   }
 
@@ -646,17 +806,24 @@ export class SessionStore {
     };
     if (!stateReadings.has(payload.type)) session.updatedAt = event.createdAt;
     if (payload.type === 'native.permission') session.permissionMode = payload.permissionMode;
-    if (payload.type === 'run.status')
-      session.activeRun = terminalStatuses.has(payload.status)
-        ? null
-        : {
-            id: runId,
-            status: payload.status,
-            connectionId: payload.connectionId,
-            ...(payload.surface ? { surface: payload.surface } : {}),
-            ...(payload.waiting ? { waiting: payload.waiting } : {}),
-            ...(payload.activity ? { activity: payload.activity } : {}),
-          };
+    if (payload.type === 'run.status') {
+      if (
+        payload.status === 'completed' ||
+        payload.status === 'cancelled' ||
+        payload.status === 'failed'
+      ) {
+        session.activeRun = null;
+        session.lastRunStatus = payload.status;
+      } else
+        session.activeRun = {
+          id: runId,
+          status: payload.status,
+          connectionId: payload.connectionId,
+          ...(payload.surface ? { surface: payload.surface } : {}),
+          ...(payload.waiting ? { waiting: payload.waiting } : {}),
+          ...(payload.activity ? { activity: payload.activity } : {}),
+        };
+    }
     this.database.exec('BEGIN');
     try {
       this.database

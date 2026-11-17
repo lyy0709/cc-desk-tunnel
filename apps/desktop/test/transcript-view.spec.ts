@@ -7,6 +7,187 @@ import type { Session } from '@cc-desk-tunnel/protocol';
 
 const minutesAgo = (minutes: number) => new Date(Date.now() - minutes * 60_000);
 
+test('commands share one readable surface, preserve exact copy and keep native results distinct', async ({
+  page,
+}) => {
+  const now = new Date().toISOString();
+  const connectionId = randomUUID(),
+    runId = randomUUID();
+  const session: Session = {
+    id: randomUUID(),
+    title: '命令阅读',
+    autoTitle: false,
+    projectPath: '/tmp/command-view',
+    permissionMode: 'auto',
+    model: null,
+    effort: null,
+    createdAt: now,
+    updatedAt: now,
+    activeRun: { id: runId, status: 'running', connectionId },
+  };
+  let sequence = 0;
+  const event = (payload: unknown) => ({
+    sessionId: session.id,
+    runId,
+    sequence: ++sequence,
+    createdAt: now,
+    payload,
+  });
+  const command = 'npm run build > .local/build.log 2>&1\nprintf "中文目录\\n"';
+  const output = '构建完成\nassets/index.js  184.2 kB\n✓ built in 1.8s';
+  const input = JSON.stringify({
+    command,
+    description: '构建桌面客户端并记录输出',
+    timeout: 120000,
+  });
+  const longOutput =
+    Array.from({ length: 1500 }, (_, n) => `第 ${n + 1} 行 · 检查文件内容`).join('\n') +
+    '\n' +
+    'long-path/'.repeat(300) +
+    '\n末尾唯一词';
+  const requested = (toolId: string, name: string, input: string) =>
+    event({ type: 'tool.requested', toolId, name, input, target: 'Linux' });
+  const result = (toolId: string, output: string, exitCode: number | null, status = 'completed') =>
+    event({ type: 'tool.result', toolId, output, exitCode, status });
+  const events = [
+    event({
+      type: 'message.user',
+      messageId: randomUUID(),
+      text: '检查构建、测试与日志。',
+      scenario: 'chat',
+    }),
+    requested('build', 'Bash', input),
+    result('build', output, 0),
+    requested(
+      'long',
+      'PowerShell',
+      JSON.stringify({ command: 'Get-Content "C:\\工作目录\\日志.txt"' }),
+    ),
+    result('long', longOutput, 0),
+    requested('unknown', 'Bash', JSON.stringify({ command: 'npm test' })),
+    result('unknown', 'PASS · tests completed', null),
+    requested('failed', 'Bash', JSON.stringify({ command: 'npm run lint' })),
+    result('failed', 'src/app.ts:12 · unexpected token', 2, 'failed'),
+    requested('live', 'Bash', JSON.stringify({ command: 'node scripts/watch.mjs' })),
+    event({ type: 'tool.output', toolId: 'live', stream: 'stdout', text: '开始读取日志\n' }),
+    requested('partial', 'Bash', '{"command":'),
+  ];
+  const requests: string[] = [];
+  let publish = (_payload: unknown) => {};
+  await page.addInitScript(() =>
+    Object.defineProperty(navigator.clipboard, 'writeText', {
+      value: async (text: string) => {
+        (window as unknown as { copied: string }).copied = text;
+      },
+    }),
+  );
+  await page.routeWebSocket('ws://127.0.0.1:18923/ws', (route) => {
+    const send = (value: unknown) => route.send(JSON.stringify(value));
+    publish = (payload) => send({ type: 'session.event', event: event(payload) });
+    route.onMessage((raw) => {
+      const message = JSON.parse(String(raw));
+      if (message.type === 'device') return;
+      if (message.type === 'auth')
+        return send({
+          type: 'ready',
+          protocolVersion: PROTOCOL_VERSION,
+          version: '0.3.19',
+          connectionId,
+          adapter: 'claude-code',
+          sessions: [session],
+        });
+      requests.push(message.type);
+      if (message.type === 'session.subscribe')
+        send({
+          type: 'session.snapshot',
+          requestId: message.requestId,
+          session,
+          mode: 'replace',
+          firstSequence: 1,
+          lastSequence: sequence,
+          hasEarlier: false,
+          events,
+        });
+      if (message.type === 'session.outline')
+        send({
+          type: 'session.outline',
+          requestId: message.requestId,
+          sessionId: session.id,
+          fromSequence: 1,
+          throughSequence: sequence,
+          entries: [],
+        });
+      send({ type: 'response', requestId: message.requestId, ok: true });
+    });
+  });
+  await page.goto('/');
+  await page.getByLabel('服务地址', { exact: true }).fill('ws://127.0.0.1:18923/ws');
+  await page.getByLabel('服务凭据', { exact: true }).fill('test-only-command-view-token');
+  await page.getByRole('button', { name: '连接', exact: true }).click();
+  await page.locator('.session-select').filter({ hasText: '命令阅读' }).click();
+  await page.locator('.work > summary').click();
+  await expect(page.locator('.command-content')).toHaveCount(0);
+  const tools = page.locator('.tool');
+  const build = tools.nth(0),
+    long = tools.nth(1),
+    unknown = tools.nth(2),
+    failed = tools.nth(3),
+    live = tools.nth(4),
+    partial = tools.nth(5);
+  await expect(build.locator('.tool-subject')).toHaveText(command.split('\n')[0]);
+  await expect(build.locator('.tool-subject')).toHaveAttribute('title', command);
+  await build.locator('> summary').click();
+  await expect(build.locator('.tool-input')).toHaveText('$ ' + command);
+  await expect(build.locator('.tool-output')).toHaveText(output);
+  await expect(build.locator('.command-status')).toHaveText('成功· 退出码 0');
+  await expect(build.getByRole('button', { name: '原始参数', exact: true })).toHaveCount(0);
+  await expect(build.getByRole('button', { name: '复制工具输入', exact: true })).toHaveCount(0);
+  mkdirSync(resolve('.local/screenshots'), { recursive: true });
+  await page.screenshot({ path: resolve('.local/screenshots/commands-light.png') });
+  await page.emulateMedia({ colorScheme: 'dark' });
+  await page.screenshot({ path: resolve('.local/screenshots/commands-dark.png') });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect(page.locator('.sidebar-shade')).toBeHidden();
+  await page.screenshot({ path: resolve('.local/screenshots/commands-dark-narrow.png') });
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await build.getByRole('button', { name: '复制命令', exact: true }).click();
+  expect(await page.evaluate(() => (window as unknown as { copied: string }).copied)).toBe(command);
+  await build.getByRole('button', { name: '复制输出', exact: true }).click();
+  expect(await page.evaluate(() => (window as unknown as { copied: string }).copied)).toBe(output);
+  await unknown.locator('> summary').click();
+  await expect(unknown.locator('.command-status')).toHaveText('已完成');
+  await expect(unknown.locator('.command-status')).not.toHaveClass(/succeeded/);
+  await failed.locator('> summary').click();
+  await expect(failed.locator('.command-status')).toHaveText('失败· 退出码 2');
+  await live.locator('> summary').click();
+  await expect(live.locator('.command-status')).toHaveText('运行中');
+  publish({ type: 'tool.output', toolId: 'live', stream: 'stdout', text: '第二段输出\n' });
+  await expect(live.locator('.tool-output')).toHaveText('开始读取日志\n第二段输出\n');
+  publish({ type: 'tool.result', toolId: 'live', status: 'completed', output: '', exitCode: null });
+  await expect(live.locator('.tool-output')).toHaveCount(0);
+  await expect(live.locator('.command-status')).toHaveText('已完成');
+  await partial.locator('> summary').click();
+  await expect(partial.locator('.tool-input')).toHaveText('{"command":');
+  await expect(partial.getByRole('button', { name: '复制工具输入', exact: true })).toBeVisible();
+  await long.locator('> summary').click();
+  await expect(long.getByRole('button', { name: '展开全文', exact: true })).toBeVisible();
+  const scroller = page.locator('.conversation');
+  const top = await scroller.evaluate((el) => el.scrollTop);
+  await long.getByRole('button', { name: '展开全文', exact: true }).click();
+  expect(Math.abs((await scroller.evaluate((el) => el.scrollTop)) - top)).toBeLessThan(4);
+  expect(
+    await long.locator('.command-content').evaluate((el) => el.scrollHeight <= el.clientHeight + 1),
+  ).toBe(true);
+  expect(await long.locator('.tool-output').textContent()).toBe(longOutput);
+  await long.getByRole('button', { name: '收起', exact: true }).click();
+  await page.getByRole('button', { name: '打开对话查找', exact: true }).click();
+  await page.getByLabel('查找对话内容', { exact: true }).fill('末尾唯一词');
+  await expect(page.locator('.find-count')).toHaveText('1 / 1');
+  await expect(long.locator('.command-content')).toHaveClass(/expanded/);
+  expect(requests).not.toContain('message.send');
+});
+
 const planText = `# 计划阅读与执行流程
 
 让最终计划在聊天中清晰可读，并让批准后的执行模式与会话状态保持一致。
@@ -155,8 +336,12 @@ async function openPlan(
     .click();
   return {
     replies,
-    resolve(allowed: boolean, executionMode?: 'auto' | 'default' | 'acceptEdits') {
-      publish({ type: 'approval.resolved', approvalId, allowed, executionMode });
+    resolve(
+      allowed: boolean,
+      executionMode?: 'auto' | 'default' | 'acceptEdits',
+      cancelled = false,
+    ) {
+      publish({ type: 'approval.resolved', approvalId, allowed, executionMode, cancelled });
       session.activeRun = { id: runId, status: 'running', connectionId };
       send({ type: 'session.updated', session });
     },
@@ -189,6 +374,8 @@ test('plans render as documents, expand without a nested scroller, and support c
   );
   const card = page.locator('.plan-card');
   await expect(card.getByRole('heading', { name: '计划阅读与执行流程' })).toBeVisible();
+  await expect(card.getByText('原始工具详情', { exact: true })).toHaveCount(0);
+  await expect(card.getByRole('button', { name: '复制工具输入', exact: true })).toHaveCount(0);
   await expect(card.locator('table')).toContainText('验收条件');
   await expect(card.getByRole('button', { name: '展开全文', exact: true })).toBeVisible();
   await expect
@@ -286,6 +473,27 @@ test('plan selection, approval and native confirmation share state across the ca
   await expect(page.getByRole('button', { name: '审批模式', exact: true })).toHaveText('手动审批');
 });
 
+test('native cancellation removes plan approval actions from the card and enlarged reader', async ({
+  page,
+}) => {
+  const plan = await openPlan(page, JSON.stringify({ plan: '# 已撤回的计划\n\n等待下一条指令。' }));
+  const card = page.locator('.plan-card');
+  await card.getByRole('button', { name: '放大阅读', exact: true }).click();
+  const reader = page.getByRole('dialog', { name: '执行计划' });
+  plan.resolve(false, undefined, true);
+  await expect(reader.getByRole('status')).toHaveText(['审批已取消', '审批已取消']);
+  await expect(reader.getByRole('heading', { name: '已撤回的计划', exact: true })).toBeVisible();
+  await expect(reader.getByRole('button', { name: '批准并执行', exact: true })).toHaveCount(0);
+  await expect(reader.getByRole('button', { name: '继续规划', exact: true })).toHaveCount(0);
+  expect(plan.replies).toHaveLength(0);
+  await page.keyboard.press('Escape');
+  await expect(card.getByRole('status')).toHaveText('审批已取消');
+  await expect(card.getByRole('button', { name: '批准并执行', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: '审批模式', exact: true })).toHaveText('计划模式');
+  mkdirSync(resolve('.local/screenshots'), { recursive: true });
+  await page.screenshot({ path: resolve('.local/screenshots/plan-cancelled.png') });
+});
+
 test('continuing to plan sends a denial without changing mode; incomplete input remains inspectable', async ({
   page,
 }) => {
@@ -304,7 +512,15 @@ test('continuing to plan sends a denial without changing mode; incomplete input 
   expect(plan.replies[0].allowed).toBe(false);
   expect(plan.replies[0].executionMode).toBeUndefined();
   plan.resolve(false);
+  plan.publish({
+    type: 'tool.result',
+    toolId: 'plan-tool',
+    status: 'denied',
+    output: '请先补充验证步骤，再提交计划。',
+    exitCode: null,
+  });
   await expect(card).toContainText('已拒绝');
+  await expect(card.locator('.plan-result')).toHaveText('请先补充验证步骤，再提交计划。');
   await expect(page.getByRole('button', { name: '审批模式', exact: true })).toHaveText('计划模式');
 });
 
@@ -485,7 +701,7 @@ test('expanded folds nothing and groups nothing', async ({ page }) => {
   await expect(page.locator('.turn-process')).toHaveCount(0);
   await expect(page.locator('.work')).toHaveCount(0);
   await expect(page.locator('.work-flat')).toHaveCount(2);
-  await expect(page.locator('.work-flat .tool-subject')).toHaveText(['列目录1', '列目录2']);
+  await expect(page.locator('.work-flat .tool-subject')).toHaveText(['ls', 'ls']);
   // The first line of each thought, without its Markdown; a number it starts with stays.
   await expect(page.locator('.thinking-preview')).toHaveText(['1 号目录先看看', '2 号目录先看看']);
 });

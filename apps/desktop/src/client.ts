@@ -17,6 +17,8 @@ import type {
   ServiceUpdate,
   Session,
   SessionEvent,
+  SessionOutline,
+  SessionRead,
 } from '@cc-desk-tunnel/protocol';
 
 type Response = Extract<ServerMessage, { type: 'response' }>;
@@ -27,6 +29,8 @@ type DataMessage = Extract<
       | 'usage.summary'
       | 'usage.page'
       | 'session.stats'
+      | 'session.outline'
+      | 'session.read'
       | 'settings.state'
       | 'compaction.state'
       | 'instructions.state'
@@ -37,6 +41,8 @@ type DataMessage = Extract<
 >;
 // Commands answered with a data frame, and the frame each one gets.
 type Replies = {
+  'session.outline': 'session.outline';
+  'session.read': 'session.read';
   'usage.summary': 'usage.summary';
   'usage.query': 'usage.page';
   'session.stats': 'session.stats';
@@ -70,6 +76,8 @@ export class RequestInterruptedError extends Error {
     const readOnly = [
       'session.subscribe',
       'session.history',
+      'session.outline',
+      'session.read',
       'session.status',
       'account.status',
       'usage.summary',
@@ -108,6 +116,8 @@ export type HistoryState = {
   // Live events received after a failed snapshot must not advance a cursor past missing history.
   needsReload?: boolean;
 };
+export type OutlineState = { entries: SessionOutline['entries']; loading: boolean; error?: string };
+export type ReadingState = { page: SessionRead; loading: boolean };
 export type ClientState = {
   status: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
   connectionId: string | null;
@@ -123,6 +133,8 @@ export type ClientState = {
   // event that records it takes its place.
   live: Record<string, SessionEvent>;
   history: Record<string, HistoryState>;
+  outlines: Record<string, OutlineState>;
+  reading: ReadingState | null;
   selectedId: string | null;
   error: string | null;
   adapter: 'simulation' | 'claude-code';
@@ -166,6 +178,8 @@ export class ProxyClient {
     events: {},
     live: {},
     history: {},
+    outlines: {},
+    reading: null,
     selectedId: null,
     error: null,
     adapter: 'simulation',
@@ -213,6 +227,9 @@ export class ProxyClient {
   // from one that has been quiet for long. Readings of the context and the quota repeat through a long turn
   // and say nothing of it.
   private activity = new Map<string, number>();
+  private outlineReads = new Map<string, AbortController>();
+  private outlineDirty = new Set<string>();
+  private viewRead?: AbortController;
   // How far this computer's clock is ahead of the service's, as near as the fastest event yet shows.
   private ahead = Infinity;
   serviceNow = () => Date.now() - (Number.isFinite(this.ahead) ? this.ahead : 0);
@@ -283,6 +300,8 @@ export class ProxyClient {
       events: {},
       live: {},
       history: {},
+      outlines: {},
+      reading: null,
       selectedId: null,
       capabilities: null,
       metrics: null,
@@ -325,6 +344,8 @@ export class ProxyClient {
       events: {},
       live: {},
       history: {},
+      outlines: {},
+      reading: null,
       selectedId: null,
     });
     this.open();
@@ -538,13 +559,20 @@ export class ProxyClient {
         message.type === 'usage.summary' ||
         message.type === 'usage.page' ||
         message.type === 'session.stats' ||
+        message.type === 'session.outline' ||
+        message.type === 'session.read' ||
         message.type === 'settings.state' ||
         message.type === 'instructions.state' ||
         message.type === 'web.settings.state' ||
         message.type === 'web.totp.setup' ||
         message.type === 'web.certificate.state'
       ) {
-        if (this.pending.has(message.requestId)) this.results.set(message.requestId, message);
+        if (this.pending.has(message.requestId)) {
+          this.results.set(message.requestId, message);
+          // Receipt of the complete data is enough; a lost response frame must not time out this read.
+          if (message.type === 'session.outline' || message.type === 'session.read')
+            receive({ type: 'response', requestId: message.requestId, ok: true });
+        }
       } else if (message.type === 'compaction.state') {
         if (message.requestId && this.pending.has(message.requestId))
           this.results.set(message.requestId, message);
@@ -573,9 +601,21 @@ export class ProxyClient {
         const events = { ...this.state.events };
         const live = { ...this.state.live };
         const history = { ...this.state.history };
+        const outlines = { ...this.state.outlines };
         delete events[message.sessionId];
         delete live[message.sessionId];
         delete history[message.sessionId];
+        delete outlines[message.sessionId];
+        this.outlineReads.get(message.sessionId)?.abort();
+        if (this.state.reading?.page.session.id === message.sessionId) this.viewRead?.abort();
+        for (const [id, request] of this.pending) {
+          // The deletion broadcast precedes its success receipt; that request must still receive the receipt.
+          if (request.sessionId !== message.sessionId || request.type === 'session.delete')
+            continue;
+          clearTimeout(request.timer);
+          this.pending.delete(id);
+          request.reject(new Error('会话已删除。'));
+        }
         this.streamEvents = this.streamEvents.filter(
           (event) => event.sessionId !== message.sessionId,
         );
@@ -583,7 +623,16 @@ export class ProxyClient {
         const sessions = this.state.sessions.filter((session) => session.id !== message.sessionId);
         const selectedId =
           this.state.selectedId === message.sessionId ? null : this.state.selectedId;
-        this.update({ sessions, events, live, history, selectedId });
+        this.update({
+          sessions,
+          events,
+          live,
+          history,
+          outlines,
+          selectedId,
+          reading:
+            this.state.reading?.page.session.id === message.sessionId ? null : this.state.reading,
+        });
       } else if (message.type === 'session.snapshot') {
         this.flushStream();
         const request = this.pending.get(message.requestId);
@@ -617,6 +666,7 @@ export class ProxyClient {
           loadingEarlier: false,
         };
         this.merge(id, message.events, history, message.mode === 'replace');
+        if (message.mode !== 'prepend') void this.loadOutline(id);
         if (request.type === 'session.history') {
           clearTimeout(request.timer);
           this.pending.delete(message.requestId);
@@ -774,7 +824,15 @@ export class ProxyClient {
     this.streamEvents = [];
     if (progress !== this.state.progress) this.update({ progress });
     if (moved) this.update({ live });
-    for (const [id, events] of grouped) this.merge(id, events);
+    for (const [id, events] of grouped) {
+      this.merge(id, events);
+      if (
+        events.some(({ payload }) =>
+          ['message.user', 'run.status', 'native.compact'].includes(payload.type),
+        )
+      )
+        void this.loadOutline(id);
+    }
   }
   private merge(
     sessionId: string,
@@ -851,6 +909,10 @@ export class ProxyClient {
     );
   }
   async loadEarlier(sessionId: string) {
+    if (this.state.reading?.page.session.id === sessionId) {
+      await this.readWindow(sessionId, 'before', this.state.reading.page.firstSequence);
+      return;
+    }
     const history = this.state.history[sessionId];
     if (!history?.hasEarlier || history.loadingEarlier || history.loading) return;
     this.update({
@@ -874,19 +936,136 @@ export class ProxyClient {
   select(sessionId: string) {
     if (this.state.selectedId === sessionId && this.state.history[sessionId]?.loading) return;
     this.cancelHistory();
+    this.viewRead?.abort();
+    for (const [id, read] of this.outlineReads) if (id !== sessionId) read.abort();
     this.flushStream();
     this.cacheOrder = [...this.cacheOrder.filter((id) => id !== sessionId), sessionId];
     const events = { ...this.state.events };
     const live = { ...this.state.live };
     const history = { ...this.state.history };
+    const outlines = { ...this.state.outlines };
     while (this.cacheOrder.length > 4) {
       const evicted = this.cacheOrder.shift()!;
       delete events[evicted];
       delete live[evicted];
       delete history[evicted];
+      delete outlines[evicted];
     }
-    this.update({ selectedId: sessionId, events, live, history });
+    this.update({ selectedId: sessionId, events, live, history, outlines, reading: null });
     if (this.state.status === 'connected') this.load(sessionId);
+  }
+
+  async loadOutline(sessionId: string) {
+    if (this.state.status !== 'connected' || this.state.selectedId !== sessionId) return;
+    if (this.outlineReads.has(sessionId)) {
+      this.outlineDirty.add(sessionId);
+      return;
+    }
+    const controller = new AbortController();
+    this.outlineReads.set(sessionId, controller);
+    const previous = this.state.outlines[sessionId];
+    this.update({
+      outlines: {
+        ...this.state.outlines,
+        [sessionId]: { entries: previous?.entries ?? [], loading: true },
+      },
+    });
+    try {
+      const result = await this.fetch(
+        {
+          type: 'session.outline',
+          sessionId,
+          afterSequence: previous?.entries.at(-1)?.sequence ?? 0,
+        },
+        controller.signal,
+      );
+      if (controller.signal.aborted || this.state.selectedId !== sessionId) return;
+      this.update({
+        outlines: {
+          ...this.state.outlines,
+          [sessionId]: {
+            entries: [
+              ...(previous?.entries.filter((entry) => entry.sequence < result.fromSequence) ?? []),
+              ...result.entries,
+            ],
+            loading: false,
+          },
+        },
+      });
+    } catch (error) {
+      if (this.state.selectedId === sessionId)
+        this.update({
+          outlines: {
+            ...this.state.outlines,
+            [sessionId]: {
+              entries: previous?.entries ?? [],
+              loading: false,
+              ...(!controller.signal.aborted ? { error: (error as Error).message } : {}),
+            },
+          },
+        });
+    } finally {
+      this.outlineReads.delete(sessionId);
+      if (this.outlineDirty.delete(sessionId)) void this.loadOutline(sessionId);
+    }
+  }
+
+  async readWindow(sessionId: string, direction: 'around' | 'before' | 'after', sequence: number) {
+    this.viewRead?.abort();
+    const visible =
+      this.state.reading?.page.session.id === sessionId
+        ? this.state.reading.page.events
+        : this.state.events[sessionId];
+    if (
+      direction === 'around' &&
+      visible?.length &&
+      sequence >= visible[0].sequence &&
+      sequence <= visible.at(-1)!.sequence
+    )
+      return;
+    const controller = new AbortController();
+    this.viewRead = controller;
+    const previous =
+      direction !== 'around' && this.state.reading?.page.session.id === sessionId
+        ? this.state.reading.page
+        : undefined;
+    if (previous) this.update({ reading: { page: previous, loading: true } });
+    try {
+      const page = await this.fetch(
+        {
+          type: 'session.read',
+          purpose: 'view',
+          sessionId,
+          direction,
+          sequence,
+          ...(previous ? { throughSequence: previous.throughSequence } : {}),
+        },
+        controller.signal,
+      );
+      if (controller.signal.aborted || this.state.selectedId !== sessionId) return;
+      if (previous) {
+        const earlier = direction === 'before' ? page : previous;
+        const later = direction === 'before' ? previous : page;
+        page.events = [...earlier.events, ...later.events];
+        page.firstSequence = earlier.firstSequence;
+        page.lastSequence = later.lastSequence;
+        page.hasEarlier = earlier.hasEarlier;
+        page.hasLater = later.hasLater;
+        page.fragment = previous.fragment;
+      }
+      this.update({ reading: { page, loading: false } });
+    } finally {
+      if (this.viewRead === controller) {
+        this.viewRead = undefined;
+        if (this.state.reading?.page.session.id === sessionId)
+          this.update({ reading: { ...this.state.reading, loading: false } });
+      }
+    }
+  }
+
+  returnLatest() {
+    this.viewRead?.abort();
+    this.update({ reading: null });
   }
 
   // A browser's user is still there; its login's idle time starts over.
@@ -897,19 +1076,28 @@ export class ProxyClient {
   }
 
   // Data replies arrive just before their response frame.
-  async fetch<T extends keyof Replies>(command: Extract<NewCommand, { type: T }>) {
-    const response = await this.request(command);
+  async fetch<T extends keyof Replies>(
+    command: Extract<NewCommand, { type: T }>,
+    signal?: AbortSignal,
+  ) {
+    const response = await this.request(command, signal);
     const result = this.results.get(response.requestId);
     this.results.delete(response.requestId);
     if (!result) throw new Error('服务没有返回数据。');
     return result as Extract<ServerMessage, { type: Replies[T] }>;
   }
-  async request(command: NewCommand): Promise<Response> {
+  async request(command: NewCommand, signal?: AbortSignal): Promise<Response> {
+    signal?.throwIfAborted();
     if (this.state.status !== 'connected' || this.socket?.readyState !== WebSocket.OPEN)
       throw new Error('服务未连接。');
     const requestId = crypto.randomUUID();
     const done = new Promise<Response>((resolve, reject) => {
-      const history = command.type === 'session.subscribe' || command.type === 'session.history';
+      const history = [
+        'session.subscribe',
+        'session.history',
+        'session.outline',
+        'session.read',
+      ].includes(command.type);
       const expire = () => {
         this.pending.delete(requestId);
         this.results.delete(requestId);
@@ -935,7 +1123,7 @@ export class ProxyClient {
         reject,
         timer: setTimeout(expire, wait),
         type: command.type,
-        sessionId: history ? command.sessionId : undefined,
+        sessionId: 'sessionId' in command ? command.sessionId : undefined,
         renew: () => {
           clearTimeout(request.timer);
           request.timer = setTimeout(expire, wait);
@@ -944,13 +1132,32 @@ export class ProxyClient {
       this.pending.set(requestId, request);
       this.socket!.send(JSON.stringify({ ...command, requestId }));
     });
-    this.pending.get(requestId)!.done = done;
-    return done;
+    const abort = () => {
+      const request = this.pending.get(requestId);
+      if (!request) return;
+      clearTimeout(request.timer);
+      this.pending.delete(requestId);
+      this.results.delete(requestId);
+      this.socket?.send(JSON.stringify({ type: 'session.history.cancel', requestId }));
+      request.reject(new DOMException('历史读取已取消。', 'AbortError'));
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+    const request = this.pending.get(requestId);
+    if (request) request.done = done;
+    try {
+      return await done;
+    } finally {
+      signal?.removeEventListener('abort', abort);
+    }
   }
   async waitForHistory(sessionId: string) {
     await Promise.all(
       [...this.pending.values()]
-        .filter((request) => request.sessionId === sessionId)
+        .filter(
+          (request) =>
+            request.sessionId === sessionId &&
+            ['session.subscribe', 'session.history'].includes(request.type),
+        )
         .map((request) => request.done),
     );
     if (this.state.selectedId !== sessionId) throw new Error('已切换会话，读取取消。');

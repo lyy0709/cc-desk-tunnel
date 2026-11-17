@@ -1,9 +1,10 @@
 import type {
   FileAttachment,
+  OutlineEntry,
   PermissionMode,
   SessionEvent,
   TurnStats,
-} from '@cc-desk-tunnel/protocol';
+} from './index.ts';
 
 export type ToolState =
   | 'requested'
@@ -144,8 +145,10 @@ export function transcript(events: SessionEvent[]): TranscriptItem[] {
       if (tool?.kind === 'tool') {
         tool.resolved = true;
         tool.approved = payload.allowed;
-        tool.status = payload.allowed ? '运行中' : '已拒绝';
-        tool.state = payload.allowed ? 'running' : 'denied';
+        if (!tool.endedAt) {
+          tool.status = payload.cancelled ? '审批已取消' : payload.allowed ? '运行中' : '已拒绝';
+          tool.state = payload.cancelled ? 'cancelled' : payload.allowed ? 'running' : 'denied';
+        }
       }
     }
     if (payload.type === 'native.permission') {
@@ -393,6 +396,60 @@ export function conversation(events: SessionEvent[]): Turn[] {
     turn.answer = turn.steps.pop() as Text;
   }
   return turns;
+}
+
+// The directory uses the same turn boundaries as the transcript, with only bounded reading previews.
+export function conversationOutline(events: SessionEvent[]): OutlineEntry[] {
+  const origins = new Map<string, number>();
+  for (const { sequence, payload } of events) {
+    const ids =
+      payload.type === 'message.user' || payload.type === 'text.delta'
+        ? [payload.messageId]
+        : payload.type === 'thinking.delta'
+          ? [`thinking-${payload.messageId}`]
+          : payload.type === 'tool.requested'
+            ? [payload.toolId]
+            : [
+                `native-${sequence}`,
+                `compact-${sequence}`,
+                `error-${sequence}`,
+                `status-${sequence}`,
+              ];
+    for (const id of ids) if (!origins.has(id)) origins.set(id, sequence);
+  }
+  const preview = (text: string, length: number) =>
+    text
+      .slice(0, 1600)
+      .split('\n')
+      .map((line) =>
+        line
+          .replace(/^\s*(?:>\s*)*(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+)?/, '')
+          .replace(/\*\*|__|`/g, '')
+          .trim(),
+      )
+      .find(Boolean)
+      ?.slice(0, length) ?? '';
+  return conversation(events).map((turn) => {
+    const question = turn.question;
+    const answer = turn.answer ?? turn.steps.findLast((step) => step.kind === 'assistant');
+    return {
+      id: turn.id,
+      sequence: origins.get(turn.id)!,
+      at: turn.startedAt,
+      ended: !!turn.endedAt,
+      question:
+        preview(
+          question?.text.replace(
+            /\[文件 #(\d+)\]/g,
+            (token, number) =>
+              question.attachments?.find((file) => file.reference === Number(number))?.name ??
+              token,
+          ) ?? '',
+          180,
+        ) || (question?.attachments?.map((file) => file.name).join('、') ?? '').slice(0, 180),
+      answer: preview(answer && 'text' in answer ? answer.text : '', 300),
+    };
+  });
 }
 
 // The figures of the runs of one turn, as one. The averages are weighed by what they average over.

@@ -23,7 +23,7 @@ import type { ConnectedDevice, ProxyClient } from './client.ts';
 import WebAccessSettings from './WebAccessSettings.tsx';
 import Help from './Help.tsx';
 import type { ConnectionForm } from './LoginPage.tsx';
-import { connectionWaits, setPrefs, themes, usePrefs, waitRange } from './prefs.ts';
+import { connectionWaits, followupModes, setPrefs, themes, usePrefs, waitRange } from './prefs.ts';
 import { viewModes } from './transcriptView.ts';
 import type { NotifyKind } from './prefs.ts';
 import { waitFields } from './setting-fields.ts';
@@ -69,7 +69,7 @@ export const sections: {
     name: '常规',
     group: '本机',
     icon: Settings,
-    words: '窗口 托盘 后台 启动 普通会话 文件夹 审批 绕过权限',
+    words: '窗口 托盘 后台 启动 普通会话 文件夹 审批 绕过权限 消息 排队 追加 引导',
   },
   {
     id: 'appearance',
@@ -530,7 +530,7 @@ function General({
   chooseWorkspace: (reset: boolean) => void;
 }) {
   const [closeToTray, setCloseToTray] = useState<boolean | null>(null);
-  const { bypassPermissions } = usePrefs();
+  const { bypassPermissions, followup } = usePrefs();
   useEffect(() => {
     void window.desktop?.windowSettings().then((values) => setCloseToTray(values.closeToTray));
   }, []);
@@ -578,6 +578,32 @@ function General({
           </div>
         </>
       )}
+      <h2 className="page-heading">消息</h2>
+      <div className="card">
+        <div className="setting-row stat-picks">
+          <span>
+            <strong>运行中发送消息</strong>
+            <small>
+              {followupModes.find((entry) => entry.priority === followup)!.detail}
+              发送按钮旁可为单条消息另选方式。
+            </small>
+          </span>
+          <div className="stat-chips" role="radiogroup" aria-label="运行中发送消息">
+            {followupModes.map((entry) => (
+              <button
+                type="button"
+                key={entry.priority}
+                role="radio"
+                className="stat-chip"
+                aria-checked={followup === entry.priority}
+                onClick={() => setPrefs((prefs) => ({ ...prefs, followup: entry.priority }))}
+              >
+                {entry.label}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
       <h2 className="page-heading">审批</h2>
       <div className="card">
         <Row

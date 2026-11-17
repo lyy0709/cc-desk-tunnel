@@ -35,6 +35,7 @@ import {
 import { messageText } from '@cc-desk-tunnel/protocol';
 import type {
   FileAttachment,
+  OutlineEntry,
   PlanExecutionMode,
   Session,
   SessionEvent,
@@ -42,15 +43,21 @@ import type {
 import Attachments from './Attachments.tsx';
 import { describe, duration, summarize } from './activity.ts';
 import type { Category } from './activity.ts';
-import type { HistoryState, TaskProgress } from './client.ts';
+import type { HistoryState, TaskProgress, OutlineState } from './client.ts';
 import { RunStatus, TaskLine, sessionRuntime } from './RunStatus.tsx';
 import type { Clock } from './RunStatus.tsx';
 import QuestionCard, { questionsOf } from './QuestionCard.tsx';
 import PermissionMenu from './PermissionMenu.tsx';
-import { conversation } from './transcript.ts';
+import { conversation } from '@cc-desk-tunnel/protocol/transcript';
 import { usePrefs } from './prefs.ts';
 import { firstLine } from './transcriptView.ts';
-import type { Compact, Notice, TranscriptItem, Turn, Work } from './transcript.ts';
+import type {
+  Compact,
+  Notice,
+  TranscriptItem,
+  Turn,
+  Work,
+} from '@cc-desk-tunnel/protocol/transcript';
 import { CopyButton, copyText } from './copy.tsx';
 import { messageTime } from './messageTime.ts';
 import TurnStats from './TurnStats.tsx';
@@ -341,17 +348,11 @@ function PlanCard({ tool, plan, live }: { tool: Tool; plan: string; live: Live }
           {shown ? '收起' : '展开全文'}
         </button>
       )}
-      <details className="plan-details" data-search-ignore>
-        <summary>原始工具详情</summary>
-        <CopyButton text={tool.input} label="复制工具输入" />
-        <pre className="tool-input">{tool.input}</pre>
-        {tool.output && (
-          <>
-            <CopyButton text={tool.output} label="复制工具输出" />
-            <pre className="tool-output">{tool.output}</pre>
-          </>
-        )}
-      </details>
+      {failed && tool.output && (
+        <p className="plan-result" data-search-content>
+          {tool.output}
+        </p>
+      )}
       {actions}
       {large && (
         <Modal
@@ -385,8 +386,105 @@ function PlanCard({ tool, plan, live }: { tool: Tool; plan: string; live: Live }
   );
 }
 
+// A command and its output share a reading surface.
+function CommandBody({
+  tool,
+  command,
+  description,
+  running,
+  pictures,
+}: {
+  tool: Tool;
+  command: string;
+  description: string;
+  running: boolean;
+  pictures: ReturnType<typeof toolPictures>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  const [long, setLong] = useState(false);
+  const content = useRef<HTMLDivElement>(null);
+  const searching = useContext(SearchExpanded);
+  const shown = expanded || searching;
+  const output = pictures ? pictures.text : (tool.output ?? tool.liveOutput ?? '');
+  useLayoutEffect(() => {
+    const element = content.current!;
+    const measure = () => setLong(element.scrollHeight > 320);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [command, output]);
+  const successful = tool.state === 'completed' && tool.exitCode === 0;
+  const failed = tool.state === 'failed';
+  const status = running ? '运行中' : successful ? '成功' : tool.status;
+  return (
+    <>
+      <div className="command-header" data-reading-control>
+        <span>{tool.name}</span>
+        <div>
+          <CopyButton text={command} label="复制命令" />
+          {output && <CopyButton text={output} label="复制输出" />}
+        </div>
+      </div>
+      {description && (
+        <p className="command-description" data-search-content>
+          {description}
+        </p>
+      )}
+      <div ref={content} className={`command-content${shown ? ' expanded' : ''}`}>
+        <pre className="tool-input" data-search-content>
+          <span className="command-prompt" aria-hidden="true" data-search-ignore>
+            ${' '}
+          </span>
+          {command}
+        </pre>
+        {output && (
+          <pre className="tool-output" data-search-content>
+            {output}
+          </pre>
+        )}
+        {pictures && (
+          <div className="tool-pictures">
+            {pictures.pictures.map((picture, index) => (
+              <Picture key={index} src={pictureUrl(picture)} alt={`图片 ${index + 1}`} />
+            ))}
+          </div>
+        )}
+      </div>
+      {long && !searching && (
+        <button
+          type="button"
+          className="command-expand"
+          data-reading-control
+          aria-expanded={shown}
+          onClick={() => setExpanded(!expanded)}
+        >
+          {shown ? '收起' : '展开全文'}
+        </button>
+      )}
+      <div className="command-footer">
+        <span
+          className={`command-status${successful ? ' succeeded' : failed ? ' failed' : ''}`}
+          role="status"
+        >
+          {running ? (
+            <LoaderCircle className="spinning" />
+          ) : tool.state === 'completed' ? (
+            <Check />
+          ) : failed ? (
+            <X />
+          ) : null}
+          {status}
+          {tool.exitCode != null && <span>· 退出码 {tool.exitCode}</span>}
+        </span>
+      </div>
+    </>
+  );
+}
+
 function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Live }) {
-  const { category, verb, subject, added, removed, running, failed } = describe(tool, active);
+  const { category, command, description, verb, subject, added, removed, running, failed } =
+    describe(tool, active);
   const Icon = icons[category];
   const pictures = useMemo(() => (tool.output ? toolPictures(tool.output) : null), [tool.output]);
   const approval = live.canApprove(tool);
@@ -414,13 +512,13 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
     );
   return (
     <Fold
-      className={`tool ${failed ? 'failed' : ''}`}
+      className={`tool${command ? ' command-tool' : ''} ${failed ? 'failed' : ''}`}
       forced={approval}
       summary={
         <span className="tool-heading">
           {running ? <LoaderCircle className="spinning" /> : <Icon />}
-          <span className="tool-verb">{verb}</span>
-          <span className="tool-subject" title={subject}>
+          {(!command || tool.state !== 'completed') && <span className="tool-verb">{verb}</span>}
+          <span className="tool-subject" title={command || subject}>
             {subject}
           </span>
           {pictures && <ImageIcon className="tool-picture-mark" aria-label="含图片" />}
@@ -441,44 +539,56 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
       }
     >
       {() => (
-        <div className="tool-detail">
-          <CopyButton text={tool.input} label="复制工具输入" />
-          <pre className="tool-input" data-search-content>
-            {tool.input}
-          </pre>
-          {tool.liveOutput && !tool.output && (
-            <pre className="tool-output" data-search-content>
-              {tool.liveOutput}
-            </pre>
-          )}
-          {pictures ? (
-            <>
-              {pictures.text && (
-                <>
-                  <CopyButton text={pictures.text} label="复制工具输出" />
-                  <pre className="tool-output" data-search-content>
-                    {pictures.text}
-                  </pre>
-                </>
-              )}
-              <div className="tool-pictures">
-                {pictures.pictures.map((picture, index) => (
-                  <Picture key={index} src={pictureUrl(picture)} alt={`图片 ${index + 1}`} />
-                ))}
-              </div>
-            </>
+        <div className={`tool-detail${command ? ' command-detail' : ''}`}>
+          {command ? (
+            <CommandBody
+              tool={tool}
+              command={command}
+              description={description}
+              running={running}
+              pictures={pictures}
+            />
           ) : (
-            tool.output && (
-              <>
-                <CopyButton text={tool.output} label="复制工具输出" />
+            <>
+              <CopyButton text={tool.input} label="复制工具输入" />
+              <pre className="tool-input" data-search-content>
+                {tool.input}
+              </pre>
+              {tool.liveOutput && !tool.output && (
                 <pre className="tool-output" data-search-content>
-                  {tool.exitCode !== null &&
-                    tool.exitCode !== undefined &&
-                    `退出码 ${tool.exitCode}\n`}
-                  {tool.output}
+                  {tool.liveOutput}
                 </pre>
-              </>
-            )
+              )}
+              {pictures ? (
+                <>
+                  {pictures.text && (
+                    <>
+                      <CopyButton text={pictures.text} label="复制工具输出" />
+                      <pre className="tool-output" data-search-content>
+                        {pictures.text}
+                      </pre>
+                    </>
+                  )}
+                  <div className="tool-pictures">
+                    {pictures.pictures.map((picture, index) => (
+                      <Picture key={index} src={pictureUrl(picture)} alt={`图片 ${index + 1}`} />
+                    ))}
+                  </div>
+                </>
+              ) : (
+                tool.output && (
+                  <>
+                    <CopyButton text={tool.output} label="复制工具输出" />
+                    <pre className="tool-output" data-search-content>
+                      {tool.exitCode !== null &&
+                        tool.exitCode !== undefined &&
+                        `退出码 ${tool.exitCode}\n`}
+                      {tool.output}
+                    </pre>
+                  </>
+                )
+              )}
+            </>
           )}
           {approval && (
             <div className="approval-actions">
@@ -848,6 +958,15 @@ function TurnView({
 export default function Conversation({
   session,
   events,
+  currentEvents,
+  outline,
+  reading,
+  hasLater,
+  readTurn,
+  loadLater,
+  returnLatest,
+  retryOutline,
+  exportStatus,
   history,
   connected,
   native,
@@ -873,6 +992,15 @@ export default function Conversation({
   deviceId?: string;
   reviewing?: boolean;
   events: SessionEvent[];
+  currentEvents: SessionEvent[];
+  outline: OutlineState | undefined;
+  reading: boolean;
+  hasLater: boolean;
+  readTurn: (entry: OutlineEntry) => Promise<void>;
+  loadLater: () => Promise<void>;
+  returnLatest: () => void;
+  retryOutline: () => void;
+  exportStatus: string;
   history: HistoryState | undefined;
   connected: boolean;
   native: boolean;
@@ -905,7 +1033,7 @@ export default function Conversation({
   progress: Record<string, TaskProgress> | undefined;
 }) {
   const turns = useMemo(() => conversation(events), [events]);
-  const runtime = sessionRuntime(session, events, connected, native);
+  const runtime = sessionRuntime(session, currentEvents, connected, native);
   const shownSession = useRef(session?.id);
   shownSession.current = session?.id;
   // A compaction under way counts its time in its own line, as a tool does.
@@ -1142,6 +1270,7 @@ export default function Conversation({
     setAway(true);
   };
   const rejoin = () => {
+    if (reading) return;
     follow.current = true;
     setAway(false);
   };
@@ -1149,6 +1278,9 @@ export default function Conversation({
   useLayoutEffect(() => {
     if (reviewing) leave();
   }, [reviewing]);
+  useLayoutEffect(() => {
+    if (reading) leave();
+  }, [reading]);
   const loadMore = () => {
     if (!session || !connected || !history?.hasEarlier || history.loadingEarlier || history.loading)
       return;
@@ -1200,7 +1332,21 @@ export default function Conversation({
     <SearchExpanded.Provider value={searching}>
       {session && (
         <div className="conversation-tools">
-          <span role="status">{copyStatus}</span>
+          <span role="status">
+            {copyStatus ||
+              exportStatus ||
+              (outline?.loading && !outline.entries.length ? '正在加载会话目录…' : '')}
+          </span>
+          {outline?.error && (
+            <button
+              type="button"
+              className="text-link"
+              title={outline.error}
+              onClick={retryOutline}
+            >
+              重试会话目录
+            </button>
+          )}
           <IconButton title="打开对话查找" onClick={openFind}>
             <Search />
           </IconButton>
@@ -1213,7 +1359,7 @@ export default function Conversation({
           query={query}
           change={setQuery}
           request={findRequest}
-          partial={!!history?.hasEarlier}
+          partial={!!history?.hasEarlier || hasLater}
           close={() => {
             setFindOpen(false);
             setQuery('');
@@ -1422,7 +1568,24 @@ export default function Conversation({
                 </div>
               )}
               <LinkPlace.Provider value={place}>{renderedTurns}</LinkPlace.Provider>
-              {session.activeRun && background && (
+              {hasLater && (
+                <button
+                  type="button"
+                  className="history-load"
+                  disabled={!connected || history?.loadingEarlier}
+                  onClick={() => {
+                    leave();
+                    void loadLater().catch((error: Error) => {
+                      if (shownSession.current === session.id && error.name !== 'AbortError')
+                        setLoadError(error.message);
+                    });
+                  }}
+                >
+                  <ArrowDown />
+                  {history?.loadingEarlier ? '加载中' : '加载较新记录'}
+                </button>
+              )}
+              {!reading && session.activeRun && background && (
                 <div className="background-tasks">
                   <div className="run-indicator" role="status">
                     <span className={`running-dot${connected ? ' breathing' : ''}`} />
@@ -1471,7 +1634,7 @@ export default function Conversation({
                 </div>
               )}
               {/* A terminal holds the session: what it does is recorded here as each of its turns ends. */}
-              {session.activeRun?.surface === 'terminal' && (
+              {!reading && session.activeRun?.surface === 'terminal' && (
                 <div className="run-indicator" role="status">
                   <span
                     className={`running-dot${session.activeRun.activity === 'working' && connected ? ' breathing' : ''}`}
@@ -1479,7 +1642,8 @@ export default function Conversation({
                   {`${runtime.task} · 进展随后显示在这里，关闭终端后可以在这里接着聊`}
                 </div>
               )}
-              {session.activeRun &&
+              {!reading &&
+                session.activeRun &&
                 session.activeRun.surface !== 'terminal' &&
                 !background &&
                 (session.activeRun.status !== 'awaiting_approval' ? (
@@ -1503,13 +1667,17 @@ export default function Conversation({
                 ))}
             </div>
           )}
-          {session && away && (
+          {session && (away || reading) && (
             <div className="to-end">
               <IconButton
-                title="回到底部"
+                title={reading ? '回到最新记录' : '回到底部'}
                 className="to-end-button"
                 onClick={() => {
-                  rejoin();
+                  if (reading) {
+                    returnLatest();
+                    follow.current = true;
+                    setAway(false);
+                  } else rejoin();
                   toEnd();
                 }}
               >
@@ -1518,15 +1686,15 @@ export default function Conversation({
             </div>
           )}
         </div>
-        {session && turns.length > 1 && (
+        {session && outline && outline.entries.length > 1 && (
           <ConversationNav
             key={session.id}
-            turns={turns}
+            turns={outline.entries}
             root={transcriptRoot}
             scroll={scroll}
-            partial={!!history?.hasEarlier}
-            loading={!connected || !!history?.loadingEarlier || !!history?.loading}
-            loadEarlier={loadMore}
+            windowKey={`${turns[0]?.id}:${turns.at(-1)?.id}`}
+            read={readTurn}
+            error={setCopyStatus}
             navigate={leave}
           />
         )}

@@ -1,12 +1,40 @@
 import type { NativeMetrics } from '@cc-desk-tunnel/protocol';
+import { useEffect, useState } from 'react';
+
+type Limits = NativeMetrics['rateLimits'] | undefined;
+export function currentQuota(limits: Limits, now = Date.now()) {
+  if (!limits?.available) return null;
+  const windows = limits.windows.filter(
+    (window) => !window.resetsAt || Date.parse(window.resetsAt) > now,
+  );
+  return windows.length ? { ...limits, windows } : null;
+}
+
+// Expire known windows while the page is idle; this timer makes no service or model request.
+export function useQuota(limits: Limits) {
+  const [now, setNow] = useState(Date.now);
+  useEffect(() => {
+    const future = (limits?.windows ?? [])
+      .flatMap((window) => (window.resetsAt ? [Date.parse(window.resetsAt)] : []))
+      .filter((at) => at > Date.now());
+    if (!future.length) return;
+    const timer = setTimeout(
+      () => setNow(Date.now()),
+      Math.min(2_147_483_647, Math.max(0, Math.min(...future) - Date.now())),
+    );
+    return () => clearTimeout(timer);
+  }, [limits, now]);
+  return currentQuota(limits, Math.max(now, Date.now()));
+}
 
 // The two figures worth a glance while writing: how much of the five-hour and of the weekly quota is used.
 // A plan with a weekly quota per model has several weekly windows; the fullest is the one that stops work
 // first. `seven_day_oauth_apps` limits the account's other applications, not this one.
 // (The idea of the quota beside the message box: #27 and #41, hansaes.)
-export function quotaFigures(limits: NonNullable<NativeMetrics['rateLimits']> | null | undefined) {
-  if (!limits?.available) return [];
-  const read = limits.windows.filter((window) => window.utilization !== null);
+export function quotaFigures(limits: Limits, now = Date.now()) {
+  const read = (currentQuota(limits, now)?.windows ?? []).filter(
+    (window) => window.utilization !== null,
+  );
   const hour = read.find((window) => window.name === 'five_hour');
   const week = read
     .filter(

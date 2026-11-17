@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { conversation } from '../src/transcript.ts';
+import { conversation, transcript } from '@cc-desk-tunnel/protocol/transcript';
 import { markdown } from '../src/exportSession.ts';
 
 let sequence = 0;
@@ -15,6 +15,44 @@ const event = (runId, second, payload) => ({
 const said = (runId, second, messageId, text) =>
   event(runId, second, { type: 'text.delta', messageId, text });
 
+test('a cancelled approval closes its controls without overriding the native tool result in either order', () => {
+  const requested = [
+    event('run', 0, {
+      type: 'tool.requested',
+      toolId: 'tool',
+      name: 'Bash',
+      target: 'Linux',
+      input: '{}',
+    }),
+    event('run', 1, { type: 'approval.requested', toolId: 'tool', approvalId: 'approval' }),
+  ];
+  const cancelled = event('run', 2, {
+    type: 'approval.resolved',
+    approvalId: 'approval',
+    allowed: false,
+    cancelled: true,
+  });
+  const result = event('run', 3, {
+    type: 'tool.result',
+    toolId: 'tool',
+    status: 'completed',
+    output: 'native result',
+    exitCode: null,
+  });
+  const pending = transcript([...requested, cancelled])[0];
+  assert.equal(pending.resolved, true);
+  assert.equal(pending.status, '审批已取消');
+  for (const events of [
+    [cancelled, result],
+    [result, cancelled],
+  ]) {
+    const tool = transcript([...requested, ...events])[0];
+    assert.equal(tool.state, 'completed');
+    assert.equal(tool.output, 'native result');
+    assert.equal(tool.resolved, true);
+  }
+});
+
 test('attachment-only messages retain their metadata and export full file references', () => {
   const attachments = [{ path: '/tmp/中文 文件.txt', name: '中文 文件.txt', deviceId: 'device' }];
   const events = [
@@ -22,6 +60,21 @@ test('attachment-only messages retain their metadata and export full file refere
   ];
   assert.deepEqual(conversation(events)[0].question.attachments, attachments);
   assert.match(markdown({ title: '附件', projectPath: '/tmp' }, events), /"\/tmp\/中文 文件.txt"/);
+});
+
+test('Markdown export retains large tool bodies containing many backticks', () => {
+  const input = '`x '.repeat(150000);
+  const text = markdown({ title: 'large', projectPath: '/tmp' }, [
+    event('run', 0, {
+      type: 'tool.requested',
+      toolId: 'tool',
+      name: 'Read',
+      target: 'Windows',
+      input,
+    }),
+  ]);
+  assert.ok(text.includes(input));
+  assert.match(text, /```\n`x /);
 });
 
 test('an automatic compaction is one mark among the steps, with what came after it under it', () => {

@@ -4,14 +4,27 @@ import type { FileAttachment } from '@cc-desk-tunnel/protocol';
 
 // Unsent text is the user's work: it is kept per session and written to disk shortly after every edit,
 // so switching sessions, closing the window or a crash does not lose it.
-export type Draft = {
+export type DraftContent = {
   text: string;
   attachments: FileAttachment[];
+  // Editing withdraws the old queue entry; sending this draft creates a new one.
+  requeue?: true;
+};
+export type Draft = DraftContent & {
+  queued?: QueuedMessage[];
+  stashed?: DraftContent[];
   // In-flight local reads belong to the draft's session, but do not survive a window restart.
   adding?: number;
   attachmentError?: string;
   insertions?: { id: string; offset: number }[];
   cursor?: number;
+};
+export type QueuedMessage = {
+  id: string;
+  text: string;
+  attachments: FileAttachment[];
+  paused?: boolean;
+  error?: string;
 };
 export type Drafts = Record<string, Draft>;
 export const emptyDraft: Draft = { text: '', attachments: [] };
@@ -68,30 +81,77 @@ export function insertDraftFiles(draft: Draft, files: FileAttachment[], offset: 
   };
 }
 
+function contentOf(saved: unknown): DraftContent | null {
+  if (typeof saved === 'string') return { text: saved, attachments: [] };
+  if (!saved || typeof saved !== 'object' || !('text' in saved) || typeof saved.text !== 'string')
+    return null;
+  const files = fileAttachmentSchema
+    .array()
+    .safeParse('attachments' in saved ? saved.attachments : []);
+  return {
+    text: saved.text,
+    attachments: files.success ? files.data : [],
+    ...('requeue' in saved && saved.requeue === true ? { requeue: true } : {}),
+  };
+}
 export function cleanDrafts(value: unknown): Drafts {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
   return Object.fromEntries(
     Object.entries(value).flatMap(([id, saved]) => {
-      if (typeof saved === 'string') return [[id, { text: saved, attachments: [] }]];
-      if (
-        !saved ||
-        typeof saved !== 'object' ||
-        !('text' in saved) ||
-        typeof saved.text !== 'string'
-      )
-        return [];
-      const files = fileAttachmentSchema
-        .array()
-        .safeParse('attachments' in saved ? saved.attachments : []);
-      return [[id, { text: saved.text, attachments: files.success ? files.data : [] }]];
+      const content = contentOf(saved);
+      if (!content) return [];
+      const queued =
+        saved && typeof saved === 'object' && 'queued' in saved && Array.isArray(saved.queued)
+          ? saved.queued.flatMap((entry: unknown) => {
+              if (
+                !entry ||
+                typeof entry !== 'object' ||
+                !('id' in entry) ||
+                typeof entry.id !== 'string'
+              )
+                return [];
+              const content = contentOf(entry);
+              if (!content) return [];
+              // A reopened window cannot know whether a send finished before it closed. Restore for manual review.
+              return [
+                {
+                  id: entry.id,
+                  ...content,
+                  paused: true,
+                  ...('error' in entry && typeof entry.error === 'string'
+                    ? { error: entry.error }
+                    : {}),
+                },
+              ];
+            })
+          : [];
+      const draft: Draft = { ...content, ...(queued.length ? { queued } : {}) };
+      if (saved && typeof saved === 'object' && 'stashed' in saved && Array.isArray(saved.stashed))
+        draft.stashed = saved.stashed.flatMap((entry: unknown) => {
+          const content = contentOf(entry);
+          return content ? [content] : [];
+        });
+      return [[id, draft]];
     }),
   );
 }
 export function withoutSentDraft(current: Draft, sent: Draft): Draft {
+  const text = current.text === sent.text ? '' : current.text;
+  const attachments = current.attachments.filter((file) => !sent.attachments.includes(file));
+  const restore =
+    !text && !attachments.length && !current.adding ? current.stashed?.at(-1) : undefined;
   return {
     ...current,
-    text: current.text === sent.text ? '' : current.text,
-    attachments: current.attachments.filter((file) => !sent.attachments.includes(file)),
+    text: restore?.text ?? text,
+    attachments: restore?.attachments ?? attachments,
+    ...(current.requeue && !text && !attachments.length ? { requeue: undefined } : {}),
+    ...(restore
+      ? {
+          requeue: restore.requeue,
+          stashed: current.stashed!.slice(0, -1),
+          cursor: restore.text.length,
+        }
+      : {}),
     ...(sent.attachmentError && current.attachmentError === sent.attachmentError
       ? { attachmentError: '' }
       : {}),
@@ -108,8 +168,20 @@ async function load(): Promise<Drafts> {
 function store(drafts: Drafts) {
   const saved = Object.fromEntries(
     Object.entries(drafts)
-      .filter(([, draft]) => draft.text || draft.attachments.length)
-      .map(([id, { text, attachments }]) => [id, { text, attachments }]),
+      .filter(
+        ([, draft]) =>
+          draft.text || draft.attachments.length || draft.queued?.length || draft.stashed?.length,
+      )
+      .map(([id, { text, attachments, queued, requeue, stashed }]) => [
+        id,
+        {
+          text,
+          attachments,
+          ...(requeue ? { requeue } : {}),
+          ...(queued?.length ? { queued } : {}),
+          ...(stashed?.length ? { stashed } : {}),
+        },
+      ]),
   );
   if (window.desktop) void window.desktop.saveDrafts(saved).catch(() => {});
   else localStorage.setItem(storageKey, JSON.stringify(saved));

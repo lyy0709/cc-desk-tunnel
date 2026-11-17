@@ -23,7 +23,7 @@ export default function ShortcutSettings() {
   return (
     <Page
       title="快捷键"
-      intro="快捷键只在本窗口处于前台时起作用，不向系统注册全局热键；对话框打开时，按键原样交给它。"
+      intro="快捷键只在本窗口处于前台时起作用，不向系统注册全局热键；对话框打开时，按键原样交给它。消息框中的立即引导作用于当前草稿，草稿为空时作用于队首；运行中也可按 Ctrl+X、Ctrl+S。"
     >
       <div className="card">
         <div className="setting-row">

@@ -5,6 +5,8 @@ export const browserCommands = new Set<Command['type']>([
   'server.session.create',
   'session.subscribe',
   'session.history',
+  'session.outline',
+  'session.read',
   'session.status',
   'session.stats',
   'session.rename',
