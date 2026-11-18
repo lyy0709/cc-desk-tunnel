@@ -97,6 +97,7 @@ async function open(page: Page, { desktop = true, history = 0, foreign = false }
         notify: empty,
         version: async () => '0.3.18',
         loadLogin: async () => null,
+        loginOwner: async () => null,
         saveLogin: empty,
         disconnectProxy: empty,
         loadDrafts: async () => JSON.parse(localStorage.getItem('fixture-drafts') ?? '{}'),

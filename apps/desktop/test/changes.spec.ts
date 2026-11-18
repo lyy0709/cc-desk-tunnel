@@ -120,6 +120,7 @@ async function open(
         notify: empty,
         version: async () => '0.3.16',
         loadLogin: async () => null,
+        loginOwner: async () => null,
         saveLogin: empty,
         disconnectProxy: empty,
         loadDrafts: async () => ({}),
