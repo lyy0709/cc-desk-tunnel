@@ -3332,6 +3332,35 @@ dialog:has(.plan-reader) > .dialog-heading h2 {
 .attachment-card:hover {
   background: var(--hover);
 }
+.attachment-inline {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  max-width: 100%;
+  gap: 4px;
+  padding: 0 5px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-s);
+  background: var(--surface-2);
+  vertical-align: middle;
+  font-size: 0.9em;
+  line-height: 1.5;
+}
+.attachment-inline:hover {
+  background: var(--hover);
+}
+.attachment-inline .attachment-thumbnail,
+.attachment-inline .attachment-thumbnail img,
+.attachment-inline .attachment-thumbnail svg {
+  width: 1.15em;
+  height: 1.15em;
+}
+.attachment-inline .attachment-label {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 .attachment-open {
   position: absolute;
   inset: 0;

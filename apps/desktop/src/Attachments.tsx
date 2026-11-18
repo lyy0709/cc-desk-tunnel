@@ -1,4 +1,4 @@
-import { memo, useContext, useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { memo, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 import { pathKey } from '@cc-desk-tunnel/protocol';
 import type { FileAttachment } from '@cc-desk-tunnel/protocol';
@@ -150,12 +150,14 @@ const AttachmentCard = memo(function AttachmentCard({
   remove,
   disabled,
   open,
+  inline = false,
 }: {
   file: FileAttachment;
   local: boolean;
   remove?: (file: FileAttachment) => void;
   disabled: boolean;
   open: (file: FileAttachment, trigger: HTMLButtonElement) => void;
+  inline?: boolean;
 }) {
   const [broken, setBroken] = useState(false);
   const picture = isPicture(file.path);
@@ -166,8 +168,8 @@ const AttachmentCard = memo(function AttachmentCard({
       : /\.(txt|md|csv|log|yaml|yml)$/i.test(file.name)
         ? FileText
         : File;
-  return (
-    <div className={`attachment-card${remove ? ' removable' : ''}`}>
+  const preview = (
+    <>
       <button
         type="button"
         className="attachment-open"
@@ -193,6 +195,19 @@ const AttachmentCard = memo(function AttachmentCard({
           <Icon />
         )}
       </span>
+    </>
+  );
+  if (inline) {
+    return (
+      <span className="attachment-inline">
+        {preview}
+        <span className="attachment-label">{file.name}</span>
+      </span>
+    );
+  }
+  return (
+    <div className={`attachment-card${remove ? ' removable' : ''}`}>
+      {preview}
       <span className="attachment-label" data-search-content>
         <strong>{file.name}</strong>
         <small>
@@ -222,11 +237,15 @@ export default memo(function Attachments({
   deviceId,
   remove,
   disabled = false,
+  text,
+  copied,
 }: {
   files: FileAttachment[];
   deviceId?: string;
   remove?: (file: FileAttachment) => void;
   disabled?: boolean;
+  text?: string;
+  copied?: string;
 }) {
   const [expanded, setExpanded] = useState(false);
   const [columns, setColumns] = useState(1);
@@ -234,8 +253,24 @@ export default memo(function Attachments({
   const list = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement | null>(null);
   const searching = useContext(SearchExpanded);
+  const { parts, listed } = useMemo(() => {
+    if (!text) return { parts: null, listed: files };
+    const references = new Map(files.map((file) => [file.reference, file]));
+    const inline = new Set<FileAttachment>();
+    let start = 0;
+    const parts: (string | FileAttachment)[] = [];
+    for (const match of text.matchAll(/\[文件 #(\d+)\]/g)) {
+      const file = references.get(Number(match[1]));
+      if (!file) continue;
+      parts.push(text.slice(start, match.index), file);
+      start = match.index + match[0].length;
+      inline.add(file);
+    }
+    parts.push(text.slice(start));
+    return { parts, listed: files.filter((file) => !inline.has(file)) };
+  }, [text, files]);
   useLayoutEffect(() => {
-    if (files.length <= 2) return;
+    if (listed.length <= 2) return;
     const element = list.current!;
     // Do not synchronously measure skipped historical messages just to lay out their file cards.
     const observer = new ResizeObserver(([entry]) =>
@@ -243,8 +278,8 @@ export default memo(function Attachments({
     );
     observer.observe(element);
     return () => observer.disconnect();
-  }, [files.length > 2]);
-  const shown = expanded || searching ? files : files.slice(0, columns * 2);
+  }, [listed.length > 2]);
+  const shown = expanded || searching ? listed : listed.slice(0, columns * 2);
   const open = (file: FileAttachment, button: HTMLButtonElement) => {
     trigger.current = button;
     setSelected(file);
@@ -254,39 +289,63 @@ export default memo(function Attachments({
     requestAnimationFrame(() => trigger.current?.focus({ preventScroll: true }));
   };
   return (
-    <div className="attachments">
-      <div
-        className={`attachment-list${expanded && !searching ? ' expanded' : ''}`}
-        ref={list}
-        style={
-          files.length > 2
-            ? ({
-                '--attachment-width': `calc((100% - ${(columns - 1) * 8}px) / ${columns})`,
-              } as CSSProperties)
-            : undefined
-        }
-      >
-        {shown.map((file) => (
-          <AttachmentCard
-            key={attachmentKey(file)}
-            file={file}
-            local={!!window.desktop && file.deviceId === deviceId}
-            remove={remove}
-            disabled={disabled}
-            open={open}
-          />
-        ))}
-      </div>
-      {files.length > columns * 2 && !searching && (
-        <button
-          type="button"
-          className="attachment-toggle"
-          data-reading-control
-          aria-expanded={expanded}
-          onClick={() => setExpanded(!expanded)}
-        >
-          {expanded ? '收起附件' : `展开附件（还有 ${files.length - shown.length} 个）`}
-        </button>
+    <>
+      {parts && (
+        <div className="message-content" data-search-content data-copy-text={copied}>
+          <p>
+            {parts.map((part, index) =>
+              typeof part === 'string' ? (
+                part
+              ) : (
+                <AttachmentCard
+                  key={index}
+                  file={part}
+                  local={!!window.desktop && part.deviceId === deviceId}
+                  disabled={disabled}
+                  open={open}
+                  inline
+                />
+              ),
+            )}
+          </p>
+        </div>
+      )}
+      {listed.length > 0 && (
+        <div className="attachments">
+          <div
+            className={`attachment-list${expanded && !searching ? ' expanded' : ''}`}
+            ref={list}
+            style={
+              listed.length > 2
+                ? ({
+                    '--attachment-width': `calc((100% - ${(columns - 1) * 8}px) / ${columns})`,
+                  } as CSSProperties)
+                : undefined
+            }
+          >
+            {shown.map((file) => (
+              <AttachmentCard
+                key={attachmentKey(file)}
+                file={file}
+                local={!!window.desktop && file.deviceId === deviceId}
+                remove={remove}
+                disabled={disabled}
+                open={open}
+              />
+            ))}
+          </div>
+          {listed.length > columns * 2 && !searching && (
+            <button
+              type="button"
+              className="attachment-toggle"
+              data-reading-control
+              aria-expanded={expanded}
+              onClick={() => setExpanded(!expanded)}
+            >
+              {expanded ? '收起附件' : `展开附件（还有 ${listed.length - shown.length} 个）`}
+            </button>
+          )}
+        </div>
       )}
       {selected && (
         <AttachmentPreview
@@ -296,6 +355,6 @@ export default memo(function Attachments({
           close={close}
         />
       )}
-    </div>
+    </>
   );
 });

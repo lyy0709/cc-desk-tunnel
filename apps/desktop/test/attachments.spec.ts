@@ -372,6 +372,12 @@ test('an inline attachment stays between sentences through reading, sending, cop
   expect(f.requests.filter((request) => request.type === 'message.send').at(-1).text).toBe(
     '请先检查[文件 #1]。再修改。',
   );
+  const message = page.locator('.message.user');
+  await expect(message.locator('.message-content')).toHaveText('请先检查tcpfit.sh。再修改。');
+  await expect(message.locator('.attachment-list')).toHaveCount(0);
+  await message.getByRole('button', { name: '预览 tcpfit.sh', exact: true }).click();
+  await expect(page.getByRole('dialog')).toContainText('本机预览');
+  await page.keyboard.press('Escape');
   await page
     .locator('.message.user')
     .getByRole('button', { name: '复制消息', exact: true })

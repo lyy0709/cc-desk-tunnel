@@ -743,13 +743,19 @@ const Message = memo(function Message({
           <CopyButton text={item.text} />
         </div>
       )}
-      {(!user || item.text) && (
-        <div className="message-content" data-search-content data-copy-text={copied}>
-          {user ? <p>{item.text}</p> : <Rich text={item.text} />}
-        </div>
-      )}
-      {user && !!item.attachments?.length && (
-        <Attachments files={item.attachments} deviceId={deviceId} />
+      {user && !!item.attachments?.length ? (
+        <Attachments
+          files={item.attachments}
+          deviceId={deviceId}
+          text={item.text}
+          copied={copied}
+        />
+      ) : (
+        (!user || item.text) && (
+          <div className="message-content" data-search-content data-copy-text={copied}>
+            {user ? <p>{item.text}</p> : <Rich text={item.text} />}
+          </div>
+        )
       )}
       {user && (
         <div className="message-footer">
