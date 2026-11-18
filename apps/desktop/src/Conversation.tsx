@@ -65,6 +65,7 @@ import ConversationFind, { SearchExpanded } from './ConversationFind.tsx';
 import ConversationNav from './ConversationNav.tsx';
 import { IconButton, Menu, Modal } from './ui.tsx';
 import type { MenuItem, MenuPosition } from './ui.tsx';
+import { isMac } from './platform.ts';
 import { LinkPlace, linkTarget } from './links.ts';
 import type { Link } from './links.ts';
 import { followLink, linkMenu } from './linkActions.ts';
@@ -152,6 +153,8 @@ function Fold({
 // What a link leads to, beside it: shown while the pointer rests on the link, and after a click with what came of
 // it (a note), so that why a path cannot be opened is read where it was clicked.
 type LinkCard = { top: number; left: number; above: boolean; link: Link; note?: string };
+const commandKey =
+  isMac || (typeof navigator !== 'undefined' && /Mac|iPhone|iPad/.test(navigator.platform));
 function LinkCardView({ card }: { card: LinkCard }) {
   const { link, note } = card;
   const target =
@@ -162,7 +165,7 @@ function LinkCardView({ card }: { card: LinkCard }) {
         : link.path;
   const hint =
     link.kind === 'web'
-      ? '点击在浏览器中打开 · 右键可复制地址'
+      ? `单击确认后打开 · ${commandKey ? '⌘' : 'Ctrl'} + 单击直接打开 · 右键可复制地址`
       : link.kind === 'path'
         ? '点击打开 · 右键查看更多操作'
         : `${link.reason}右键可复制路径。`;
@@ -1081,6 +1084,7 @@ export default function Conversation({
     [session?.projectPath, here, deviceId],
   );
   const [linkCard, setLinkCard] = useState<LinkCard | null>(null);
+  const [leaving, setLeaving] = useState<string | null>(null);
   const resting = useRef<ReturnType<typeof setTimeout>>(undefined);
   const showLink = (element: Element, link: Link, note?: string) => {
     const box = element.getBoundingClientRect();
@@ -1107,6 +1111,7 @@ export default function Conversation({
     setContextMenu(null);
     setCopyStatus('');
     setLinkCard(null);
+    setLeaving(null);
   }, [session?.id]);
   // What came of a click stays a while, then goes.
   useEffect(() => {
@@ -1434,7 +1439,10 @@ export default function Conversation({
             event.preventDefault();
             const link = anchor.dataset.link ? linkTarget(anchor.dataset.link, place) : null;
             clearTimeout(resting.current);
-            if (link) void followLink(link, (note) => showLink(anchor, link, note));
+            if (link?.kind === 'web' && !(commandKey ? event.metaKey : event.ctrlKey)) {
+              setLinkCard(null);
+              setLeaving(link.url);
+            } else if (link) void followLink(link, (note) => showLink(anchor, link, note));
           }}
           onPointerOver={(event) => {
             const anchor = (event.target as HTMLElement).closest<HTMLElement>('a[data-link]');
@@ -1703,6 +1711,29 @@ export default function Conversation({
         <Menu label="对话文字操作" {...contextMenu} onClose={() => setContextMenu(null)} />
       )}
       {linkCard && !contextMenu && <LinkCardView card={linkCard} />}
+      {leaving && (
+        <Modal title="打开外部链接" onClose={() => setLeaving(null)}>
+          <p className="leave-lead">
+            {leaving.startsWith('mailto:') ? '将用邮件程序打开' : '将在浏览器中打开'}
+          </p>
+          <p className="leave-url">{leaving}</p>
+          <div className="dialog-actions">
+            <button type="button" className="button" onClick={() => setLeaving(null)}>
+              取消
+            </button>
+            <button
+              type="button"
+              className="button primary"
+              onClick={() => {
+                setLeaving(null);
+                void followLink({ kind: 'web', url: leaving }, setCopyStatus);
+              }}
+            >
+              打开
+            </button>
+          </div>
+        </Modal>
+      )}
     </SearchExpanded.Provider>
   );
 }
