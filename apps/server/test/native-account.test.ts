@@ -116,10 +116,13 @@ test('setup-token uses the official command, extracts its successful output and 
   await delay(300);
   assert.deepEqual(held, { succeeded: true, token: 'sk-ant-oat01-held' });
 
-  const cancelled = Promise.withResolvers<{ succeeded: boolean; token?: string }>();
+  let finishCancellation!: (result: { succeeded: boolean; token?: string }) => void;
+  const cancelled = new Promise<{ succeeded: boolean; token?: string }>((resolve) => {
+    finishCancellation = resolve;
+  });
   const cancelling = new NativeLogin(
     'claude',
-    (succeeded, token) => cancelled.resolve({ succeeded, token }),
+    (succeeded, token) => finishCancellation({ succeeded, token }),
     () => {},
     { method: 'setup-token', spawn },
   );
@@ -128,7 +131,7 @@ test('setup-token uses the official command, extracts its successful output and 
   cancelling.submit('code#state');
   data('Your OAuth token:\r\n sk-ant-oat01-cancelled\r\n');
   cancelling.cancel();
-  assert.deepEqual(await cancelled.promise, { succeeded: false, token: undefined });
+  assert.deepEqual(await cancelled, { succeeded: false, token: undefined });
 
   const failure = new NativeLogin(
     'claude',
