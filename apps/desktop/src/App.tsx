@@ -1441,6 +1441,16 @@ export function App({
           void exportConversation(session);
         },
       },
+      ...(client.disk?.ready
+        ? [
+            {
+              label: '重新同步记录',
+              icon: <RefreshCw />,
+              disabled: !connected,
+              run: () => client.resync(session.id),
+            },
+          ]
+        : []),
       // A session on another computer is taken over first, with a directory here.
       ...(onThis(session)
         ? [

@@ -72,7 +72,8 @@ export const sections: {
     name: '常规',
     group: '本机',
     icon: Settings,
-    words: '窗口 托盘 后台 启动 普通会话 文件夹 审批 绕过权限 消息 排队 追加 引导',
+    words:
+      '窗口 托盘 后台 启动 普通会话 文件夹 审批 绕过权限 消息 排队 追加 引导 对话记录 缓存 占用 清理',
   },
   {
     id: 'appearance',
@@ -513,11 +514,62 @@ function Connections() {
   );
 }
 
+function HistoryCacheCard({ client }: { client: ProxyClient }) {
+  const disk = client.disk;
+  const [stats, setStats] =
+    useState<Awaited<ReturnType<NonNullable<ProxyClient['disk']>['stats']>>>(null);
+  useEffect(() => {
+    let current = true;
+    void disk?.stats().then((value) => {
+      if (current) setStats(value);
+    });
+    return () => {
+      current = false;
+    };
+  }, [disk]);
+  if (!stats) return null;
+  const bytes = stats.bytes;
+  const size = !bytes
+    ? ''
+    : bytes < 1024 ** 2
+      ? `约 ${Math.ceil(bytes / 1024)} KB · `
+      : bytes < 1024 ** 3
+        ? `约 ${(bytes / 1024 ** 2).toFixed(1)} MB · `
+        : `约 ${(bytes / 1024 ** 3).toFixed(2)} GB · `;
+  return (
+    <>
+      <h2 className="page-heading">对话记录</h2>
+      <div className="card">
+        <Row title="本机缓存" detail="读过的记录保存在本机，再次打开时补读新增内容">
+          <span className="setting-actions">
+            <span className="setting-value">
+              {size}
+              {stats.sessions} 个会话
+            </span>
+            <button
+              type="button"
+              className="button"
+              onClick={() => {
+                client.resync();
+                void disk?.stats().then(setStats);
+              }}
+            >
+              清理
+            </button>
+          </span>
+        </Row>
+      </div>
+    </>
+  );
+}
+
 function General({
+  client,
   browser,
   workspaceRoot,
   chooseWorkspace,
 }: {
+  client: ProxyClient;
   browser: boolean;
   workspaceRoot: string;
   chooseWorkspace: (reset: boolean) => void;
@@ -571,6 +623,7 @@ function General({
           </div>
         </>
       )}
+      <HistoryCacheCard client={client} />
       <h2 className="page-heading">消息</h2>
       <div className="card">
         <div className="setting-row stat-picks">
@@ -1014,6 +1067,7 @@ export default function SettingsPage({
           <InstallAppSettings />
         ) : section === 'general' ? (
           <General
+            client={client}
             browser={browser}
             workspaceRoot={workspaceRoot}
             chooseWorkspace={chooseWorkspace}

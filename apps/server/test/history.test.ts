@@ -33,6 +33,27 @@ function reopenAsOld(made: { store: SessionStore; directory: string }) {
 const texts = (events: { payload: EventPayload }[]) =>
   events.map(({ payload }) => (payload.type === 'text.delta' ? payload.text : '')).join('');
 
+test('cached history can check its last event and fill only a missing range', (t) => {
+  const { made, session } = fixture(t);
+  const append = (text: string) =>
+    made.store.append(session.id, randomUUID(), { type: 'native.notice', text });
+  const before = append('cached');
+  const missing = append('missing');
+  const after = append('already shown');
+  const history = made.store.historyId;
+  assert.equal(made.store.holds(session.id, after.sequence, after.createdAt), true);
+  assert.equal(made.store.holds(session.id, after.sequence, '2000-01-01T00:00:00.000Z'), false);
+  assert.deepEqual(
+    made.store.history(session.id, randomUUID(), 0, after.sequence, before.sequence).events,
+    [missing],
+  );
+  made.store.close();
+  made.store = new SessionStore(made.directory);
+  assert.equal(made.store.historyId, history);
+  reopenAsOld(made);
+  assert.notEqual(made.store.historyId, history);
+});
+
 test('the last run outcome is available in the directory and survives reopening', (t) => {
   const f = fixture(t);
   for (const status of ['completed', 'cancelled', 'failed'] as const) {

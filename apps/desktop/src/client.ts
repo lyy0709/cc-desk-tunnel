@@ -11,6 +11,7 @@ import type {
   Command,
   Device,
   IdleCompaction,
+  HistoryPage,
   NativeCapabilities,
   NativeMetrics,
   ServerMessage,
@@ -20,8 +21,22 @@ import type {
   SessionOutline,
   SessionRead,
 } from '@cc-desk-tunnel/protocol';
+import { HistoryCache } from './historyCache.ts';
+import type { HeldPage, HistoryDisk, Range } from './historyCache.ts';
 
 type Response = Extract<ServerMessage, { type: 'response' }>;
+
+// The half-open sequence range covered by a page, including numbers removed by old history migrations.
+function covered(page: HistoryPage, command: NewCommand): Range {
+  if (command.type === 'session.subscribe' && page.mode === 'append')
+    return [command.afterSequence ?? 0, page.lastSequence];
+  if (command.type === 'session.history' && page.mode === 'prepend')
+    return [
+      page.hasEarlier ? page.firstSequence - 1 : (command.afterSequence ?? 0),
+      command.beforeSequence - 1,
+    ];
+  return [page.hasEarlier ? page.firstSequence - 1 : 0, page.lastSequence];
+}
 type DataMessage = Extract<
   ServerMessage,
   {
@@ -223,6 +238,8 @@ export class ProxyClient {
   streamEvents: (SessionEvent | Extract<ServerMessage, { type: 'session.fragment' }>)[] = [];
   // Event history is kept for the most recently viewed sessions only.
   cacheOrder: string[] = [];
+  disk: HistoryDisk | null = null;
+  private opening = new Map<string, Promise<void>>();
   // When something last came from each session's run, by the service's clock, for telling a run that goes on
   // from one that has been quiet for long. Readings of the context and the quota repeat through a long turn
   // and say nothing of it.
@@ -246,6 +263,7 @@ export class ProxyClient {
       parts?: string[];
       following?: ServerMessage[];
       done?: Promise<Response>;
+      command?: NewCommand;
     }
   >();
   getSnapshot = () => this.state;
@@ -324,6 +342,7 @@ export class ProxyClient {
     )
       throw new Error('浏览器只能连接当前服务。');
     this.disconnect();
+    this.disk = new HistoryCache(`history:${address.pathname}`);
     this.credentials = {
       url: address.href,
       token: '',
@@ -499,12 +518,19 @@ export class ProxyClient {
         const selectedId = message.sessions.some((session) => session.id === this.state.selectedId)
           ? this.state.selectedId
           : null;
+        const changed = this.disk?.ready && this.disk.historyId !== message.historyId;
+        if (message.historyId && this.disk) {
+          this.disk.use(message.historyId);
+          this.disk.retain(message.sessions);
+        }
+        if (changed) this.opening.clear();
         this.update({
           status: 'connected',
           connectionId: message.connectionId,
           browser: message.browser ?? null,
           sessions: message.sessions,
           selectedId,
+          ...(changed ? { events: {}, live: {}, history: {}, outlines: {}, reading: null } : {}),
           error: null,
           adapter: message.adapter,
           release: message.client?.version ?? null,
@@ -512,7 +538,7 @@ export class ProxyClient {
           update: message.update ?? null,
           model: message.model ?? null,
         });
-        if (selectedId) this.load(selectedId);
+        if (selectedId) this.present(selectedId);
       } else if (message.type === 'response') {
         const request = this.pending.get(message.requestId);
         if (!request) return;
@@ -598,6 +624,7 @@ export class ProxyClient {
       } else if (message.type === 'session.updated') {
         this.upsert(message.session);
       } else if (message.type === 'session.deleted') {
+        this.disk?.drop(message.sessionId);
         const events = { ...this.state.events };
         const live = { ...this.state.live };
         const history = { ...this.state.history };
@@ -650,22 +677,36 @@ export class ProxyClient {
           this.update({ live });
         }
         const previous = this.state.history[id];
+        const floor =
+          request.command?.type === 'session.history' ? request.command.afterSequence : 0;
+        if (message.reset) {
+          this.disk?.drop(id);
+          this.outlineReads.get(id)?.abort();
+          this.viewRead?.abort();
+          const { [id]: _old, ...outlines } = this.state.outlines;
+          this.update({ outlines, reading: null });
+        }
         const history = {
           ...(message.mode === 'prepend' && previous?.needsReload ? { needsReload: true } : {}),
           firstSequence:
             message.mode === 'append'
               ? (previous?.firstSequence ?? message.firstSequence)
-              : message.firstSequence,
+              : message.firstSequence ||
+                (message.mode === 'prepend' ? (previous?.firstSequence ?? 0) : 0),
           lastSequence:
             message.mode === 'prepend'
               ? (previous?.lastSequence ?? message.lastSequence)
               : message.lastSequence,
           hasEarlier:
-            message.mode === 'append' ? (previous?.hasEarlier ?? false) : message.hasEarlier,
+            message.mode === 'append'
+              ? (previous?.hasEarlier ?? false)
+              : message.hasEarlier || !!floor,
           loading: false,
           loadingEarlier: false,
         };
         this.merge(id, message.events, history, message.mode === 'replace');
+        if (this.disk?.ready && request.command)
+          this.disk.write(message.session, message.events, covered(message, request.command));
         if (message.mode !== 'prepend') void this.loadOutline(id);
         if (request.type === 'session.history') {
           clearTimeout(request.timer);
@@ -748,6 +789,7 @@ export class ProxyClient {
     const browser = this.credentials?.browser;
     this.credentials = null;
     this.turn++;
+    this.opening.clear();
     clearTimeout(this.retryTimer);
     this.retryTimer = undefined;
     const socket = this.socket;
@@ -825,7 +867,14 @@ export class ProxyClient {
     if (progress !== this.state.progress) this.update({ progress });
     if (moved) this.update({ live });
     for (const [id, events] of grouped) {
+      const before = this.state.history[id];
       this.merge(id, events);
+      const session = this.state.sessions.find((entry) => entry.id === id);
+      if (this.disk?.ready && session && before && !before.loading && !before.needsReload)
+        this.disk.write(session, events, [
+          before.lastSequence,
+          this.state.history[id].lastSequence,
+        ]);
       if (
         events.some(({ payload }) =>
           ['message.user', 'run.status', 'native.compact'].includes(payload.type),
@@ -893,20 +942,26 @@ export class ProxyClient {
         },
       },
     });
-    void this.request({ type: 'session.subscribe', sessionId, afterSequence }).catch(
-      (error: Error) => {
-        if (error.name === 'AbortError' || this.state.selectedId !== sessionId) return;
-        const history = this.state.history[sessionId];
-        if (history)
-          this.update({
-            error: error.message,
-            history: {
-              ...this.state.history,
-              [sessionId]: { ...history, loading: false, needsReload: true },
-            },
-          });
-      },
-    );
+    const last = this.state.events[sessionId]?.at(-1);
+    void this.request({
+      type: 'session.subscribe',
+      sessionId,
+      afterSequence,
+      ...(this.disk?.ready && afterSequence > 0 && last?.sequence === afterSequence
+        ? { afterCreatedAt: last.createdAt }
+        : {}),
+    }).catch((error: Error) => {
+      if (error.name === 'AbortError' || this.state.selectedId !== sessionId) return;
+      const history = this.state.history[sessionId];
+      if (history)
+        this.update({
+          error: error.message,
+          history: {
+            ...this.state.history,
+            [sessionId]: { ...history, loading: false, needsReload: true },
+          },
+        });
+    });
   }
   async loadEarlier(sessionId: string) {
     if (this.state.reading?.page.session.id === sessionId) {
@@ -919,10 +974,30 @@ export class ProxyClient {
       history: { ...this.state.history, [sessionId]: { ...history, loadingEarlier: true } },
     });
     try {
+      const beforeSequence = history.firstSequence;
+      const held = this.disk?.ready ? await this.disk.earlier(sessionId, beforeSequence) : null;
+      const current = this.state.history[sessionId];
+      if (!current?.loadingEarlier || current.firstSequence !== beforeSequence) return;
+      if (this.state.selectedId !== sessionId) {
+        this.update({
+          history: { ...this.state.history, [sessionId]: { ...current, loadingEarlier: false } },
+        });
+        return;
+      }
+      if (held && 'events' in held) {
+        this.merge(sessionId, held.events, {
+          ...current,
+          firstSequence: held.events[0]!.sequence,
+          hasEarlier: held.hasEarlier,
+          loadingEarlier: false,
+        });
+        return;
+      }
       await this.request({
         type: 'session.history',
         sessionId,
-        beforeSequence: history.firstSequence,
+        beforeSequence,
+        ...(held?.after ? { afterSequence: held.after } : {}),
       });
     } catch (error) {
       const current = this.state.history[sessionId];
@@ -952,7 +1027,78 @@ export class ProxyClient {
       delete outlines[evicted];
     }
     this.update({ selectedId: sessionId, events, live, history, outlines, reading: null });
-    if (this.state.status === 'connected') this.load(sessionId);
+    this.present(sessionId);
+  }
+
+  private cachePage(sessionId: string, page: HeldPage, replace: boolean) {
+    this.merge(
+      sessionId,
+      page.events,
+      {
+        firstSequence: page.events[0]!.sequence,
+        lastSequence: replace
+          ? page.events.at(-1)!.sequence
+          : this.state.history[sessionId].lastSequence,
+        hasEarlier: page.hasEarlier,
+        loading: false,
+        loadingEarlier: false,
+      },
+      replace,
+    );
+  }
+
+  private present(sessionId: string) {
+    if (this.opening.has(sessionId)) return;
+    const disk = this.disk;
+    if (this.state.history[sessionId] || !disk?.ready) {
+      if (this.state.status === 'connected') this.load(sessionId);
+      return;
+    }
+    const reading: HistoryState = {
+      firstSequence: 0,
+      lastSequence: 0,
+      hasEarlier: false,
+      loading: true,
+      loadingEarlier: false,
+    };
+    this.update({ history: { ...this.state.history, [sessionId]: reading } });
+    const request = disk.latest(sessionId).then((page) => {
+      if (this.opening.get(sessionId) !== request) return;
+      this.opening.delete(sessionId);
+      if (this.state.history[sessionId] !== reading) return;
+      if (page?.events.length) this.cachePage(sessionId, page, true);
+      else {
+        const { [sessionId]: _empty, ...history } = this.state.history;
+        this.update({ history });
+      }
+      if (this.state.status === 'connected' && this.state.selectedId === sessionId)
+        this.load(sessionId);
+    });
+    this.opening.set(sessionId, request);
+  }
+
+  resync(sessionId?: string) {
+    const selected = this.state.selectedId;
+    this.flushStream();
+    this.cancelHistory(sessionId);
+    if (sessionId) {
+      this.opening.delete(sessionId);
+      this.disk?.drop(sessionId);
+    } else {
+      this.opening.clear();
+      this.disk?.clear();
+    }
+    const keep = <T>(map: Record<string, T>) =>
+      sessionId ? Object.fromEntries(Object.entries(map).filter(([id]) => id !== sessionId)) : {};
+    if (!sessionId || selected === sessionId) this.viewRead?.abort();
+    this.update({
+      events: keep(this.state.events),
+      live: keep(this.state.live),
+      history: keep(this.state.history),
+      outlines: keep(this.state.outlines),
+      ...(!sessionId || selected === sessionId ? { reading: null } : {}),
+    });
+    if (selected && (!sessionId || selected === sessionId)) this.select(selected);
   }
 
   async loadOutline(sessionId: string) {
@@ -1123,6 +1269,7 @@ export class ProxyClient {
         reject,
         timer: setTimeout(expire, wait),
         type: command.type,
+        command,
         sessionId: 'sessionId' in command ? command.sessionId : undefined,
         renew: () => {
           clearTimeout(request.timer);
@@ -1151,6 +1298,8 @@ export class ProxyClient {
     }
   }
   async waitForHistory(sessionId: string) {
+    const opening = this.opening.get(sessionId);
+    if (opening) await opening;
     await Promise.all(
       [...this.pending.values()]
         .filter(

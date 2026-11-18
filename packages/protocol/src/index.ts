@@ -593,6 +593,7 @@ export const historyPageSchema = snapshotSchema.extend({
   firstSequence: z.number().int().nonnegative(),
   lastSequence: z.number().int().nonnegative(),
   hasEarlier: z.boolean(),
+  reset: z.literal(true).optional(),
 });
 export type HistoryPage = z.infer<typeof historyPageSchema>;
 
@@ -833,6 +834,7 @@ export const commandSchema = z.discriminatedUnion('type', [
       ...request,
       sessionId: id,
       afterSequence: z.number().int().nonnegative().default(0),
+      afterCreatedAt: timestamp.optional(),
     })
     .strict(),
   z
@@ -841,6 +843,7 @@ export const commandSchema = z.discriminatedUnion('type', [
       ...request,
       sessionId: id,
       beforeSequence: z.number().int().positive(),
+      afterSequence: z.number().int().nonnegative().optional(),
     })
     .strict(),
   z
@@ -1014,6 +1017,7 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     // The newest Windows installer the service holds, for clients that want to upgrade themselves.
     client: installerSchema.optional(),
     sessions: z.array(sessionSchema),
+    historyId: id.optional(),
     browser: z.object({ sessionId: id, serverDeviceId: id, selfSigned: z.boolean() }).optional(),
   }),
   z.object({
