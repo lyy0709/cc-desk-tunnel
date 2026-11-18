@@ -8,7 +8,12 @@ import { screenshots } from './helpers.ts';
 
 async function open(
   page: Page,
-  options: { desktop?: boolean; running?: boolean; reconnect?: boolean } = {},
+  options: {
+    desktop?: boolean;
+    running?: boolean;
+    reconnect?: boolean;
+    startOnSend?: boolean;
+  } = {},
 ) {
   const desktop = options.desktop !== false;
   const device = { id: randomUUID(), name: '本机 Mac', platform: 'darwin' as const };
@@ -62,7 +67,47 @@ async function open(
         added: 2,
         removed: 1,
       });
+      const listeners = new Set<(id: string, summary: unknown) => void>();
+      const counts = new Map<string, number>();
+      const finished = new Set<string>();
+      (window as any).changeLines = (lines: number) => {
+        const id = (window as any).latestTurn;
+        counts.set(id, lines);
+        for (const listener of listeners)
+          listener(id, { added: lines, removed: 0, count: lines ? 1 : 0 });
+      };
       (window as any).desktop = {
+        startTurnChanges: async (id: string) => {
+          (window as any).latestTurn = id;
+          counts.set(id, 0);
+          if ((window as any).holdTurn)
+            await new Promise<void>((resolve) => {
+              (window as any).readyTurn = resolve;
+            });
+        },
+        finishTurnChanges: async (id: string) => {
+          finished.add(id);
+          for (const listener of listeners) listener(id, {});
+        },
+        refreshTurnChanges: empty,
+        releaseTurnChanges: empty,
+        onTurnChanges: (fn: (id: string, summary: unknown) => void) => {
+          listeners.add(fn);
+          return () => listeners.delete(fn);
+        },
+        turnFiles: async (id: string) => ({
+          root: '/fixtures/项目',
+          branch: null,
+          baselineAt: '2026-11-17T00:00:00Z',
+          finished: finished.has(id),
+          files: counts.get(id)
+            ? [{ ...file('/fixtures/项目', 'live.ts'), added: counts.get(id), removed: 0 }]
+            : [],
+        }),
+        turnDiff: async (id: string) => ({
+          kind: 'text',
+          patch: '@@ -0,0 +1,1 @@\n+turn-lines-' + counts.get(id) + '\n',
+        }),
         dev: true,
         platform: 'darwin',
         boot: { connection: '', shared: { connections: [], busy: [] } },
@@ -89,9 +134,18 @@ async function open(
           calls.push(['branch', directory]);
           return 'main';
         },
-        gitChanges: async (directory: string, scope: string) => {
+        projectChanges: async (directory: string, scope: string, reset?: boolean) => {
           calls.push(['changes', directory, scope]);
           if ((window as any).listError) throw new Error('读取 Git 失败：fixture');
+          if ((window as any).snapshotProject) {
+            if (reset) (window as any).snapshotReset = true;
+            return {
+              root: directory,
+              branch: null,
+              baselineAt: '2026-11-17T00:00:00Z',
+              files: (window as any).snapshotReset ? [] : [file(directory, 'local.txt')],
+            };
+          }
           return {
             root: directory,
             branch: 'main',
@@ -106,6 +160,7 @@ async function open(
                   ],
           };
         },
+        projectDiff: async () => ({ kind: 'text', patch: '@@ -1,1 +1,1 @@\n-before\n+after\n' }),
         gitDiff: async (directory: string, scope: string, name: string) => {
           calls.push(['diff', directory, scope, name]);
           if ((window as any).holdDiff)
@@ -222,6 +277,10 @@ async function open(
         session.permissionMode = message.permissionMode;
         send({ type: 'session.updated', session });
       }
+      if (message.type === 'message.send' && options.startOnSend && !session.activeRun) {
+        session.activeRun = { id: runId, connectionId, status: 'running' };
+        send({ type: 'session.updated', session });
+      }
       if (message.requestId) send({ type: 'response', requestId: message.requestId, ok: true });
     });
   });
@@ -280,12 +339,13 @@ test('local changes are readable, stay local, preserve conversation scroll, and 
   const before = await page.locator('.conversation').evaluate((node) => node.scrollTop);
   const count = fixture.requests.length;
   await page.getByRole('button', { name: '查看改动', exact: true }).click();
-  const panel = page.getByRole('complementary', { name: '当前仓库改动' });
+  const panel = page.getByRole('complementary', { name: '项目改动' });
   await expect(panel).toContainText('LOCAL_ONLY_/fixtures/项目');
-  await expect(panel.getByRole('tab', { name: '未暂存3' })).toHaveAttribute(
-    'aria-selected',
-    'true',
-  );
+  const scope = panel.getByRole('combobox', { name: '改动范围' });
+  await expect(scope).toHaveValue('unstaged');
+  const summary = panel.locator('.changes-comparison');
+  await expect(summary.locator('ins')).toHaveText('+4');
+  await expect(summary.locator('del')).toHaveText('−2');
   await panel.getByRole('button', { name: '在编辑器中打开第 1 行', exact: true }).first().click();
   await expect
     .poll(() =>
@@ -309,8 +369,10 @@ test('local changes are readable, stay local, preserve conversation scroll, and 
   await page.screenshot({ path: resolve(screenshots, 'changes-light.png') });
   await page.evaluate(() => (document.documentElement.dataset.theme = 'dark'));
   await page.screenshot({ path: resolve(screenshots, 'changes-dark.png') });
-  await panel.getByRole('tab', { name: '已暂存1' }).click();
+  await scope.selectOption('staged');
   await expect(panel).toContainText('staged.ts');
+  await expect(summary.locator('ins')).toHaveText('+2');
+  await expect(summary.locator('del')).toHaveText('−1');
   await expect(panel).toContainText('存在未暂存修改，点击行号仅打开文件');
   await panel.locator('.diff-line.added button').first().click();
   await expect
@@ -329,7 +391,7 @@ test('narrow review uses the existing dialog and long lines stay inside it', asy
   await open(page);
   await page.setViewportSize({ width: 620, height: 850 });
   await page.getByRole('button', { name: '查看改动', exact: true }).click();
-  const dialog = page.getByRole('dialog', { name: '当前仓库改动' });
+  const dialog = page.getByRole('dialog', { name: '项目改动' });
   await expect(dialog).toContainText('LOCAL_ONLY');
   expect(await dialog.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
@@ -348,15 +410,15 @@ test('late diffs cannot cross project or scope boundaries and read failures are 
   });
   await page.getByRole('button', { name: '查看改动', exact: true }).click();
   await expect.poll(() => page.evaluate(() => !!(window as any).finishDiff)).toBe(true);
-  await page.getByRole('tab', { name: '已暂存1' }).click();
+  await page.getByRole('combobox', { name: '改动范围' }).selectOption('staged');
   await page.evaluate(() => {
     (window as any).holdDiff = false;
     (window as any).finishDiff({ kind: 'text', patch: '+OLD_SCOPE' });
   });
   await fixture.select(fixture.other.title);
-  await expect(page.getByRole('complementary', { name: '当前仓库改动' })).toHaveCount(0);
+  await expect(page.getByRole('complementary', { name: '项目改动' })).toHaveCount(0);
   await page.getByRole('button', { name: '查看改动', exact: true }).click();
-  await expect(page.getByRole('complementary', { name: '当前仓库改动' })).toContainText(
+  await expect(page.getByRole('complementary', { name: '项目改动' })).toContainText(
     'LOCAL_ONLY_/fixtures/另一个项目',
   );
   await expect(page.locator('body')).not.toContainText('OLD_SCOPE');
@@ -493,4 +555,80 @@ test('browser local commands keep native review and do not send while composing 
     1,
   );
   expect(fixture.requests.some((message) => message.type === 'message.send')).toBe(false);
+});
+
+test('turn pill follows net lines while an open panel keeps its completed turn', async ({
+  page,
+}) => {
+  const fixture = await open(page, { running: true });
+  const pill = page.locator('.turn-changes-pill');
+  await expect(pill).toHaveCount(0);
+  const before = await page.locator('.composer-context').boundingBox();
+  await page.evaluate(() => (window as any).changeLines(3));
+  await expect(pill).toContainText('+3');
+  await expect(pill).toHaveCSS('position', 'absolute');
+  const after = await page.locator('.composer-context').boundingBox();
+  expect(after).toEqual(before);
+  const bounds = (await pill.boundingBox())!;
+  expect(bounds.y + bounds.height).toBeLessThan(after!.y);
+  expect(after!.y + after!.height).toBeLessThan((await page.locator('.composer').boundingBox())!.y);
+  await pill.click();
+  const panel = page.getByRole('complementary', { name: '本轮更改' });
+  await expect(panel).toContainText('从接入时开始统计');
+  await expect(panel).toContainText('+turn-lines-3');
+  await expect(panel.locator('.changes-comparison ins')).toHaveText('+3');
+  await page.screenshot({ path: resolve(screenshots, 'changes-current-turn.png') });
+  await page.evaluate(() => (window as any).changeLines(0));
+  await expect(pill).toHaveCount(0);
+  await page.evaluate(() => (window as any).changeLines(1));
+  await expect(pill).toContainText('+1');
+  fixture.send({ type: 'session.updated', session: { ...fixture.session, activeRun: null } });
+  await expect(pill).toHaveCount(0);
+  await expect(panel.getByRole('button', { name: '刷新改动' })).toHaveCount(0);
+  await panel.getByRole('button', { name: '展开 live.ts' }).click();
+  await expect(panel).toContainText('+turn-lines-1');
+  const previous = await page.evaluate(() => (window as any).latestTurn);
+  fixture.send({
+    type: 'session.updated',
+    session: { ...fixture.session, activeRun: { ...fixture.session.activeRun, id: randomUUID() } },
+  });
+  await expect.poll(() => page.evaluate(() => (window as any).latestTurn)).not.toBe(previous);
+  await page.evaluate(() => (window as any).changeLines(2));
+  await expect(pill).toContainText('+2');
+  await expect(panel).toContainText('+turn-lines-1');
+  await pill.click();
+  await expect(panel).toContainText('+turn-lines-2');
+});
+
+test('the first message waits for its local baseline before going to the service', async ({
+  page,
+}) => {
+  const fixture = await open(page, { startOnSend: true });
+  await page.evaluate(() => ((window as any).holdTurn = true));
+  await box(page).fill('修改本机文件');
+  await page.getByRole('button', { name: '发送消息', exact: true }).click();
+  await expect.poll(() => page.evaluate(() => !!(window as any).readyTurn)).toBe(true);
+  expect(fixture.requests.some((request) => request.type === 'message.send')).toBe(false);
+  await page.evaluate(() => (window as any).readyTurn());
+  await expect
+    .poll(() => fixture.requests.filter((request) => request.type === 'message.send').length)
+    .toBe(1);
+  await page.evaluate(() => (window as any).changeLines(1));
+  await page.locator('.turn-changes-pill').click();
+  const panel = page.getByRole('complementary', { name: '本轮更改' });
+  await expect(panel).toContainText('+turn-lines-1');
+  await expect(panel).not.toContainText('从接入时开始统计');
+});
+
+test('a snapshot project can reset its baseline from the project panel', async ({ page }) => {
+  await open(page);
+  await page.evaluate(() => ((window as any).snapshotProject = true));
+  await page.getByRole('button', { name: '查看改动', exact: true }).click();
+  const panel = page.getByRole('complementary', { name: '项目改动' });
+  await expect(panel).toContainText('项目累计');
+  await expect(panel).toContainText('+after');
+  await expect(panel.getByRole('combobox', { name: '改动范围' })).toHaveCount(0);
+  page.once('dialog', (dialog) => dialog.accept());
+  await panel.getByRole('button', { name: '重设起点' }).click();
+  await expect(panel).toContainText('与起点相比没有改动');
 });

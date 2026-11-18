@@ -80,6 +80,47 @@
   min-height: 0;
   min-width: 0;
 }
+.turn-changes-pill {
+  position: absolute;
+  z-index: 3;
+  bottom: 100%;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  width: max-content;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: var(--raised);
+  box-shadow: 0 2px 8px light-dark(#1b25331a, #0004);
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.turn-changes-pill:hover,
+.turn-changes-pill[aria-expanded='true'] {
+  background: var(--hover);
+}
+.turn-changes-pill .tool-diff,
+.changes-comparison .tool-diff {
+  font-size: inherit;
+  font-variant-numeric: tabular-nums;
+}
+.turn-changes-pill .tool-diff del,
+.changes-comparison .tool-diff del {
+  color: var(--danger-text);
+}
+.changes-origin {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 16px 8px;
+  color: var(--muted);
+  font-size: 12px;
+}
 .changes-panel {
   display: flex;
   flex-direction: column;
@@ -102,22 +143,39 @@
   border-bottom: 1px solid var(--line-soft);
   justify-content: space-between;
 }
-.changes-summary > strong {
-  font-size: 13px;
+.changes-comparison {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  padding: 3px 9px;
+  border: 1px solid var(--line);
+  border-radius: 99px;
+  background: var(--surface-2);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.changes-comparison select {
+  border: 0;
+  background: transparent;
+}
+.changes-branch {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+.changes-branch > span {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.changes-summary > span:not(.toolbar-space) {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  font-size: 12px;
-  color: var(--muted);
-}
 .changes-summary svg {
   width: 15px;
   height: 15px;
+  flex-shrink: 0;
 }
 .changes-root {
   padding: 0 16px;
@@ -128,30 +186,10 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.changes-tabs {
-  display: flex;
-  gap: 16px;
-  padding: 0 16px;
-  border-bottom: 1px solid var(--line);
-}
-.changes-tabs button {
-  background: none;
-  border: 0;
-  border-bottom: 2px solid transparent;
-  padding: 8px 0;
-  color: var(--muted);
-}
-.changes-tabs button[aria-selected='true'] {
-  border-bottom-color: var(--text);
-  color: var(--text);
-}
-.changes-tabs small {
-  margin-left: 6px;
-  color: var(--muted);
-}
 .changes-files {
   flex: 1;
   min-height: 0;
+  border-top: 1px solid var(--line-soft);
   overflow: auto;
   overscroll-behavior: contain;
   overflow-anchor: none;

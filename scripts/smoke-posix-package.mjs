@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { _electron } from '@playwright/test';
@@ -46,6 +46,63 @@ try {
   await page.getByRole('heading', { name: '连接代理服务', exact: true }).waitFor();
   assert.equal(await application.evaluate(({ app }) => app.isPackaged), true);
   assert.equal(await page.evaluate(() => window.desktop.platform), process.platform);
+  // Exercise the installed preload, SQLite baseline and bundled diff libraries with Git absent.
+  const project = join(directory, 'project');
+  mkdirSync(project);
+  const oldPath = await application.evaluate(() => {
+    const old = process.env.PATH;
+    process.env.PATH = '';
+    return old;
+  });
+  try {
+    await page.evaluate((path) => window.desktop.prepareChanges(path), project);
+    writeFileSync(join(project, 'example.txt'), 'first line\n');
+    const changes = await page.evaluate(
+      (path) => window.desktop.projectChanges(path, 'unstaged'),
+      project,
+    );
+    assert.equal(changes.files[0].added, 1);
+    const patch = await page.evaluate(
+      (root) => window.desktop.projectDiff(root, 'example.txt'),
+      changes.root,
+    );
+    assert.match(patch.patch, /\+first line/);
+    const turn = 'package-smoke-turn';
+    await page.evaluate(([id, path]) => window.desktop.startTurnChanges(id, path), [turn, project]);
+    await page.evaluate((id) => window.desktop.turnFiles(id), turn);
+    writeFileSync(join(project, 'example.txt'), 'first line\nturn line\n');
+    // The next turn may be requested while the previous turn's final scan is in flight.
+    const next = 'package-smoke-next';
+    await page.evaluate(
+      ([id, next, path]) =>
+        Promise.all([
+          window.desktop.finishTurnChanges(id),
+          window.desktop.startTurnChanges(next, path),
+        ]),
+      [turn, next, project],
+    );
+    writeFileSync(join(project, 'example.txt'), 'first line\nturn line\nnext line\n');
+    const result = await page.evaluate((id) => window.desktop.turnFiles(id), turn);
+    assert.equal(result.finished, true);
+    const finalPatch = await page.evaluate(
+      (id) => window.desktop.turnDiff(id, 'example.txt'),
+      turn,
+    );
+    assert.match(finalPatch.patch, /\+turn line/);
+    assert.doesNotMatch(finalPatch.patch, /next line/);
+    await page.evaluate(
+      ([id, next]) =>
+        Promise.all([
+          window.desktop.releaseTurnChanges(id),
+          window.desktop.finishTurnChanges(next),
+        ]),
+      [turn, next],
+    );
+  } finally {
+    await application.evaluate((_, path) => {
+      process.env.PATH = path;
+    }, oldPath);
+  }
   execFileSync(
     executable,
     [

@@ -32,6 +32,7 @@ import type {
 } from '@cc-desk-tunnel/protocol';
 import type { FileAttachment } from '@cc-desk-tunnel/protocol';
 import type { Draft } from './drafts.ts';
+import type { ChangeSummary } from './turnChanges.ts';
 import { changeDraftText, insertDraftFiles } from './drafts.ts';
 import Attachments from './Attachments.tsx';
 import { folderName } from './paths.ts';
@@ -83,6 +84,7 @@ export default function Composer({
   native,
   localProject,
   showChanges,
+  turnChanges,
   localActions,
   modeDisplay,
   connected,
@@ -121,6 +123,7 @@ export default function Composer({
   native: boolean;
   localProject: boolean;
   showChanges: () => void;
+  turnChanges?: { summary: ChangeSummary; expanded: boolean; open: () => void };
   localActions: { name: string; title: string; detail: string; reason: string }[];
   modeDisplay: { label: string; detail: string };
   connected: boolean;
@@ -410,6 +413,25 @@ export default function Composer({
             </button>
           ))}
         </div>
+      )}
+      {!!turnChanges?.summary.count && (
+        <button
+          type="button"
+          className="turn-changes-pill"
+          title={turnChanges.summary.error ?? '查看本轮运行期间的项目目录变化'}
+          aria-expanded={turnChanges.expanded}
+          onClick={turnChanges.open}
+        >
+          更改
+          {turnChanges.summary.added || turnChanges.summary.removed ? (
+            <span className="tool-diff">
+              <ins>+{turnChanges.summary.added}</ins>
+              <del>−{turnChanges.summary.removed}</del>
+            </span>
+          ) : (
+            ` · ${turnChanges.summary.count} 个文件`
+          )}
+        </button>
       )}
       <div className="composer-context">
         <button

@@ -36,9 +36,13 @@ function git(directory, args, maxBuffer = 8 * previewBytes, config = []) {
       },
       (error, stdout, stderr) => {
         if (!error) return resolve(stdout);
-        if (error.code === 'ENOENT') error.message = '找不到 Git，请先在本机安装 Git 并加入 PATH。';
-        else if (/not a git repository/i.test(stderr)) error.message = '这个目录不在 Git 仓库中。';
-        else if (error.killed) error.message = '读取 Git 超时，请稍后刷新。';
+        if (error.code === 'ENOENT') {
+          error.code = 'NO_GIT';
+          error.message = '找不到 Git，请先在本机安装 Git 并加入 PATH。';
+        } else if (/^fatal: not a git repository(?: |:)/i.test(stderr)) {
+          error.code = 'NOT_REPOSITORY';
+          error.message = '这个目录不在 Git 仓库中。';
+        } else if (error.killed) error.message = '读取 Git 超时，请稍后刷新。';
         else error.message = `读取 Git 失败：${stderr.trim() || error.message}`;
         reject(error);
       },
@@ -267,4 +271,4 @@ async function gitDiff(directory, scope, name) {
   return { kind: /^(?:Binary files |GIT binary patch)/m.test(patch) ? 'binary' : 'text', patch };
 }
 
-module.exports = { gitChanges, gitDiff };
+module.exports = { gitChanges, gitDiff, repository, previewBytes, previewLines };

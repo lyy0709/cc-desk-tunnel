@@ -70,6 +70,18 @@ test('packaged exe runs without development dependencies and reclaims bundled re
     expect(await page.evaluate((path) => window.desktop!.gitBranch(path), project)).toBe(
       'package-smoke',
     );
+    await page.evaluate((path) => window.desktop!.prepareChanges(path), project);
+    writeFileSync(join(project, 'example.txt'), 'first line\n');
+    const changes = await page.evaluate(
+      (path) => window.desktop!.projectChanges(path, 'unstaged'),
+      project,
+    );
+    expect(changes.files.find((file) => file.path === 'example.txt')?.added).toBe(1);
+    const patch = await page.evaluate(
+      (root) => window.desktop!.projectDiff(root, 'example.txt'),
+      changes.root,
+    );
+    expect(patch.patch).toContain('+first line');
     // Loaded only when an upgrade is fetched from the release page, so its absence would not show otherwise.
     expect(
       await application.evaluate(({ app }) => {
