@@ -97,6 +97,39 @@ test('setup-token uses the official command, extracts its successful output and 
   await completed;
   assert.deepEqual(result, { succeeded: true, token: 'sk-ant-oat01-test' });
 
+  // A command that shows the token but does not end is ended, and the token kept.
+  let held: { succeeded: boolean; token?: string } | undefined;
+  const holding = new NativeLogin(
+    'claude',
+    (succeeded, token) => {
+      held = { succeeded, token };
+    },
+    () => {},
+    { method: 'setup-token', spawn, tokenGraceMs: 50 },
+  );
+  data('https://claude.ai/oauth/authorize?fixture=true\r\n');
+  await holding.url;
+  holding.submit('code#state');
+  data(
+    'Your OAuth token (valid for 1 year):\r\n\r\n sk-ant-oat01-held\r\n\r\n Store this token securely.\r\n',
+  );
+  await delay(300);
+  assert.deepEqual(held, { succeeded: true, token: 'sk-ant-oat01-held' });
+
+  const cancelled = Promise.withResolvers<{ succeeded: boolean; token?: string }>();
+  const cancelling = new NativeLogin(
+    'claude',
+    (succeeded, token) => cancelled.resolve({ succeeded, token }),
+    () => {},
+    { method: 'setup-token', spawn },
+  );
+  data('https://claude.ai/oauth/authorize?fixture=true\r\n');
+  await cancelling.url;
+  cancelling.submit('code#state');
+  data('Your OAuth token:\r\n sk-ant-oat01-cancelled\r\n');
+  cancelling.cancel();
+  assert.deepEqual(await cancelled.promise, { succeeded: false, token: undefined });
+
   const failure = new NativeLogin(
     'claude',
     (succeeded) => {
