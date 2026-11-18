@@ -30,7 +30,8 @@ const {
 } = require('node:fs');
 const { copyFile, mkdtemp, readFile, stat, writeFile } = require('node:fs/promises');
 const { gitBranch } = require('./git-branch.cjs');
-const { gitChanges, gitDiff } = require('./git-changes.cjs');
+const { ProjectChanges, TurnChanges } = require('./local-changes.cjs');
+const { gitDiff } = require('./git-changes.cjs');
 const fileLinks = require('./file-links.cjs');
 const { asOnDisk } = require('./disk-path.cjs');
 const { openLog } = require('./client-log.cjs');
@@ -204,7 +205,88 @@ handle('devtools:open', (event) => {
   event.sender.openDevTools({ mode: 'detach' });
 });
 handle('git:branch', (_event, directory) => gitBranch(directory));
-handle('git:changes', (_event, directory, scope) => gitChanges(directory, scope));
+const projectsReview = new ProjectChanges(path.join(base, 'change-baselines'));
+handle('changes:prepare', (_event, directory) => projectsReview.prepare(directory));
+handle('changes:project', (_event, directory, scope, reset) =>
+  projectsReview.list(directory, scope, reset),
+);
+handle('changes:project-diff', (_event, root, name) => {
+  if (projectsReview.latest?.root !== root) throw new Error('比较目录已变化，请刷新。');
+  return projectsReview.latest.diff(name);
+});
+
+// Each window has its own main process. A finished comparison lives only while its panel is open.
+const turnReviews = new Map();
+handle('changes:start', (event, id, directory) => {
+  if (turnReviews.has(id)) throw new Error('本轮比较已开始。');
+  const record = { directory, pinned: false, finished: false };
+  const notify = (turn) => {
+    if (event.sender.isDestroyed() || turnReviews.get(id) !== record) return;
+    const files = turn.comparison.changed;
+    let added = 0;
+    let removed = 0;
+    let count = 0;
+    for (const file of files.values()) {
+      if (file.status !== '!') count++;
+      added += file.added ?? 0;
+      removed += file.removed ?? 0;
+    }
+    event.sender.send('changes:updated', id, {
+      added,
+      removed,
+      count,
+      error: turn.error,
+    });
+  };
+  // A message in this directory must wait for the previous turn's final read and any
+  // initial project baseline already being taken. Their failures do not prevent the new turn.
+  const preceding = [...turnReviews.values()]
+    .filter((review) => review.directory === directory && review.finishing)
+    .map((review) => review.finishing);
+  const preparing = projectsReview.preparing.get(directory);
+  if (preparing) preceding.push(preparing);
+  record.ready = Promise.allSettled(preceding).then(() =>
+    TurnChanges.start(directory, projectsReview.storage, notify),
+  );
+  turnReviews.set(id, record);
+  return record.ready.then(
+    () => undefined,
+    (error) => {
+      turnReviews.delete(id);
+      throw error;
+    },
+  );
+});
+handle('changes:refresh', async (_event, id) => (await turnReviews.get(id)?.ready)?.refresh());
+handle('changes:finish', (_event, id) => {
+  const record = turnReviews.get(id);
+  if (!record) return;
+  record.finishing ??= record.ready
+    .then((turn) => turn.finish())
+    .finally(() => {
+      record.finished = true;
+      if (!record.pinned && turnReviews.get(id) === record) turnReviews.delete(id);
+    });
+  return record.finishing;
+});
+handle('changes:turn-files', async (_event, id) => {
+  const record = turnReviews.get(id);
+  if (!record) throw new Error('本轮更改已清除。');
+  record.pinned = true;
+  const turn = await record.ready;
+  return { ...turn.comparison.result(), notice: turn.error, finished: !!turn.ended };
+});
+handle('changes:turn-diff', async (_event, id, name) => {
+  const turn = await turnReviews.get(id)?.ready;
+  if (!turn) throw new Error('本轮更改已清除。');
+  return turn.comparison.diff(name);
+});
+handle('changes:release', (_event, id) => {
+  const record = turnReviews.get(id);
+  if (!record) return;
+  record.pinned = false;
+  if (record.finished) turnReviews.delete(id);
+});
 handle('git:diff', (_event, directory, scope, file) => gitDiff(directory, scope, file));
 handle('clipboard:write', (_event, text) => {
   if (typeof text !== 'string') throw new Error('Expected clipboard text');
@@ -894,6 +976,13 @@ app.whenReady().then(() => {
     ]).popup({ window });
   });
   window.webContents.on('will-navigate', (event) => event.preventDefault());
+  const releaseReviews = () => {
+    for (const { ready } of turnReviews.values())
+      void ready.then((turn) => turn.finish()).catch((error) => log(error.message));
+    turnReviews.clear();
+  };
+  window.webContents.on('did-navigate', releaseReviews);
+  window.webContents.on('render-process-gone', releaseReviews);
   window.loadFile(path.join(__dirname, '../dist/index.html'));
 
   // Long tasks keep running with the window closed: closing hides it, and the tray icon brings it back or quits.

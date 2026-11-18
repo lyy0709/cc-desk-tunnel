@@ -101,8 +101,9 @@ export async function stageDesktop(root, app, { description, files = [], depende
     ))
       if (!name.startsWith('../vendor') && !existsSync(join(app, 'electron', name)))
         throw new Error(`${file} loads ${name}, which is not in the package.`);
+  const runtime = [...dependencies, 'diff', 'ignore'];
   const versions = Object.fromEntries(
-    dependencies.map((name) => [name, copyDependency(root, app, name)]),
+    runtime.map((name) => [name, copyDependency(root, app, name)]),
   );
   // The staging manifest names only what was copied beside the bundle: the bridge and protocol are in it.
   writeFileSync(
@@ -118,7 +119,7 @@ export async function stageDesktop(root, app, { description, files = [], depende
         private: true,
         main: 'electron/main.cjs',
         type: 'module',
-        ...(dependencies.length ? { dependencies: versions } : {}),
+        dependencies: versions,
       },
       null,
       2,

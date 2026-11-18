@@ -38,15 +38,30 @@ declare global {
       saveImage: (type: string, bytes: Uint8Array) => Promise<string>;
       // The branch a project's working tree is on, or null outside a repository.
       gitBranch: (path: string) => Promise<string | null>;
-      gitChanges: (
+      prepareChanges: (directory: string) => Promise<void>;
+      projectDiff: (
+        directory: string,
+        file: string,
+      ) => Promise<import('./ChangesPanel.tsx').FileDiff>;
+      startTurnChanges: (id: string, directory: string) => Promise<void>;
+      refreshTurnChanges: (id: string) => Promise<void>;
+      finishTurnChanges: (id: string) => Promise<void>;
+      turnFiles: (id: string) => Promise<import('./ChangesPanel.tsx').Changes>;
+      turnDiff: (id: string, file: string) => Promise<import('./ChangesPanel.tsx').FileDiff>;
+      releaseTurnChanges: (id: string) => Promise<void>;
+      onTurnChanges: (
+        callback: (id: string, summary: import('./turnChanges.ts').ChangeSummary) => void,
+      ) => () => void;
+      projectChanges: (
         directory: string,
         scope: import('./ChangesPanel.tsx').GitScope,
-      ) => Promise<import('./ChangesPanel.tsx').GitChanges>;
+        reset?: boolean,
+      ) => Promise<import('./ChangesPanel.tsx').Changes>;
       gitDiff: (
         directory: string,
         scope: import('./ChangesPanel.tsx').GitScope,
         file: string,
-      ) => Promise<import('./ChangesPanel.tsx').GitDiff>;
+      ) => Promise<import('./ChangesPanel.tsx').FileDiff>;
       copyText: (text: string) => Promise<void>;
       openExternal: (url: string) => Promise<void>;
       openWeb: (url: string) => Promise<void>;

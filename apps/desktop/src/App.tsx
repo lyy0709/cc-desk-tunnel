@@ -50,6 +50,7 @@ import { hostCapabilities } from './host-capabilities.ts';
 import AccountPanel from './AccountPanel.tsx';
 import { ProxyClient, RequestInterruptedError } from './client.ts';
 import Composer from './Composer.tsx';
+import { useTurnChanges, type TurnReview } from './turnChanges.ts';
 import ChangesPanel from './ChangesPanel.tsx';
 import { localCommand } from './commands.ts';
 import { sessionRuntime } from './RunStatus.tsx';
@@ -178,13 +179,17 @@ export function App({
   const [findRequest, setFindRequest] = useState(0);
   const [statusRequest, setStatusRequest] = useState(0);
   const [changesProject, setChangesProject] = useState<string | null>(null);
+  const [turnReview, setTurnReview] = useState<TurnReview>();
+  const changes = useTurnChanges(client, setError);
   const workspace = useRef<HTMLElement>(null);
   const closeChanges = useCallback(() => {
+    setTurnReview(undefined);
     setChangesProject(null);
-    requestAnimationFrame(() =>
-      document.querySelector<HTMLButtonElement>('.changes-trigger')?.focus(),
-    );
-  }, []);
+    requestAnimationFrame(() => {
+      const pill = turnReview && document.querySelector<HTMLButtonElement>('.turn-changes-pill');
+      (pill || document.querySelector<HTMLButtonElement>('.changes-trigger'))?.focus();
+    });
+  }, [turnReview]);
   // Which of this computer's settings is open on the login page.
   const [localSettings, setLocalSettings] = useState<Section | null>(null);
   useEffect(() => {
@@ -349,8 +354,31 @@ export function App({
   }, [localProject]);
   const canReadProject = !!localProject && existingProject === localProject;
   const showChanges = () => {
+    setTurnReview(undefined);
     if (canReadProject) setChangesProject(localProject);
   };
+  useEffect(() => {
+    if (!localProject || !canReadProject) return;
+    let current = true;
+    void window.desktop?.prepareChanges?.(localProject).catch((error: Error) => {
+      if (current) setError(error.message);
+    });
+    return () => {
+      current = false;
+    };
+  }, [localProject, canReadProject]);
+  useEffect(() => {
+    setTurnReview(undefined);
+  }, [selected?.id, localProject, place.page]);
+  const shownTurn =
+    turnReview?.sessionId === selected?.id && turnReview?.directory === localProject
+      ? turnReview
+      : undefined;
+  const trackedTurn = selected && changes.live[selected.id];
+  const currentTurn =
+    trackedTurn && trackedTurn.directory === localProject && runWorking(selected?.activeRun ?? null)
+      ? trackedTurn
+      : undefined;
   const sessions = state.sessions.filter((session) => onThis(session));
   const elsewhere = state.sessions.filter((session) => !onThis(session));
   const away = !!selected && !onThis(selected);
@@ -1054,7 +1082,7 @@ export function App({
           model: task.model ?? session.model,
           effort: task.effort ?? session.effort,
         });
-      await client.request({
+      await changes.send({
         type: 'message.send',
         sessionId: session.id,
         text: taskMessage(task, due),
@@ -1125,7 +1153,7 @@ export function App({
       ),
     }));
     try {
-      await client.request({
+      await changes.send({
         type: 'message.send',
         sessionId,
         text: message.text,
@@ -1225,7 +1253,7 @@ export function App({
         setDraft(sessionId, command.body);
         if (!command.body) return;
       }
-      await client.request({
+      await changes.send({
         type: 'message.send',
         sessionId,
         text: command?.body ?? text,
@@ -1241,7 +1269,7 @@ export function App({
     if (!selected) return;
     const sessionId = selected.id;
     void act(async () => {
-      await client.request({ type: 'run.continue', sessionId });
+      await changes.send({ type: 'run.continue', sessionId });
     });
   }
   async function compact() {
@@ -2017,7 +2045,7 @@ export function App({
                   </div>
                 )}
                 <Conversation
-                  reviewing={!!changesProject && changesProject === localProject && canReadProject}
+                  reviewing={!!shownTurn || (!!changesProject && changesProject === localProject)}
                   findRequest={findRequest}
                   session={selected}
                   here={!!selected && onThis(selected)}
@@ -2232,6 +2260,16 @@ export function App({
                     native={nativeMode}
                     localProject={canReadProject}
                     showChanges={showChanges}
+                    turnChanges={
+                      currentTurn && {
+                        summary: currentTurn.summary,
+                        expanded: shownTurn?.id === currentTurn.id,
+                        open: () => {
+                          setChangesProject(null);
+                          setTurnReview(currentTurn);
+                        },
+                      }
+                    }
                     localActions={localActions}
                     modeDisplay={{ label: runtime.modeLabel, detail: runtime.modeDetail }}
                     connected={connected}
@@ -2269,15 +2307,15 @@ export function App({
                   />
                 )}
               </div>
-              {changesProject &&
-                changesProject === localProject &&
-                canReadProject &&
+              {localProject &&
+                (shownTurn || changesProject === localProject) &&
                 workspace.current && (
                   <ChangesPanel
-                    key={localProject}
+                    key={shownTurn?.id ?? localProject}
+                    turn={shownTurn}
                     directory={localProject}
                     workspace={workspace.current}
-                    running={!!selected?.activeRun}
+                    running={runWorking(selected?.activeRun ?? null)}
                     close={closeChanges}
                   />
                 )}

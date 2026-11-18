@@ -27,7 +27,21 @@ contextBridge.exposeInMainWorld('desktop', {
   openLogs: () => ipcRenderer.invoke('log:open'),
   openDevTools: () => ipcRenderer.invoke('devtools:open'),
   gitBranch: (directory) => ipcRenderer.invoke('git:branch', directory),
-  gitChanges: (directory, scope) => ipcRenderer.invoke('git:changes', directory, scope),
+  projectChanges: (directory, scope, reset) =>
+    ipcRenderer.invoke('changes:project', directory, scope, reset),
+  prepareChanges: (directory) => ipcRenderer.invoke('changes:prepare', directory),
+  projectDiff: (directory, file) => ipcRenderer.invoke('changes:project-diff', directory, file),
+  startTurnChanges: (id, directory) => ipcRenderer.invoke('changes:start', id, directory),
+  refreshTurnChanges: (id) => ipcRenderer.invoke('changes:refresh', id),
+  finishTurnChanges: (id) => ipcRenderer.invoke('changes:finish', id),
+  turnFiles: (id) => ipcRenderer.invoke('changes:turn-files', id),
+  turnDiff: (id, file) => ipcRenderer.invoke('changes:turn-diff', id, file),
+  releaseTurnChanges: (id) => ipcRenderer.invoke('changes:release', id),
+  onTurnChanges: (callback) => {
+    const listener = (_event, id, summary) => callback(id, summary);
+    ipcRenderer.on('changes:updated', listener);
+    return () => ipcRenderer.removeListener('changes:updated', listener);
+  },
   gitDiff: (directory, scope, file) => ipcRenderer.invoke('git:diff', directory, scope, file),
   copyText: (text) => ipcRenderer.invoke('clipboard:write', text),
   openExternal: (url) => ipcRenderer.invoke('external:open', url),
