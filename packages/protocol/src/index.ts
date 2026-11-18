@@ -4,7 +4,7 @@ import { webCertificateStateSchema } from './web-certificate.ts';
 export * from './web.ts';
 export * from './web-certificate.ts';
 
-export const PROTOCOL_VERSION = 31;
+export const PROTOCOL_VERSION = 32;
 // The release each protocol version began with, from 0.2.4 on: a client newer than its service signs in with
 // the service's number to have it upgrade (see the README). A new number adds its line here.
 export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
@@ -30,6 +30,7 @@ export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
   '0.3.19': 29,
   '0.3.20': 30,
   '0.3.21': 31,
+  '0.3.23': 32,
 };
 export const MAX_FRAME_BYTES = 256 * 1024;
 // The longest global instructions edited here, in characters; it keeps a frame of them within MAX_FRAME_BYTES.
@@ -164,6 +165,9 @@ export const nativeSettingsSchema = z.object({
   // anything else as unset.
   attribution: z.literal(false).nullable(),
   includeGitInstructions: toggle,
+  // The Artifact tool, which publishes pages to claude.ai. The CLI turns it on by default once it is available to
+  // the account; off in the user's settings keeps it off.
+  enableArtifact: toggle,
   // Not a key of its own in the file: ENABLE_TOOL_SEARCH under `env`. Tools are then described to the model
   // only when it looks for them, instead of all of them with every request.
   toolSearch: toggle,

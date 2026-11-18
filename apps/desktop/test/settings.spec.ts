@@ -27,6 +27,7 @@ test('Claude Code settings load from the service and save each change at once', 
     bashOutputMaxChars: 45_000,
     attribution: null,
     includeGitInstructions: null,
+    enableArtifact: null,
     toolSearch: null,
     denyInsteadOfPrompting: null,
     blockWritesOutsideWorkingDirectories: null,
@@ -80,6 +81,7 @@ test('Claude Code settings load from the service and save each change at once', 
   // A value set by hand that is not among the choices is still shown.
   await expect(panel.getByLabel('命令输出上限', { exact: true })).toHaveValue('45000');
   await panel.getByLabel('提交与 PR 的署名', { exact: true }).selectOption('false');
+  await panel.getByLabel('Artifact 网页', { exact: true }).selectOption('false');
   await panel.getByLabel('备用模型', { exact: true }).fill('sonnet， haiku');
   await panel.getByLabel('备用模型', { exact: true }).press('Enter');
   await expect(panel.getByLabel('备用模型', { exact: true })).toHaveValue('sonnet, haiku');
@@ -94,6 +96,7 @@ test('Claude Code settings load from the service and save each change at once', 
       { fastMode: null },
       { language: 'chinese' },
       { attribution: false },
+      { enableArtifact: false },
       { fallbackModel: ['sonnet', 'haiku'] },
       { askUserQuestionTimeout: '5m' },
       { fallbackModel: null },
