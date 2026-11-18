@@ -10,7 +10,12 @@ import { screenshots } from './helpers.ts';
 const webScreenshots = resolve(screenshots, 'web');
 mkdirSync(webScreenshots, { recursive: true });
 
-async function browserFixture(page: Page, authenticated = false, withHistory = false) {
+async function browserFixture(
+  page: Page,
+  authenticated = false,
+  withHistory = false,
+  { cache = false, quota = false } = {},
+) {
   let loggedIn = authenticated;
   let offline = false;
   const commands: Record<string, unknown>[] = [];
@@ -18,6 +23,9 @@ async function browserFixture(page: Page, authenticated = false, withHistory = f
   const sessionId = randomUUID();
   const serverDeviceId = randomUUID();
   const now = new Date().toISOString();
+  const historyId = cache ? randomUUID() : undefined;
+  const runId = randomUUID();
+  const messageId = randomUUID();
   const sessions: Session[] = withHistory
     ? [
         {
@@ -92,6 +100,7 @@ async function browserFixture(page: Page, authenticated = false, withHistory = f
             connectionId: randomUUID(),
             adapter: 'claude-code',
             sessions,
+            historyId,
             browser: { sessionId, serverDeviceId, selfSigned: true },
           }),
         );
@@ -102,33 +111,59 @@ async function browserFixture(page: Page, authenticated = false, withHistory = f
           }),
         );
       } else if (command.requestId) {
-        if (command.type === 'session.subscribe' || command.type === 'session.history')
+        if (command.type === 'session.subscribe' || command.type === 'session.history') {
+          const append = cache && command.afterSequence === 2;
           socket.send(
             JSON.stringify({
               type: 'session.snapshot',
               requestId: command.requestId,
               session: sessions[0],
-              mode: command.type === 'session.history' ? 'prepend' : 'replace',
-              firstSequence: 2,
+              mode: command.type === 'session.history' ? 'prepend' : append ? 'append' : 'replace',
+              firstSequence: append ? 0 : 2,
               lastSequence: 2,
-              hasEarlier: true,
+              hasEarlier: !cache,
               events:
-                command.type === 'session.history'
+                command.type === 'session.history' || append
                   ? []
                   : [
                       {
                         sessionId: sessions[0].id,
-                        runId: randomUUID(),
+                        runId,
                         sequence: 2,
                         createdAt: now,
                         payload: {
                           type: 'message.user',
-                          messageId: randomUUID(),
+                          messageId,
                           text: '阅读记录\n'.repeat(120),
                           scenario: 'chat',
                         },
                       },
                     ],
+            }),
+          );
+        }
+        if (quota && command.type === 'account.status')
+          socket.send(JSON.stringify({ type: 'account.state', loggedIn: true, login: null }));
+        if (quota && command.type === 'session.status')
+          socket.send(
+            JSON.stringify({
+              type: 'session.event',
+              event: {
+                sessionId: sessions[0].id,
+                runId,
+                sequence: 3,
+                createdAt: now,
+                payload: {
+                  type: 'native.metrics',
+                  context: null,
+                  usage: null,
+                  rateLimits: {
+                    available: true,
+                    measuredAt: now,
+                    windows: [{ name: 'five_hour', utilization: 37, resetsAt: null }],
+                  },
+                },
+              },
             }),
           );
         if (command.type === 'web.settings.update') {
@@ -155,6 +190,70 @@ async function browserFixture(page: Page, authenticated = false, withHistory = f
     },
   };
 }
+
+test('browser history resumes from IndexedDB after a reload', async ({ page }) => {
+  const fixture = await browserFixture(page, true, true, { cache: true });
+  const open = async () => {
+    await expect(page.locator('.connection-status')).toContainText('已连接');
+    const others = page.getByRole('button', { name: '展开其他设备的会话', exact: true });
+    if (await others.isVisible()) await others.click();
+    await page.locator('.session-select').filter({ hasText: '阅读测试' }).click();
+    await expect(page.locator('.message.user')).toContainText('阅读记录');
+  };
+  await open();
+  // Wait for the first write to commit before reloading the page.
+  await expect
+    .poll(() =>
+      page.evaluate(async () => {
+        const name = (await indexedDB.databases()).find((item) =>
+          item.name?.startsWith('history:'),
+        )?.name;
+        if (!name) return 0;
+        return new Promise<number>((resolve, reject) => {
+          const request = indexedDB.open(name);
+          request.onerror = () => reject(request.error);
+          request.onsuccess = () => {
+            const db = request.result;
+            const count = db.transaction('events').objectStore('events').count();
+            count.onsuccess = () => {
+              db.close();
+              resolve(count.result);
+            };
+            count.onerror = () => {
+              db.close();
+              reject(count.error);
+            };
+          };
+        });
+      }),
+    )
+    .toBe(1);
+  const sent = fixture.commands.length;
+  await page.reload();
+  await open();
+  expect(
+    fixture.commands.slice(sent).find((command) => command.type === 'session.subscribe'),
+  ).toMatchObject({ afterSequence: 2, afterCreatedAt: expect.any(String) });
+});
+
+test('Web quota primes with a normal status read and refreshes explicitly', async ({ page }) => {
+  const fixture = await browserFixture(page, true, true, { quota: true });
+  const entry = page.getByRole('button', { name: '查看订阅用量', exact: true });
+  await expect(entry).toContainText('37%');
+  expect(
+    fixture.commands.find((command) => command.type === 'session.status')?.quota,
+  ).toBeUndefined();
+  await entry.click();
+  await expect(page.getByRole('region', { name: '订阅用量' })).toContainText('37%');
+  await page.getByRole('button', { name: '刷新订阅用量', exact: true }).click();
+  await expect
+    .poll(() =>
+      fixture.commands.some(
+        (command) => command.type === 'session.status' && command.quota === true,
+      ),
+    )
+    .toBe(true);
+});
 
 test('production browser logs in with TOTP, sends no desktop identity, and exposes only browser capabilities', async ({
   page,

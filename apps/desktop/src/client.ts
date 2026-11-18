@@ -22,7 +22,8 @@ import type {
   SessionRead,
 } from '@cc-desk-tunnel/protocol';
 import { HistoryCache } from './historyCache.ts';
-import type { HeldPage, HistoryDisk, Range } from './historyCache.ts';
+import type { DesktopHistoryCache, HeldPage, HistoryDisk, Range } from './historyCache.ts';
+import { conversationOutline } from '@cc-desk-tunnel/protocol/transcript';
 
 type Response = Extract<ServerMessage, { type: 'response' }>;
 
@@ -130,11 +131,13 @@ export type HistoryState = {
   loadingEarlier: boolean;
   // Live events received after a failed snapshot must not advance a cursor past missing history.
   needsReload?: boolean;
+  cacheGap?: boolean;
 };
 export type OutlineState = { entries: SessionOutline['entries']; loading: boolean; error?: string };
 export type ReadingState = { page: SessionRead; loading: boolean };
 export type ClientState = {
   status: 'disconnected' | 'connecting' | 'connected' | 'reconnecting';
+  offline: boolean;
   connectionId: string | null;
   // The computer this client signed in as; a session's commands run on the one it is on.
   device: Device | null;
@@ -185,6 +188,7 @@ export type ConnectedDevice = Extract<ServerMessage, { type: 'devices' }>['devic
 export class ProxyClient {
   state: ClientState = {
     status: 'disconnected',
+    offline: false,
     connectionId: null,
     device: null,
     browser: null,
@@ -283,6 +287,7 @@ export class ProxyClient {
     device: Device,
     reconnect = true,
     bridge?: () => Promise<string>,
+    disk: HistoryDisk | null = null,
   ) {
     const address = new URL(url);
     if (
@@ -300,6 +305,7 @@ export class ProxyClient {
       throw new Error('当前离线原型仅连接本机环回服务。');
     if (token.trim().length < 24) throw new Error('服务凭据至少 24 个字符。');
     this.disconnect();
+    this.disk = disk;
     this.credentials = { url: address.toString(), token: token.trim(), device, reconnect, bridge };
     this.established = false;
     this.cacheOrder = [];
@@ -800,7 +806,35 @@ export class ProxyClient {
     socket?.close();
     this.rejectPending();
     this.retryAttempt = 0;
-    this.update({ status: 'disconnected', connectionId: null, setupToken: null });
+    this.update({ status: 'disconnected', offline: false, connectionId: null, setupToken: null });
+  }
+  async openOffline(disk: DesktopHistoryCache, device: Device) {
+    this.disconnect();
+    this.disk = disk;
+    const turn = this.turn;
+    const sessions = await disk.list();
+    if (this.turn !== turn) return;
+    if (!sessions.length) throw new Error('这个服务还没有可离线查看的记录。');
+    this.cacheOrder = [];
+    this.update({
+      offline: true,
+      device,
+      browser: null,
+      devices: [],
+      sessions,
+      events: {},
+      history: {},
+      outlines: {},
+      reading: null,
+      live: {},
+      selectedId: null,
+      error: null,
+      account: null,
+      metrics: null,
+      capabilities: null,
+      progress: {},
+    });
+    this.select(sessions[0].id);
   }
   private rejectPending() {
     for (const [requestId, request] of this.pending) {
@@ -811,6 +845,7 @@ export class ProxyClient {
     this.pending.clear();
   }
   private upsert(session: Session) {
+    if (this.disk?.ready) this.disk.update?.(session);
     this.update({
       sessions: [...this.state.sessions.filter((item) => item.id !== session.id), session].sort(
         (a, b) => b.updatedAt.localeCompare(a.updatedAt),
@@ -975,9 +1010,23 @@ export class ProxyClient {
     });
     try {
       const beforeSequence = history.firstSequence;
-      const held = this.disk?.ready ? await this.disk.earlier(sessionId, beforeSequence) : null;
+      const disk = this.disk;
+      const offline = this.state.offline;
+      const held =
+        disk && (offline || disk.ready)
+          ? await disk.earlier(sessionId, beforeSequence, offline).catch((error: unknown) => {
+              if (offline) throw error;
+              console.warn('无法读取对话缓存', error);
+              return null;
+            })
+          : null;
       const current = this.state.history[sessionId];
-      if (!current?.loadingEarlier || current.firstSequence !== beforeSequence) return;
+      if (
+        disk !== this.disk ||
+        !current?.loadingEarlier ||
+        current.firstSequence !== beforeSequence
+      )
+        return;
       if (this.state.selectedId !== sessionId) {
         this.update({
           history: { ...this.state.history, [sessionId]: { ...current, loadingEarlier: false } },
@@ -985,11 +1034,15 @@ export class ProxyClient {
         return;
       }
       if (held && 'events' in held) {
-        this.merge(sessionId, held.events, {
-          ...current,
-          firstSequence: held.events[0]!.sequence,
-          hasEarlier: held.hasEarlier,
-          loadingEarlier: false,
+        this.cachePage(sessionId, held, false);
+        return;
+      }
+      if (offline) {
+        this.update({
+          history: {
+            ...this.state.history,
+            [sessionId]: { ...current, hasEarlier: false, loadingEarlier: false, cacheGap: true },
+          },
         });
         return;
       }
@@ -1031,26 +1084,36 @@ export class ProxyClient {
   }
 
   private cachePage(sessionId: string, page: HeldPage, replace: boolean) {
+    const previous = this.state.history[sessionId];
     this.merge(
       sessionId,
       page.events,
       {
         firstSequence: page.events[0]!.sequence,
-        lastSequence: replace
-          ? page.events.at(-1)!.sequence
-          : this.state.history[sessionId].lastSequence,
+        lastSequence: replace ? page.events.at(-1)!.sequence : previous.lastSequence,
         hasEarlier: page.hasEarlier,
         loading: false,
         loadingEarlier: false,
+        ...(page.gap || (!replace && previous.cacheGap) ? { cacheGap: true } : {}),
       },
       replace,
     );
+    if (this.state.offline)
+      this.update({
+        outlines: {
+          ...this.state.outlines,
+          [sessionId]: {
+            entries: conversationOutline(this.state.events[sessionId]),
+            loading: false,
+          },
+        },
+      });
   }
 
   private present(sessionId: string) {
     if (this.opening.has(sessionId)) return;
     const disk = this.disk;
-    if (this.state.history[sessionId] || !disk?.ready) {
+    if (this.state.history[sessionId] || !disk || (!disk.ready && !this.state.offline)) {
       if (this.state.status === 'connected') this.load(sessionId);
       return;
     }
@@ -1062,18 +1125,26 @@ export class ProxyClient {
       loadingEarlier: false,
     };
     this.update({ history: { ...this.state.history, [sessionId]: reading } });
-    const request = disk.latest(sessionId).then((page) => {
-      if (this.opening.get(sessionId) !== request) return;
-      this.opening.delete(sessionId);
-      if (this.state.history[sessionId] !== reading) return;
-      if (page?.events.length) this.cachePage(sessionId, page, true);
-      else {
-        const { [sessionId]: _empty, ...history } = this.state.history;
-        this.update({ history });
-      }
-      if (this.state.status === 'connected' && this.state.selectedId === sessionId)
-        this.load(sessionId);
-    });
+    const request = disk
+      .latest(sessionId)
+      .catch((error: unknown) => {
+        if (this.state.offline && this.opening.get(sessionId) === request)
+          this.update({ error: error instanceof Error ? error.message : '无法读取对话缓存。' });
+        else console.warn('无法读取对话缓存', error);
+        return null;
+      })
+      .then((page) => {
+        if (this.opening.get(sessionId) !== request) return;
+        this.opening.delete(sessionId);
+        if (this.state.history[sessionId] !== reading) return;
+        if (page?.events.length) this.cachePage(sessionId, page, true);
+        else {
+          const { [sessionId]: _empty, ...history } = this.state.history;
+          this.update({ history });
+        }
+        if (this.state.status === 'connected' && this.state.selectedId === sessionId)
+          this.load(sessionId);
+      });
     this.opening.set(sessionId, request);
   }
 
@@ -1098,7 +1169,14 @@ export class ProxyClient {
       outlines: keep(this.state.outlines),
       ...(!sessionId || selected === sessionId ? { reading: null } : {}),
     });
-    if (selected && (!sessionId || selected === sessionId)) this.select(selected);
+    if (this.state.offline) {
+      this.update({
+        sessions: sessionId
+          ? this.state.sessions.filter((session) => session.id !== sessionId)
+          : [],
+        selectedId: !sessionId || selected === sessionId ? null : selected,
+      });
+    } else if (selected && (!sessionId || selected === sessionId)) this.select(selected);
   }
 
   async loadOutline(sessionId: string) {
@@ -1189,6 +1267,11 @@ export class ProxyClient {
         controller.signal,
       );
       if (controller.signal.aborted || this.state.selectedId !== sessionId) return;
+      if (this.disk?.ready && page.events.length)
+        this.disk.write(page.session, page.events, [
+          page.hasEarlier ? page.firstSequence - 1 : 0,
+          page.lastSequence,
+        ]);
       if (previous) {
         const earlier = direction === 'before' ? page : previous;
         const later = direction === 'before' ? previous : page;

@@ -151,6 +151,15 @@ function handle(channel, listener) {
   });
 }
 
+let historyCache;
+handle('history-cache', (_event, command) => {
+  if (launcher) throw new Error('请从服务的窗口查看缓存。');
+  historyCache ??= new (require('./history-cache.cjs').HistoryCache)(
+    path.join(app.getPath('userData'), 'history-cache'),
+  );
+  return historyCache.request(command);
+});
+
 handle('project:choose', async (event) => {
   const window = BrowserWindow.fromWebContents(event.sender);
   const result = await dialog.showOpenDialog(window, {
@@ -591,6 +600,7 @@ function decrypt(token) {
 }
 // Whether this window signs in as soon as its page asks for its sign-in: see `role` in connections.cjs.
 let signInNow = signInAtStart;
+let offlineNow = process.argv.includes('--offline-history');
 // A sign-in window offers the latest service whose window is not open, without its token, which stays with its
 // connection. A connection's window has its own sign-in, or what the sign-in window handed over; `locked` once it
 // has an address, as a connection is one service's.
@@ -614,7 +624,9 @@ handle('login:load', () => {
   const { login: own, pending } = readSettings();
   const login = handed ?? own;
   const signIn = signInNow;
+  const offline = offlineNow;
   signInNow = false;
+  offlineNow = false;
   if (!login?.url) return null;
   const token = handed?.token || decrypt(own?.token);
   return {
@@ -627,6 +639,7 @@ handle('login:load', () => {
     // One that has not signed in yet may have a mistyped address, which can still be corrected here.
     ...(own?.url && !pending ? { locked: true } : {}),
     ...(signIn && token ? { signIn: true } : {}),
+    ...(offline ? { offline: true } : {}),
   };
 });
 // Saved once signed in, which makes the connection more than a try (see `create` in connections.cjs). Only one
@@ -686,6 +699,17 @@ handle('launcher:start', async (_event, form) => {
     autoLogin: form.autoLogin === true,
   };
   return (await startConnection(id, ['--sign-in'], sign))
+    ? {}
+    : { error: '服务的窗口没有启动起来，请再试一次。' };
+});
+handle('launcher:offline', async (_event, url) => {
+  const service = connections.owner(base, url);
+  if (!service) return { error: '请先选择已登录过的服务。' };
+  if (connections.running(base, service.id)) {
+    launch(service.id);
+    return { shown: service.label };
+  }
+  return (await startConnection(service.id, ['--offline-history']))
     ? {}
     : { error: '服务的窗口没有启动起来，请再试一次。' };
 });
@@ -1230,10 +1254,10 @@ let quitting = false;
 let exiting = false;
 app.on('before-quit', (event) => {
   quitting = true;
-  if (exiting || !bridge) return;
+  if (exiting || (!bridge && !historyCache)) return;
   event.preventDefault();
   exiting = true;
-  bridge.close().finally(() => app.quit());
+  Promise.allSettled([bridge?.close(), historyCache?.close()]).finally(() => app.quit());
 });
 app.on('window-all-closed', () => app.quit());
 // A sign-in window's profile is removed by the next one (see `tidy`), as its files are still open now.

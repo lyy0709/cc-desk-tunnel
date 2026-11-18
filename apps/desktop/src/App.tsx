@@ -69,6 +69,7 @@ import Conversation from './Conversation.tsx';
 import LoginPage from './LoginPage.tsx';
 import type { ConnectionForm } from './LoginPage.tsx';
 import { exportSession } from './exportSession.ts';
+import { DesktopHistoryCache } from './historyCache.ts';
 import { onSharedChange, saveShared, shared, useShared } from './shared.ts';
 import { useNotifications } from './notifications.ts';
 import { folderName, isInside, isNewer, pathKey, withProject } from './paths.ts';
@@ -304,7 +305,7 @@ export function App({
   const [renameProject, setRenameProject] = useState<string | null>(null);
   const [repointProject, setRepointProject] = useState<string | null>(null);
 
-  const nativeMode = state.adapter === 'claude-code';
+  const nativeMode = state.offline || state.adapter === 'claude-code';
   const connected = state.status === 'connected';
   const selfSigned = !!browser && (state.browser?.selfSigned ?? browser.selfSigned);
   const othersBusy = useShared('busy');
@@ -452,10 +453,11 @@ export function App({
     const active = exporting.current;
     if (
       active &&
-      (!connected || !state.sessions.some((session) => session.id === active.sessionId))
+      ((!connected && !state.offline) ||
+        !state.sessions.some((session) => session.id === active.sessionId))
     )
       active.controller.abort();
-  }, [connected, state.sessions]);
+  }, [connected, state.offline, state.sessions]);
   useEffect(
     () => () => {
       exporting.current?.controller.abort();
@@ -743,12 +745,13 @@ export function App({
     loaded.current = true;
     void window.desktop?.loadLogin().then((saved) => {
       if (!saved) return;
-      const { signIn, locked, ...values } = saved;
+      const { signIn, locked, offline, ...values } = saved;
       setLocked(!!locked);
       // The installed client has no simulation mode, whatever an earlier version saved.
       const restored = window.desktop!.dev ? values : { ...values, mode: 'remote' as const };
       setForm(restored);
-      if (signIn) void login(restored);
+      if (offline) void openOffline(restored.url);
+      else if (signIn) void login(restored);
     });
   }, []);
   useEffect(() => {
@@ -899,6 +902,9 @@ export function App({
   async function login(form: ConnectionForm) {
     setError(null);
     try {
+      const cache = window.desktop?.historyCache
+        ? new DesktopHistoryCache(form.url, window.desktop.historyCache)
+        : null;
       if (form.mode === 'remote') {
         setProxyConnecting(true);
         // The address here only has to be a loopback one; each attempt gets its own from the bridge it opens.
@@ -915,9 +921,10 @@ export function App({
                 waits: getPrefs().connection,
               })
             ).url,
+          cache,
         );
       } else {
-        client.connect(form.url, form.token, await thisDevice());
+        client.connect(form.url, form.token, await thisDevice(), true, undefined, cache);
       }
       localStorage.setItem('proxy-url', form.url);
     } catch (error) {
@@ -926,6 +933,15 @@ export function App({
     } finally {
       setProxyConnecting(false);
     }
+  }
+  async function openOffline(url: string) {
+    if (!window.desktop?.historyCache) return;
+    await act(async () => {
+      await client.openOffline(
+        new DesktopHistoryCache(url, window.desktop!.historyCache),
+        await thisDevice(),
+      );
+    });
   }
   // A connection is one service's: a window an earlier version made without keeping its address may not sign in
   // to a service another connection has.
@@ -1436,7 +1452,7 @@ export function App({
       {
         label: exportingId === session.id ? '取消导出' : '导出为 Markdown',
         icon: <FileDown />,
-        disabled: !connected || (!!exportingId && exportingId !== session.id),
+        disabled: (!connected && !state.offline) || (!!exportingId && exportingId !== session.id),
         run: () => {
           void exportConversation(session);
         },
@@ -1618,7 +1634,7 @@ export function App({
       };
     });
   }
-  const adapterName = nativeMode ? 'Claude Code' : 'Simulation';
+  const adapterName = state.offline ? '本地记录' : nativeMode ? 'Claude Code' : 'Simulation';
   const accountName = signedOut
     ? '未登录'
     : (state.account?.email ?? capabilities?.account.email ?? (nativeMode ? '账号' : '离线模拟'));
@@ -1716,7 +1732,7 @@ export function App({
           : []),
         {
           label: exportingId ? '取消会话导出' : '导出当前会话…',
-          disabled: !exportingId && (!selected || !connected),
+          disabled: !exportingId && (!selected || (!connected && !state.offline)),
           separated: true,
           run: () => {
             if (exporting.current) exporting.current.controller.abort();
@@ -1856,7 +1872,7 @@ export function App({
       </main>
     );
 
-  if (state.status === 'disconnected' || state.status === 'connecting')
+  if (!state.offline && (state.status === 'disconnected' || state.status === 'connecting'))
     return localSettings ? (
       <div className="settings-only">
         <div className="window-drag" />
@@ -1890,6 +1906,9 @@ export function App({
           showNotes={setNotes}
           newer={upgrade ?? ahead}
           openSettings={() => setLocalSettings('general')}
+          offline={
+            window.desktop?.historyCache && form.url ? () => void openOffline(form.url) : undefined
+          }
           form={form}
           change={changeForm}
           error={
@@ -1998,12 +2017,14 @@ export function App({
         adapterName={adapterName}
         statusRequest={statusRequest}
         statusLabel={
-          {
-            connected: '已连接',
-            connecting: '连接中',
-            reconnecting: '重连中',
-            disconnected: '未连接',
-          }[state.status]
+          state.offline
+            ? '离线查看'
+            : {
+                connected: '已连接',
+                connecting: '连接中',
+                reconnecting: '重连中',
+                disconnected: '未连接',
+              }[state.status]
         }
         details={[
           {
@@ -2145,7 +2166,12 @@ export function App({
                 {!connected && state.status !== 'reconnecting' && (
                   <div className="connection-banner" role="status">
                     <Unplug />
-                    连接中断，等待恢复
+                    {state.offline ? '离线查看 · 显示本机已缓存的记录' : '连接中断，等待恢复'}
+                    {state.offline && (
+                      <button className="button" onClick={disconnect}>
+                        返回登录
+                      </button>
+                    )}
                   </div>
                 )}
                 <Conversation
@@ -2170,6 +2196,7 @@ export function App({
                   }}
                   exportStatus={exportStatus}
                   connected={connected}
+                  offline={state.offline}
                   native={nativeMode}
                   ownsRun={ownsRun}
                   clock={clock}

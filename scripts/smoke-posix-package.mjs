@@ -113,10 +113,21 @@ try {
     import { execFile } from 'node:child_process';
     import { randomUUID } from 'node:crypto';
     import { writeFile } from 'node:fs/promises';
+    import { createRequire } from 'node:module';
     import { join } from 'node:path';
     import { pathToFileURL } from 'node:url';
     const root = process.env.CC_PACKAGE_ROOT;
     const directory = process.cwd();
+    const require = createRequire(pathToFileURL(join(directory, 'package.json')));
+    const { HistoryCache } = require(join(root, 'electron/history-cache.cjs'));
+    const cache = new HistoryCache(join(directory, 'history-cache'));
+    try {
+      const address = { url: 'wss://fixture.invalid/ws', protocol: 1, history: randomUUID() + '/1' };
+      await cache.request({ type: 'use', ...address });
+      const stats = await cache.request({ type: 'stats', ...address });
+      assert.ok(stats.bytes > 0);
+      assert.equal(stats.events, 0);
+    } finally { await cache.close(); }
     // The bridge as it is packaged: one file, which starts the SSH service's process from the files beside it.
     const bridge = await import(pathToFileURL(join(root, 'electron/proxy-bridge.mjs')));
     assert.equal(typeof bridge.openProxyBridge, 'function');

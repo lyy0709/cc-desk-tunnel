@@ -1,5 +1,6 @@
 const { contextBridge, ipcRenderer, webFrame, webUtils } = require('electron');
 contextBridge.exposeInMainWorld('desktop', {
+  historyCache: (command) => ipcRenderer.invoke('history-cache', command),
   dev: process.argv.includes('--cc-desk-tunnel-dev'),
   platform: process.platform,
   // Read once, before the page draws: see `boot` in main.cjs.
@@ -59,6 +60,7 @@ contextBridge.exposeInMainWorld('desktop', {
   loginOwner: (url) => ipcRenderer.invoke('login:owner', url),
   signInElsewhere: () => ipcRenderer.invoke('login:elsewhere'),
   startService: (login) => ipcRenderer.invoke('launcher:start', login),
+  openCachedService: (url) => ipcRenderer.invoke('launcher:offline', url),
   openLegacy: (id) => ipcRenderer.invoke('launcher:open', id),
   loadDrafts: () => ipcRenderer.invoke('drafts:load'),
   saveDrafts: (drafts) => ipcRenderer.invoke('drafts:save', drafts),

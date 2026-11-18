@@ -3,6 +3,7 @@ export {};
 declare global {
   interface Window {
     desktop?: {
+      historyCache: import('./historyCache.ts').CachePort;
       // Run from the source tree, not installed: the login page then also offers the simulation service.
       dev: boolean;
       platform: 'win32' | 'darwin' | 'linux';
@@ -98,7 +99,12 @@ declare global {
       // window's own sign-in: `signIn` to connect at once, as the window was started to; `locked` once the
       // connection has its service.
       loadLogin: () => Promise<
-        (import('./LoginPage.tsx').ConnectionForm & { signIn?: boolean; locked?: boolean }) | null
+        | (import('./LoginPage.tsx').ConnectionForm & {
+            signIn?: boolean;
+            locked?: boolean;
+            offline?: boolean;
+          })
+        | null
       >;
       saveLogin: (login: import('./LoginPage.tsx').ConnectionForm) => Promise<void>;
       // The name of another connection that has signed in to the service, if one has.
@@ -110,6 +116,7 @@ declare global {
       startService: (
         login: import('./LoginPage.tsx').ConnectionForm,
       ) => Promise<{ shown?: string; error?: string }>;
+      openCachedService: (url: string) => Promise<{ shown?: string; error?: string }>;
       // Opens an earlier version's connection that kept no address, to sign in from its own window.
       openLegacy: (id: string) => Promise<{ shown?: boolean; error?: string }>;
       loadDrafts: () => Promise<unknown>;

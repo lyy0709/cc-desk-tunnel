@@ -34,15 +34,16 @@ export default function Launcher() {
         }),
     );
   }, []);
-  async function start() {
+  async function start(offline = false) {
     setError(null);
     setStarting(true);
-    const result: { shown?: string; error?: string } = await window
-      .desktop!.startService(form)
-      .catch((failure: unknown) => ({
-        error: messageOf(failure),
-      }));
-    if (result.shown) setError(`“${result.shown}”已在另一个窗口登录，已切换到那个窗口。`);
+    const result: { shown?: string; error?: string } = await (
+      offline ? window.desktop!.openCachedService(form.url) : window.desktop!.startService(form)
+    ).catch((failure: unknown) => ({
+      error: messageOf(failure),
+    }));
+    if (result.shown)
+      setError(`“${result.shown}”已在另一个窗口${offline ? '打开' : '登录'}，已切换到那个窗口。`);
     else if (result.error) setError(result.error);
     // Otherwise the window goes as the service's window runs.
     else return;
@@ -63,6 +64,7 @@ export default function Launcher() {
       newer={null}
       showNotes={() => {}}
       submit={() => void start()}
+      offline={form.url ? () => void start(true) : undefined}
     />
   );
 }

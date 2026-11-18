@@ -17,19 +17,20 @@ export type Range = [after: number, through: number];
 type Held = { id: string; ranges: Range[] };
 type Kept = { sessionId: string; sequence: number; size: number; event: SessionEvent };
 export type HeldPage = { events: SessionEvent[]; hasEarlier: boolean; gap?: boolean };
+export type CacheStats = { bytes: number | null; sessions: number; events: number };
 export type HistoryDisk = Pick<
   HistoryCache,
-  | 'historyId'
-  | 'ready'
-  | 'use'
-  | 'retain'
-  | 'write'
-  | 'drop'
-  | 'clear'
-  | 'latest'
-  | 'earlier'
-  | 'stats'
->;
+  'historyId' | 'ready' | 'use' | 'retain' | 'write' | 'drop' | 'clear' | 'latest' | 'stats'
+> & {
+  earlier(
+    sessionId: string,
+    before: number,
+    offline?: boolean,
+  ): Promise<HeldPage | { after: number } | null>;
+  update?(session: Session): void;
+};
+
+const writeFailed = (error: unknown) => console.warn('对话缓存写入失败', error);
 
 // The service's page: whole runs, up to about this many events or this much text.
 const pageEvents = 1000;
@@ -117,7 +118,7 @@ export class HistoryCache {
   }
   // Writes are best effort: a failed one leaves the service to supply what it would have held.
   private quietly(work: Promise<unknown>) {
-    work.catch((error: unknown) => console.warn('对话缓存写入失败', error));
+    void work.catch(writeFailed);
   }
 
   // The history the service keeps now. Kept history of another one, or of another protocol, goes.
@@ -193,11 +194,7 @@ export class HistoryCache {
     return this.read(sessionId, (ranges) => ranges.at(-1), Infinity).catch(() => null);
   }
   // The page held right below `before`, or where the service's page can stop if none is held.
-  async earlier(
-    sessionId: string,
-    before: number,
-    _offline = false,
-  ): Promise<HeldPage | { after: number } | null> {
+  async earlier(sessionId: string, before: number): Promise<HeldPage | { after: number } | null> {
     if (!this.ready) return null;
     try {
       let ranges: Range[] = [];
@@ -258,7 +255,7 @@ export class HistoryCache {
     });
   }
 
-  async stats() {
+  async stats(): Promise<CacheStats | null> {
     const counts = await this.run(['sessions', 'events'], 'readonly', async (transaction) => ({
       sessions: await result(transaction.objectStore('sessions').count()),
       events: await result(transaction.objectStore('events').count()),
@@ -266,5 +263,80 @@ export class HistoryCache {
     if (!counts) return null;
     const estimate = await navigator.storage?.estimate?.().catch(() => undefined);
     return { ...counts, bytes: estimate?.usage ?? null };
+  }
+}
+
+type CacheCommand =
+  | { type: 'use' | 'list' | 'clear' | 'stats' }
+  | { type: 'read'; sessionId: string; before?: number; offline?: boolean }
+  | { type: 'write'; session: Session; events: SessionEvent[]; range: Range }
+  | { type: 'metadata'; session: Session }
+  | { type: 'retain'; sessions: Session[] }
+  | { type: 'drop'; sessionId: string };
+
+export type CachePort = (
+  command: CacheCommand & { url: string; protocol: number; history?: string },
+) => Promise<unknown>;
+
+// Electron keeps one SQLite cache per service inside the connection's own profile.
+export class DesktopHistoryCache implements HistoryDisk {
+  historyId: string | null = null;
+  private url: string;
+  private port: CachePort;
+
+  constructor(url: string, port: CachePort) {
+    this.url = new URL(url).href;
+    this.port = port;
+  }
+  get ready() {
+    return this.historyId !== null;
+  }
+  private request<T>(command: CacheCommand) {
+    return this.port({
+      ...command,
+      url: this.url,
+      protocol: PROTOCOL_VERSION,
+      ...(this.historyId ? { history: `${this.historyId}/${PROTOCOL_VERSION}` } : {}),
+    }) as Promise<T>;
+  }
+  use(historyId: string) {
+    this.historyId = historyId;
+    void this.request({ type: 'use' }).catch(writeFailed);
+  }
+  retain(sessions: Session[]) {
+    void this.request({ type: 'retain', sessions }).catch(writeFailed);
+  }
+  update(session: Session) {
+    void this.request({ type: 'metadata', session }).catch(writeFailed);
+  }
+  write(session: Session, events: SessionEvent[], range: Range) {
+    if (events.length || range[1] > range[0])
+      void this.request({ type: 'write', session, events, range }).catch(writeFailed);
+  }
+  drop(sessionId: string) {
+    void this.request({ type: 'drop', sessionId }).catch(writeFailed);
+  }
+  clear() {
+    void this.request({ type: 'clear' }).catch(writeFailed);
+  }
+  latest(sessionId: string) {
+    return this.request<HeldPage | null>({ type: 'read', sessionId });
+  }
+  earlier(sessionId: string, before: number, offline = false) {
+    return this.request<HeldPage | { after: number } | null>({
+      type: 'read',
+      sessionId,
+      before,
+      offline,
+    });
+  }
+  stats() {
+    return this.request<CacheStats | null>({ type: 'stats' }).catch((error: unknown) => {
+      console.warn('无法读取对话缓存占用', error);
+      return null;
+    });
+  }
+  async list() {
+    return (await this.request<Session[] | null>({ type: 'list' })) ?? [];
   }
 }

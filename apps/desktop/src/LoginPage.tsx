@@ -34,6 +34,7 @@ export default function LoginPage({
   showNotes,
   submit,
   openSettings,
+  offline,
   launcher = false,
   locked = false,
   elsewhere,
@@ -59,6 +60,7 @@ export default function LoginPage({
   submit: () => void;
   // This computer's own settings, which need no connection.
   openSettings?: () => void;
+  offline?: () => void;
   // A sign-in window (see Launcher.tsx), which offers the services signed in to before.
   launcher?: boolean;
   // A connection's window keeps to its service; `elsewhere` goes back to a sign-in window for another.
@@ -409,6 +411,11 @@ export default function LoginPage({
           </button>
         </form>
         <div className="login-links">
+          {offline && (
+            <button className="project-link" type="button" disabled={connecting} onClick={offline}>
+              离线查看缓存
+            </button>
+          )}
           {elsewhere && !launcher && (
             <button className="project-link" type="button" onClick={elsewhere}>
               <Unplug />

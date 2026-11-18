@@ -72,6 +72,25 @@ export async function exportSession(
   } = {},
 ) {
   const { signal, progress } = options;
+  const name = `${session.title.replace(/[\\/:*?"<>|\r\n]+/g, ' ').trim() || '会话'}.md`;
+  if (client.state.offline) {
+    signal?.throwIfAborted();
+    const disk = client.disk;
+    const latest = await disk?.latest(session.id);
+    if (!latest?.events.length) throw new Error('这个会话还没有可导出的本机记录。');
+    const pages = [latest.events];
+    let page = latest;
+    while (page.hasEarlier) {
+      signal?.throwIfAborted();
+      const earlier = await disk!.earlier(session.id, page.events[0].sequence);
+      if (!earlier || !('events' in earlier))
+        throw new Error('还有记录未缓存在本机，请连接服务后完整导出。');
+      pages.push(earlier.events);
+      page = earlier;
+    }
+    signal?.throwIfAborted();
+    return window.desktop!.saveFile(name, markdown(session, pages.reverse().flat()));
+  }
   let throughSequence: number | undefined;
   let sequence = 0,
     read = 0,
@@ -114,7 +133,6 @@ export async function exportSession(
   }
   signal?.throwIfAborted();
   const text = parts.join('\n');
-  const name = `${session.title.replace(/[\\/:*?"<>|\r\n]+/g, ' ').trim() || '会话'}.md`;
   if (window.desktop) return window.desktop.saveFile(name, text);
   const link = document.createElement('a');
   link.href = URL.createObjectURL(new Blob([text], { type: 'text/markdown' }));

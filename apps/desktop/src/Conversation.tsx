@@ -994,6 +994,7 @@ export default function Conversation({
   here,
   deviceId,
   reviewing = false,
+  offline = false,
 }: {
   session: Session | undefined;
   // This window can open the files of the session's project: a desktop on the computer they are on.
@@ -1012,6 +1013,7 @@ export default function Conversation({
   exportStatus: string;
   history: HistoryState | undefined;
   connected: boolean;
+  offline?: boolean;
   native: boolean;
   ownsRun: boolean;
   busy: boolean;
@@ -1293,7 +1295,13 @@ export default function Conversation({
     if (reading) leave();
   }, [reading]);
   const loadMore = () => {
-    if (!session || !connected || !history?.hasEarlier || history.loadingEarlier || history.loading)
+    if (
+      !session ||
+      (!connected && !offline) ||
+      !history?.hasEarlier ||
+      history.loadingEarlier ||
+      history.loading
+    )
       return;
     setLoadError('');
     if (scroll.current)
@@ -1562,7 +1570,7 @@ export default function Conversation({
                 <button
                   type="button"
                   className="history-load"
-                  disabled={!connected || history.loadingEarlier || history.loading}
+                  disabled={(!connected && !offline) || history.loadingEarlier || history.loading}
                   onClick={loadMore}
                 >
                   <ArrowUpToLine />
@@ -1572,6 +1580,11 @@ export default function Conversation({
               {history?.loading && (
                 <div className="history-status" role="status">
                   同步会话
+                </div>
+              )}
+              {history?.cacheGap && (
+                <div className="history-status" role="status">
+                  部分更早的记录未缓存在本机
                 </div>
               )}
               {turns.length === 0 && !history?.loading && (
