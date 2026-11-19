@@ -947,7 +947,13 @@ export function App({
   // to a service another connection has.
   async function signIn(form: ConnectionForm) {
     if (window.desktop && !locked) {
-      const owner = await window.desktop.loginOwner(form.url).catch(() => null);
+      let owner;
+      try {
+        owner = await window.desktop.loginOwner(form.url);
+      } catch (error) {
+        setError(error instanceof Error ? error.message : '无法确认服务所属的连接。');
+        return;
+      }
       if (owner) {
         setError(`“${owner}”已有自己的连接，请从登录窗口登录它。`);
         return;

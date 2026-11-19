@@ -40,6 +40,7 @@ test('cached history can check its last event and fill only a missing range', (t
   const before = append('cached');
   const missing = append('missing');
   const after = append('already shown');
+  assert.equal(made.store.list(true)[0].lastSequence, after.sequence);
   const history = made.store.historyId;
   assert.equal(made.store.holds(session.id, after.sequence, after.createdAt), true);
   assert.equal(made.store.holds(session.id, after.sequence, '2000-01-01T00:00:00.000Z'), false);

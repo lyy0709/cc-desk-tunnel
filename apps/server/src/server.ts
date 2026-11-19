@@ -450,6 +450,11 @@ export function createProxyServer(options: ServerOptions) {
       });
   }
   function broadcast(message: ServerMessage, sessionId?: string) {
+    if (message.type === 'session.updated')
+      message = {
+        ...message,
+        session: { ...message.session, lastSequence: store.lastSequence(message.session.id) },
+      };
     for (const peer of peers) {
       if (peer.authenticated && (!sessionId || peer.subscriptions.has(sessionId)))
         send(peer, message);
@@ -2000,7 +2005,7 @@ export function createProxyServer(options: ServerOptions) {
         adapter,
         model: options.claude?.model,
         version,
-        sessions: store.list(),
+        sessions: store.list(true),
         historyId: store.historyId,
         browser: {
           sessionId: peer.browser,
@@ -2056,7 +2061,7 @@ export function createProxyServer(options: ServerOptions) {
       version,
       update: updates?.state,
       client: installer(),
-      sessions: store.list(),
+      sessions: store.list(true),
       historyId: store.historyId,
     });
     send(peer, devices());

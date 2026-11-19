@@ -54,6 +54,20 @@ function replace(target, value) {
 }
 const writeShared = (base, key, value) => replace(sharedFile(base, key), value);
 
+// The OS releases SQLite's file lock if a launcher exits during the registry operation.
+function withRegistry(base, operation) {
+  const shared = path.join(base, 'shared');
+  mkdirSync(shared, { recursive: true });
+  const { DatabaseSync } = require('node:sqlite');
+  const lock = new DatabaseSync(path.join(shared, 'connections-lock.sqlite'), { timeout: 5000 });
+  try {
+    lock.exec('BEGIN IMMEDIATE');
+    return operation();
+  } finally {
+    lock.close();
+  }
+}
+
 const named = (name) => {
   const text = String(name ?? '')
     .replace(/\s+/g, ' ')
@@ -175,6 +189,8 @@ function tell(base, id, command) {
 // in it is `pending`: a mistyped address leaves no record, and its directory goes once its window has.
 function create(base, login) {
   const entries = list(base);
+  const existing = owner(base, login.url) ?? reserved(base, entries, login.url);
+  if (existing) return existing.id;
   if (entries.length >= limit) throw new Error(`最多保存 ${limit} 个连接。`);
   const id = randomBytes(4).toString('hex');
   mkdirSync(directory(base, id), { recursive: true });
@@ -227,6 +243,27 @@ function accounts(base) {
     })
     .sort((a, b) => b.usedAt - a.usedAt);
 }
+// Pending connections reserve their address before their first handshake.
+function reserved(base, entries, url) {
+  const key = serviceKey(url);
+  return entries.find(({ id }) => {
+    const settings = readSettings(base, id);
+    const address = (running(base, id) && settings.reservedUrl) || settings.login?.url;
+    return address && serviceKey(address) === key;
+  });
+}
+
+function claim(base, id, url) {
+  return withRegistry(base, () => {
+    const found = reserved(base, list(base), url);
+    if (found && found.id !== id) return labelOf(base, found) || shown(url);
+    const settings = readSettings(base, id);
+    if (settings.pending) writeSettings(base, id, { login: { ...settings.login, url } });
+    else if (!settings.login?.url) writeSettings(base, id, { reservedUrl: url });
+    return null;
+  });
+}
+
 // The connection that has signed in to the service, if one has.
 function owner(base, url) {
   const key = serviceKey(url);
@@ -342,10 +379,11 @@ function adopt(base) {
 
 module.exports = {
   accounts,
-  adopt,
+  adopt: (base) => withRegistry(base, () => adopt(base)),
   autoLogin,
   busy,
-  create,
+  claim,
+  create: (base, login) => withRegistry(base, () => create(base, login)),
   directory,
   labelOf,
   launcherDirectory,
@@ -356,14 +394,14 @@ module.exports = {
   owner,
   pending,
   readShared,
-  remove,
-  rename,
+  remove: (base, id) => withRegistry(base, () => remove(base, id)),
+  rename: (base, id, name) => withRegistry(base, () => rename(base, id, name)),
   role,
   running,
   serviceKey,
   setAutoLogin,
   tell,
-  tidy,
+  tidy: (base, now) => withRegistry(base, () => tidy(base, now)),
   writeSettings,
   writeShared,
 };

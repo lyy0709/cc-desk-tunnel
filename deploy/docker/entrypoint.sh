@@ -13,17 +13,12 @@ fi
 PROGRAM=/app
 STORE=/data/program
 IMAGE_VERSION="$(node -p "require('/app/apps/desktop/package.json').version")"
-VERSION="$(head -n 1 "$STORE/current" 2>/dev/null || true)"
-if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && -f "$STORE/$VERSION/apps/server/src/main.ts" \
-  && "$VERSION" != "$IMAGE_VERSION" \
-  && "$(printf '%s\n' "$IMAGE_VERSION" "$VERSION" | sort -V | tail -n 1)" = "$VERSION" ]]; then
+source /usr/local/lib/cc-desk-tunnel/program.sh
+VERSION="$(program_version "$STORE" "$IMAGE_VERSION")"
+if [[ "$VERSION" != "$IMAGE_VERSION" ]]; then
   ATTEMPTS="$(cat "$STORE/attempts" 2>/dev/null || echo 0)"
-  if [[ "$ATTEMPTS" =~ ^[0-2]$ ]]; then
-    echo "$((ATTEMPTS + 1))" > "$STORE/attempts"
-    PROGRAM="$STORE/$VERSION"
-  else
-    echo "Program $VERSION did not start; running $IMAGE_VERSION from the image." >&2
-  fi
+  echo "$((ATTEMPTS + 1))" > "$STORE/attempts"
+  PROGRAM="$STORE/$VERSION"
 fi
 [ ! -x "$PROGRAM/cli/bin/claude" ] || PATH="$PROGRAM/cli/bin:$PATH"
 echo "Starting program $(node -p "require('$PROGRAM/apps/desktop/package.json').version") from $PROGRAM"

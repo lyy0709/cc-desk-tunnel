@@ -521,6 +521,8 @@ export const platformOf = (device?: { platform?: DevicePlatform } | null): Devic
   device?.platform ?? 'win32';
 export type Device = z.infer<typeof deviceSchema>;
 export const sessionSchema = z.object({
+  // Latest recorded event known to the service, including when only the directory is sent.
+  lastSequence: z.number().int().nonnegative().optional(),
   id,
   title: z.string().min(1).max(120),
   autoTitle: z.boolean().default(false),

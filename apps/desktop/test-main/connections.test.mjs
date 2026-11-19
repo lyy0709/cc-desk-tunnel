@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -237,4 +239,27 @@ test('a damaged list and a shared value that is not there are passed over', (con
     null,
   ]);
   assert.deepEqual(connections.list(base), [{ id: 'abcd1234', name: '好' }]);
+});
+
+test('concurrent launchers reserve one profile per normalized address', async (context) => {
+  const base = profile(context);
+  const module = createRequire(import.meta.url).resolve('../electron/connections.cjs');
+  const urls = ['wss://EXAMPLE.com:443/ws', 'wss://example.com/ws', 'wss://other.test/ws'];
+  const results = await Promise.all(
+    urls.map((url) =>
+      promisify(execFile)(process.execPath, [
+        '-e',
+        'console.log(require(process.argv[1]).create(process.argv[2], { url: process.argv[3] }))',
+        module,
+        base,
+        url,
+      ]),
+    ),
+  );
+  const [first, second, other] = results.map((result) => result.stdout.trim());
+  assert.equal(first, second);
+  assert.notEqual(first, other);
+  assert.equal(connections.list(base).length, 2);
+  assert.deepEqual(connections.accounts(base), []);
+  assert.ok(connections.claim(base, other, urls[0]));
 });

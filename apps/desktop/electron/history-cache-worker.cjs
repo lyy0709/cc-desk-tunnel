@@ -4,8 +4,8 @@ const { createHash } = require('node:crypto');
 const { mkdirSync, statSync, chmodSync } = require('node:fs');
 const { join } = require('node:path');
 
-const pageEvents = 1000;
-const pageBytes = 512 * 1024;
+const { historyPageStart } = require('./history-page.mjs');
+const pageColumns = `json_extract(data, '$.runId'), CASE WHEN json_extract(data, '$.payload.type') = 'message.user' THEN CASE WHEN json_extract(data, '$.payload.continued') THEN 2 ELSE 1 END ELSE 0 END, octet_length(data)`;
 let database, file;
 
 function open(url) {
@@ -34,6 +34,7 @@ function open(url) {
       CREATE TABLE IF NOT EXISTS about(key TEXT PRIMARY KEY, value TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, metadata TEXT NOT NULL, ranges TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS events(session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE, sequence INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(session_id,sequence));
+      CREATE INDEX IF NOT EXISTS event_pages ON events(session_id, sequence, ${pageColumns});
       PRAGMA user_version=1;`);
     if (process.platform !== 'win32') chmodSync(target, 0o600);
     database = db;
@@ -57,7 +58,7 @@ function transaction(run) {
 }
 
 function readPage(sessionId, before, offline) {
-  const row = database.prepare('SELECT ranges FROM sessions WHERE id = ?').get(sessionId);
+  const row = database.prepare('SELECT ranges, metadata FROM sessions WHERE id = ?').get(sessionId);
   if (!row) return null;
   const ranges = JSON.parse(row.ranges);
   const adjacent =
@@ -71,33 +72,33 @@ function readPage(sessionId, before, offline) {
   if (!range) return null;
 
   const end = Math.min(before ?? Infinity, range[1] + 1);
-  const rows = database
+  const keys = database.prepare(`SELECT session_id, sequence, ${pageColumns}
+    FROM events INDEXED BY event_pages WHERE session_id = ? AND sequence > ? AND sequence < ? ORDER BY sequence`);
+  keys.setReturnArrays(true);
+  const rows = keys.all(sessionId, range[0], end);
+  const first = historyPageStart(rows);
+  if (first === undefined) return null;
+  const events = database
     .prepare(
-      'SELECT data, octet_length(data) AS size FROM events WHERE session_id = ? AND sequence > ? AND sequence < ? ORDER BY sequence DESC',
+      'SELECT data FROM events WHERE session_id = ? AND sequence >= ? AND sequence < ? ORDER BY sequence',
     )
-    .iterate(sessionId, range[0], end);
-  const events = [];
-  let bytes = 0;
-  let more = false;
-  let continued = false;
-  for (const { data, size } of rows) {
-    const event = JSON.parse(data);
-    if (events.length && events.at(-1).runId !== event.runId) {
-      if ((events.length >= pageEvents || bytes >= pageBytes) && !continued) {
-        more = true;
-        break;
-      }
-      continued = false;
-    }
-    if (event.payload.type === 'message.user') continued = event.payload.continued === true;
-    events.push(event);
-    bytes += size;
-  }
-  if (!events.length) return null;
-  return { events: events.reverse(), hasEarlier: more || range[0] > 0, gap: !adjacent };
+    .all(sessionId, first, end)
+    .map((row) => JSON.parse(row.data));
+  return {
+    events,
+    hasEarlier: first > rows[0][1] || range[0] > 0,
+    gap: !adjacent,
+    lastSequence: JSON.parse(row.metadata).lastSequence,
+  };
 }
 
-const metadata = (session) => JSON.stringify({ ...session, activeRun: null });
+function metadata(session, saved) {
+  const lastSequence =
+    session.lastSequence === undefined
+      ? undefined
+      : Math.max(session.lastSequence, saved ? (JSON.parse(saved).lastSequence ?? 0) : 0);
+  return JSON.stringify({ ...session, activeRun: null, lastSequence });
+}
 
 function run(message) {
   if (message.type === 'close') {
@@ -131,7 +132,9 @@ function run(message) {
     case 'write':
       return transaction(() => {
         const { session, events, range } = message;
-        const saved = database.prepare('SELECT ranges FROM sessions WHERE id = ?').get(session.id);
+        const saved = database
+          .prepare('SELECT ranges, metadata FROM sessions WHERE id = ?')
+          .get(session.id);
         const ranges = [...(saved ? JSON.parse(saved.ranges) : []), range].sort(
           (a, b) => a[0] - b[0],
         );
@@ -146,15 +149,20 @@ function run(message) {
           .prepare(
             'INSERT INTO sessions VALUES (?, ?, ?) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,ranges=excluded.ranges',
           )
-          .run(session.id, metadata(session), JSON.stringify(combined));
+          .run(session.id, metadata(session, saved?.metadata), JSON.stringify(combined));
         const put = database.prepare('INSERT OR REPLACE INTO events VALUES (?, ?, ?)');
         for (const event of events) put.run(session.id, event.sequence, JSON.stringify(event));
       });
-    case 'metadata':
+    case 'metadata': {
+      const saved = database
+        .prepare('SELECT metadata FROM sessions WHERE id = ?')
+        .get(message.session.id);
+      if (!saved) return;
       database
         .prepare('UPDATE sessions SET metadata = ? WHERE id = ?')
-        .run(metadata(message.session), message.session.id);
+        .run(metadata(message.session, saved.metadata), message.session.id);
       return;
+    }
     case 'retain':
       return transaction(() => {
         const sessions = new Map(message.sessions.map((session) => [session.id, session]));

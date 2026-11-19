@@ -630,6 +630,7 @@ export class ProxyClient {
       } else if (message.type === 'session.updated') {
         this.upsert(message.session);
       } else if (message.type === 'session.deleted') {
+        this.opening.delete(message.sessionId);
         this.disk?.drop(message.sessionId);
         const events = { ...this.state.events };
         const live = { ...this.state.live };
@@ -735,6 +736,15 @@ export class ProxyClient {
         // The service streams the shown session's events, and only some events of the others (a terminal's quota goes
         // to every connection): one of those in a cached history would move its cursor past what was never received,
         // and showing that session again would not fetch it.
+        if (
+          this.disk?.update &&
+          (message.event.sessionId !== this.state.selectedId ||
+            this.state.history[message.event.sessionId]?.loading)
+        ) {
+          const session = this.state.sessions.find((entry) => entry.id === message.event.sessionId);
+          if (session && message.event.sequence > (session.lastSequence ?? 0))
+            this.disk.update({ ...session, lastSequence: message.event.sequence });
+        }
         if (message.event.sessionId !== this.state.selectedId) return;
         this.streamEvents.push(message.event);
         this.streamTimer ??= setTimeout(() => this.flushStream(), 32);
@@ -902,14 +912,21 @@ export class ProxyClient {
     if (progress !== this.state.progress) this.update({ progress });
     if (moved) this.update({ live });
     for (const [id, events] of grouped) {
+      // A quota broadcast can precede the subscription. The snapshot will replay it
+      // along with the intervening events; it is not a valid resume cursor yet.
+      if (this.opening.has(id)) continue;
       const before = this.state.history[id];
       this.merge(id, events);
       const session = this.state.sessions.find((entry) => entry.id === id);
       if (this.disk?.ready && session && before && !before.loading && !before.needsReload)
-        this.disk.write(session, events, [
-          before.lastSequence,
-          this.state.history[id].lastSequence,
-        ]);
+        this.disk.write(
+          {
+            ...session,
+            lastSequence: Math.max(session.lastSequence ?? 0, this.state.history[id].lastSequence),
+          },
+          events,
+          [before.lastSequence, this.state.history[id].lastSequence],
+        );
       if (
         events.some(({ payload }) =>
           ['message.user', 'run.status', 'native.compact'].includes(payload.type),
@@ -1074,6 +1091,7 @@ export class ProxyClient {
     const outlines = { ...this.state.outlines };
     while (this.cacheOrder.length > 4) {
       const evicted = this.cacheOrder.shift()!;
+      this.opening.delete(evicted);
       delete events[evicted];
       delete live[evicted];
       delete history[evicted];
@@ -1136,7 +1154,6 @@ export class ProxyClient {
       .then((page) => {
         if (this.opening.get(sessionId) !== request) return;
         this.opening.delete(sessionId);
-        if (this.state.history[sessionId] !== reading) return;
         if (page?.events.length) this.cachePage(sessionId, page, true);
         else {
           const { [sessionId]: _empty, ...history } = this.state.history;

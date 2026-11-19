@@ -134,3 +134,50 @@ test('desktop resumes from SQLite and can page through the same records with the
     rmSync(directory, { recursive: true, force: true });
   }
 });
+
+test('Web IndexedDB keeps existing records and pages whole continuations after upgrade', async ({
+  page,
+}) => {
+  await page.goto('/');
+  const result = await page.evaluate(async (protocol) => {
+    const url = new URL('/src/historyCache.ts', location.href).href;
+    const { HistoryCache } = (await import(url)) as typeof import('../src/historyCache.ts');
+    const dbName = crypto.randomUUID(),
+      sessionId = crypto.randomUUID();
+    const events = [
+      ['a', { type: 'message.user', text: 'earlier' }],
+      ['b', { type: 'message.user', text: 'original' }],
+      ['s', { type: 'native.notice', text: 'status' }],
+      ['c', { type: 'message.user', continued: true, text: 'continued' }],
+      ['c', { type: 'text.delta', text: '中'.repeat(180000) }],
+    ].map(([runId, payload], i) => ({ sessionId, sequence: i + 1, runId, payload }));
+    await new Promise<void>((resolve, reject) => {
+      const open = indexedDB.open(dbName, 1);
+      open.onupgradeneeded = () => {
+        const db = open.result;
+        db.createObjectStore('about').put(`fixture/${protocol}`, 'history');
+        db.createObjectStore('sessions', { keyPath: 'id' }).put({
+          id: sessionId,
+          ranges: [[0, 5]],
+        });
+        const records = db.createObjectStore('events', { keyPath: ['sessionId', 'sequence'] });
+        for (const event of events)
+          records.put({ sessionId, sequence: event.sequence, event, size: 1 });
+      };
+      open.onerror = () => reject(open.error);
+      open.onsuccess = () => {
+        open.result.close();
+        resolve();
+      };
+    });
+    const disk = new HistoryCache(dbName);
+    disk.use('fixture');
+    const latest = await disk.latest(sessionId);
+    const earlier = await disk.earlier(sessionId, 2);
+    return [
+      latest?.events.map((e) => e.sequence),
+      earlier && 'events' in earlier && earlier.events.map((e) => e.sequence),
+    ];
+  }, PROTOCOL_VERSION);
+  expect(result).toEqual([[2, 3, 4, 5], [1]]);
+});

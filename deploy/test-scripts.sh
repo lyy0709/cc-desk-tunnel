@@ -14,6 +14,7 @@ program() {
   mkdir -p "$1/deploy/docker" "$1/apps/desktop"
   for file in manage.sh install.sh; do tr -d '\r' < "$ROOT/deploy/$file" > "$1/deploy/$file"; done
   cp "$ROOT/deploy/compose.yml" "$1/deploy/"
+  cp "$ROOT/deploy/docker/program.sh" "$1/deploy/docker/"
   cp "$ROOT/deploy/docker/compose.yaml" "$1/deploy/docker/"
   printf '{\n  "version": "%s",\n}\n' "$2" > "$1/apps/desktop/package.json"
 }
@@ -38,7 +39,10 @@ case "$1 $2" in
 esac
 case " $* " in
   *' build '*) [[ "${FAIL_BUILD:-0}" != 1 ]]; exit ;;
+  *' exec -T proxy node '*) echo "${MOCK_ACTIVE_VERSION:-$MOCK_IMAGE_VERSION}" ;;
+  *' ps --status running '*) [[ "${MOCK_STOPPED:-0}" = 1 ]] || echo mock-container ;;
   *' ps '*) echo mock-container ;;
+  *' --entrypoint node '*) echo "$MOCK_IMAGE_VERSION" ;;
 esac
 exit 0
 MOCK
@@ -62,6 +66,7 @@ export PROXY_DEPLOY_CONFIG="$TEMP/config.env"
 mkdir -p "$TEMP/data/config"
 touch "$TEMP/data/.cc-desk-tunnel-data" "$TEMP/data/config/service.env"
 deployment() {
+  export MOCK_IMAGE_VERSION="$1"
   rm -rf "$DEPLOYED"
   program "$DEPLOYED" "$1"
   cat > "$PROXY_DEPLOY_CONFIG" <<CONFIG
@@ -180,6 +185,41 @@ deployment 1.2.0
 if manage restore "$archive" --yes > /dev/null 2>&1; then echo 'A newer backup was restored.' >&2; exit 1; fi
 # A host is checked before anything else is done; underscores are fine (see the installer below).
 if manage init --host https://example.com --data "$TEMP/none" > /dev/null 2>&1; then echo 'A URL was taken for a host.' >&2; exit 1; fi
+
+# Both commands lock the deployment inode before querying or stopping its container.
+(
+  flock -x 8
+  : > "$MOCK_LOG"
+  if manage backup "$backups/locked.tar.gz" >/dev/null 2>&1 || manage restore "$archive" --yes >/dev/null 2>&1; then exit 1; fi
+  test ! -s "$MOCK_LOG"
+) 8< "$data"
+
+# An image-only source and a hot-upgraded target can run the same release.
+mkdir -p "$data/program/1.2.3/apps/server/src"
+touch "$data/program/1.2.3/apps/server/src/main.ts"
+echo 1.2.3 > "$data/program/current"
+MOCK_ACTIVE_VERSION=1.2.3 manage backup "$backups/active.tar.gz" >/dev/null
+tar -xzOf "$backups/active.tar.gz" cc-desk-tunnel-backup.txt | grep -qx 'version=1.2.3'
+MOCK_STOPPED=1 manage restore "$archive" --yes >/dev/null
+test "$(cat "$data/program/current")" = 1.2.3
+test -f "$data/program/1.2.3/apps/server/src/main.ts"
+echo 3 > "$data/program/attempts"
+if MOCK_STOPPED=1 manage restore "$archive" --yes >/dev/null 2>&1; then exit 1; fi
+
+# A pulled image can already support the backup before the old container is replaced.
+MOCK_IMAGE_VERSION=1.2.3 MOCK_ACTIVE_VERSION=1.2.0 manage restore "$archive" --yes >/dev/null
+test "$(cat "$data/home/marker")" = kept
+
+# An invalid configuration entry is rejected before swapping live data.
+mkdir -p "$TEMP/bad/config"
+touch "$TEMP/bad/.cc-desk-tunnel-data" "$TEMP/bad/config/not-env"
+ln -s not-env "$TEMP/bad/config/service.env"
+tar -czf "$backups/invalid.tar.gz" -C "$TEMP/bad" .
+: > "$MOCK_LOG"
+if manage restore "$backups/invalid.tar.gz" --yes >/dev/null 2>&1; then exit 1; fi
+grep -qx "PROXY_TOKEN='from-backup'" "$data/config/service.env"
+grep -q ' start$' "$MOCK_LOG"
+test ! -e "$data/.restore"
 
 # The one-line installer, as root on Linux: a first install, then the command it leaves, then an upgrade.
 if [[ "$(uname -s)" != Linux ]]; then

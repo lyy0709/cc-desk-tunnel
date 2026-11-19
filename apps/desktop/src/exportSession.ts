@@ -78,6 +78,8 @@ export async function exportSession(
     const disk = client.disk;
     const latest = await disk?.latest(session.id);
     if (!latest?.events.length) throw new Error('这个会话还没有可导出的本机记录。');
+    if (latest.events.at(-1)!.sequence !== latest.lastSequence)
+      throw new Error('还有记录未缓存在本机，请连接服务后完整导出。');
     const pages = [latest.events];
     let page = latest;
     while (page.hasEarlier) {

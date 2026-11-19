@@ -656,6 +656,7 @@ handle('login:save', (_event, login) => {
       usedAt: Date.now(),
     },
     pending: undefined,
+    reservedUrl: undefined,
   });
   connections.setAutoLogin(base, connectionId, remember && login.autoLogin === true);
   takeShared();
@@ -663,8 +664,7 @@ handle('login:save', (_event, login) => {
 // The name of another connection that has signed in to the service: a window an earlier version made without
 // keeping its address may not sign in to a service another one has.
 handle('login:owner', (_event, url) => {
-  const found = connections.owner(base, url);
-  return found && found.id !== connectionId ? found.label : null;
+  return connections.claim(base, connectionId, url);
 });
 // The sign-in window starts the service's connection, made for a service new here, and waits for its window to
 // run before it goes. A service whose window is open is that window's: it is shown instead.
@@ -680,17 +680,21 @@ async function startConnection(id, flags, sign) {
   return false;
 }
 handle('launcher:start', async (_event, form) => {
-  const found = connections.owner(base, form?.url);
-  if (found && connections.running(base, found.id)) {
-    launch(found.id);
-    return { shown: found.label };
-  }
   const login = {
     url: String(form.url).trim(),
     fingerprint: String(form.fingerprint ?? ''),
     mode: form.mode === 'local' ? 'local' : 'remote',
   };
-  const id = found?.id ?? connections.create(base, login);
+  const id = connections.create(base, login);
+  if (connections.running(base, id)) {
+    launch(id);
+    return {
+      shown: connections.labelOf(
+        base,
+        connections.list(base).find((entry) => entry.id === id),
+      ),
+    };
+  }
   takeShared();
   const sign = {
     ...login,

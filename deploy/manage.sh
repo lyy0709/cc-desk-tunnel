@@ -227,20 +227,56 @@ backup_name() {
   host="$(hostname 2>/dev/null || true)"; host="${host%%.*}"; host="${host//[^A-Za-z0-9_-]/-}"
   printf 'cc-desk-tunnel-backup-%s-%s%s.tar.gz' "${host:-server}" "$(date +%Y%m%d-%H%M%S)" "${1:-}"
 }
+# Inspect the running Node process when available. A stopped deployment selects the
+# program as its entrypoint will, including the image's own bundled version.
+deployment_versions() {
+  local read_version='require("/app/apps/desktop/package.json").version'
+  current=''
+  if running; then
+    current="$(dc exec -T proxy node -e '
+      const fs = require("node:fs");
+      const children = fs.readFileSync("/proc/1/task/1/children", "utf8").trim().split(/\s+/).filter(Boolean);
+      // Release images run Node as the direct child of tini.
+      for (const pid of ["1", ...children]) {
+        let args;
+        try { args = fs.readFileSync("/proc/" + pid + "/cmdline", "utf8").split("\0"); }
+        catch (error) { if (error.code === "ENOENT") continue; throw error; }
+        if (require("node:path").basename(args[0]) !== "node") continue;
+        const main = args.find(arg => /^\/(app|data\/program\/\d+\.\d+\.\d+)\/apps\/server\/src\/main\.ts$/.test(arg));
+        if (main) {
+          console.log(require(require("node:path").resolve(main, "../../../desktop/package.json")).version);
+          process.exit(0);
+        }
+      }
+      process.exit(1);')" || fail "Cannot read running service version."
+    [[ "$current" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Unknown running service version."
+    [[ "$command" != backup ]] || return 0
+  fi
+  # Compose may already point to a different image than the running container.
+  if docker image inspect "$PROXY_IMAGE" >/dev/null 2>&1; then
+    image_version="$(docker run --rm --network none --entrypoint node "$PROXY_IMAGE" -p "$read_version")" || fail "Cannot read image version."
+  else
+    image_version="$(version_of)"  # prepare_image will pull or build this release.
+  fi
+  [[ "$image_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "Unknown image version."
+  if [[ -z "$current" ]]; then current="$(program_version "$DATA_DIR/program" "$image_version")"; fi
+}
 # With the service stopped, for SQLite and the native files to agree. Written aside and renamed when complete.
 make_backup() {
-  local note
-  note="$(mktemp -d)"
-  printf 'CC Desk Tunnel 服务端备份\nversion=%s\ncreated=%s\nhost=%s\nmode=%s\nurl=%s\n' "$(version_of)" \
-    "$(date '+%Y-%m-%d %H:%M:%S %z')" "$(hostname 2>/dev/null || true)" "$MODE" "$CONNECTION_URL" > "$note/$NOTE"
+  local note partial
+  note="$(mktemp -d)" || return 1
+  partial="$(mktemp -- "$1.XXXXXX")" || { rm -rf -- "$note"; return 1; }
+  if ! printf 'CC Desk Tunnel 服务端备份\nversion=%s\ncreated=%s\nhost=%s\nmode=%s\nurl=%s\n' "$current" \
+    "$(date '+%Y-%m-%d %H:%M:%S %z')" "$(hostname 2>/dev/null || true)" "$MODE" "$CONNECTION_URL" > "$note/$NOTE"; then
+    rm -rf -- "$note" "$partial"; return 1
+  fi
   if ! tar --exclude=./state/connections --exclude=./state/devices --exclude=./state/backups --exclude=./home/.cache \
-    --exclude=./.restore --exclude=./.replaced -czf "$1.partial" -C "$note" "$NOTE" -C "$DATA_DIR" .; then
-    rm -rf -- "$note" "$1.partial"
+    --exclude=./.restore --exclude=./.replaced -czf "$partial" -C "$note" "$NOTE" -C "$DATA_DIR" .; then
+    rm -rf -- "$note" "$partial"
     return 1
   fi
   rm -rf -- "$note"
-  chmod 600 "$1.partial"
-  mv -- "$1.partial" "$1"
+  mv -T -- "$partial" "$1"
 }
 command="${1:-help}"
 shift || true
@@ -399,6 +435,13 @@ case "$command" in
     exit ;;
 esac
 load
+if [[ "$command" = backup || "$command" = restore ]]; then
+  # Lock the directory inode itself; it stays in place throughout replacement.
+  command -v flock >/dev/null || fail "备份和还原需要 util-linux 的 flock。"
+  exec 9< "$DATA_DIR"
+  flock -xn 9 || fail "此部署正在备份或还原，请等当前操作结束。"
+  source "$ROOT/deploy/docker/program.sh"
+fi
 case "$command" in
   build) build_image ;;
   pull) pull_image ;;
@@ -505,6 +548,7 @@ case "$command" in
     [[ ! -e "$archive" ]] || fail "$archive already exists."
     [[ -d "$(dirname -- "$archive")" ]] || fail "No directory $(dirname -- "$archive")."
     [[ "$archive" != "$DATA_DIR/"* ]] || fail "Backup must be outside the data directory."
+    deployment_versions
     was_running=false; running && was_running=true
     trap 'if $was_running; then dc start >/dev/null; fi' EXIT
     echo "备份期间服务暂停，数据多时需要几分钟…"
@@ -534,16 +578,21 @@ case "$command" in
     if grep -E '(^/|(^|/)\.\.(/|$))' "$listing" >/dev/null; then fail "Unsafe archive paths."; fi
     # Data written by a newer version may not be readable by this one; migrations only go forward.
     note="$(tar -xzOf "$archive" "$NOTE" 2>/dev/null || true)"
-    from="$(sed -n 's/^version=//p' <<< "$note")" current="$(version_of)"
-    if [[ -n "$from" && -n "$current" && "$from" != "$current" \
-      && "$(printf '%s\n' "$from" "$current" | sort -V | tail -n 1)" = "$from" ]]; then
-      fail "这份备份来自 $from 版，比这里的 $current 新。先执行 sudo $(self) upgrade 升级，再还原。"
+    from="$(sed -n 's/^version=//p' <<< "$note")"
+    deployment_versions
+    local_version="$(program_version "$DATA_DIR/program" "$image_version")"
+    if [[ -n "$from" ]] && version_before "$current" "$from" && version_before "$local_version" "$from"; then
+      fail "这份备份来自 $from 版，运行中的程序和可启动的版本都较旧。先执行 sudo $(self) upgrade 升级，再还原。"
     fi
     source_text="（早期版本做的备份，没有记录来源）"
     if [[ -n "$note" ]]; then
       source_text="主机 $(sed -n 's/^host=//p' <<< "$note") · 版本 ${from:-未知} · $(sed -n 's/^created=//p' <<< "$note")"
     fi
     safety="$(dirname -- "$archive")/$(backup_name -before-restore)"
+    candidate="$safety" serial=0
+    while [[ -e "$safety" || -L "$safety" ]]; do
+      serial=$((serial + 1)); safety="${candidate%.tar.gz}-$serial.tar.gz"
+    done
     red='' plain=''
     if [[ -t 1 ]]; then red=$'\e[1;31m' plain=$'\e[0m'; fi
     cat <<NOTICE
@@ -578,11 +627,13 @@ NOTICE
     stage="$DATA_DIR/.restore" old="$DATA_DIR/.replaced"
     rm -rf -- "$stage" "$old"
     mkdir -- "$stage" "$old"
+    # Until the first live entry is moved any error leaves the original data usable.
+    trap 'rm -f -- "$listing"; rm -rf -- "$stage" "$old"; if $was_running; then dc start >/dev/null; fi' EXIT
     if ! tar -xzf "$archive" -C "$stage" --no-same-owner; then
-      rm -rf -- "$stage" "$old"
-      if $was_running; then dc start >/dev/null; fi
       fail "Could not unpack the backup; the data is as it was."
     fi
+    [[ -d "$stage/config" && ! -L "$stage/config" && -f "$stage/config/service.env" && ! -L "$stage/config/service.env" \
+      && -f "$stage/.cc-desk-tunnel-data" && ! -L "$stage/.cc-desk-tunnel-data" ]] || fail "Invalid backup configuration."
     rm -f -- "$stage/$NOTE"
     # This machine's way in stays its own. A self-signed certificate comes with the backup when this machine uses
     # one too: it names no host, so clients that pinned its fingerprint keep it.
@@ -592,9 +643,33 @@ NOTICE
       rm -rf -- "$stage/tls"
       cp -a -- "$DATA_DIR/tls" "$stage/tls"
       { grep -Ev "$way_in" "$stage/config/service.env" || true; grep -E "$way_in" "$DATA_DIR/config/service.env"; } \
-        > "$stage/config/service.env.new"
-      mv -- "$stage/config/service.env.new" "$stage/config/service.env"
+        > "$old/service.env"
+      mv -fT -- "$old/service.env" "$stage/config/service.env"
     fi
+    if [[ -n "$from" ]]; then
+      # The backup may come from a machine that ran this version from its image.
+      # Keep the working local overlay if the restored data would boot an older image.
+      if [[ -e "$stage/program" || -L "$stage/program" ]]; then
+        [[ -d "$stage/program" && ! -L "$stage/program" ]] || fail "Invalid backup program directory."
+        for marker in current attempts; do
+          file="$stage/program/$marker"
+          [[ ! -L "$file" && ( ! -e "$file" || -f "$file" ) ]] || fail "Invalid backup program marker."
+        done
+      fi
+      restored="$(program_version "$stage/program" "$image_version")"
+      if version_before "$restored" "$from"; then
+        overlay="$local_version"
+        if version_before "$overlay" "$from"; then overlay="$current"; fi
+        [[ "$overlay" != "$image_version" && -f "$DATA_DIR/program/$overlay/apps/server/src/main.ts" ]] || fail "Restore requires a newer image."
+        mkdir -p -- "$stage/program"
+        rm -rf -- "$stage/program/$overlay"
+        cp -a -- "$DATA_DIR/program/$overlay" "$stage/program/"
+        printf '%s\n' "$overlay" > "$old/program-current"
+        mv -fT -- "$old/program-current" "$stage/program/current"
+        rm -f -- "$stage/program/attempts"
+      fi
+    fi
+    trap 'rm -f -- "$listing"' EXIT
     for entry in "$DATA_DIR"/* "$DATA_DIR"/.[!.]* "$DATA_DIR"/..?*; do
       [[ -e "$entry" || -L "$entry" ]] && [[ "$entry" != "$stage" && "$entry" != "$old" ]] || continue
       mv -- "$entry" "$old/"

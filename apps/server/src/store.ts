@@ -312,11 +312,19 @@ export class SessionStore {
     );
   }
 
-  list(): Session[] {
+  list(withHistoryEnd = false): Session[] {
     return this.database
-      .prepare('SELECT metadata FROM sessions')
+      .prepare(
+        withHistoryEnd
+          ? 'SELECT metadata, (SELECT COALESCE(MAX(sequence), 0) FROM events WHERE session_id = sessions.id) AS tail FROM sessions'
+          : 'SELECT metadata FROM sessions',
+      )
       .all()
-      .map((row) => sessionSchema.parse(JSON.parse(String(row.metadata))))
+      .map((row) => {
+        const session = sessionSchema.parse(JSON.parse(String(row.metadata)));
+        if (withHistoryEnd) session.lastSequence = Number(row.tail);
+        return session;
+      })
       .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
 
@@ -362,7 +370,7 @@ export class SessionStore {
       .all(sessionId, runId)
       .map((row) => JSON.parse(String(row.data)) as SessionEvent);
   }
-  private lastSequence(sessionId: string) {
+  lastSequence(sessionId: string) {
     return Number(
       this.database
         .prepare('SELECT COALESCE(MAX(sequence), 0) AS value FROM events WHERE session_id = ?')
@@ -587,6 +595,7 @@ export class SessionStore {
   ): HistoryPage {
     const { session } = this.get(sessionId);
     const last = this.lastSequence(sessionId);
+    session.lastSequence = last;
     if (
       afterSequence > last ||
       (beforeSequence !== undefined && (beforeSequence > last + 1 || lower >= beforeSequence))
@@ -767,7 +776,8 @@ export class SessionStore {
     throughSequence = this.lastSequence(sessionId),
   ): SessionRead {
     const { session } = this.get(sessionId);
-    if (throughSequence > this.lastSequence(sessionId) || sequence > throughSequence + 1)
+    session.lastSequence = this.lastSequence(sessionId);
+    if (throughSequence > session.lastSequence || sequence > throughSequence + 1)
       throw new DomainError('invalid_cursor', '历史游标超出范围。');
     const ranges = this.readingRanges(sessionId, throughSequence);
     let index =

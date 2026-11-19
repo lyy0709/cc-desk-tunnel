@@ -1,3 +1,4 @@
+import { historyPageStart } from '../electron/history-page.mjs';
 import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
 import type { Session, SessionEvent } from '@cc-desk-tunnel/protocol';
 
@@ -15,8 +16,14 @@ import type { Session, SessionEvent } from '@cc-desk-tunnel/protocol';
 
 export type Range = [after: number, through: number];
 type Held = { id: string; ranges: Range[] };
-type Kept = { sessionId: string; sequence: number; size: number; event: SessionEvent };
-export type HeldPage = { events: SessionEvent[]; hasEarlier: boolean; gap?: boolean };
+type Kept = { sessionId: string; sequence: number; event: SessionEvent };
+type PageKey = [string, number, string, number, number];
+export type HeldPage = {
+  events: SessionEvent[];
+  hasEarlier: boolean;
+  gap?: boolean;
+  lastSequence?: number;
+};
 export type CacheStats = { bytes: number | null; sessions: number; events: number };
 export type HistoryDisk = Pick<
   HistoryCache,
@@ -32,9 +39,17 @@ export type HistoryDisk = Pick<
 
 const writeFailed = (error: unknown) => console.warn('对话缓存写入失败', error);
 
-// The service's page: whole runs, up to about this many events or this much text.
-const pageEvents = 1000;
-const pageSize = 512 * 1024;
+const encoder = new TextEncoder();
+function pageKey(event: SessionEvent): PageKey {
+  const question = event.payload.type === 'message.user' ? (event.payload.continued ? 2 : 1) : 0;
+  return [
+    event.sessionId,
+    event.sequence,
+    event.runId,
+    question,
+    encoder.encode(JSON.stringify(event)).length,
+  ];
+}
 
 export function addRange(ranges: Range[], range: Range): Range[] {
   const joined: Range[] = [];
@@ -77,14 +92,25 @@ export class HistoryCache {
       typeof indexedDB === 'undefined'
         ? Promise.resolve(null)
         : new Promise<IDBDatabase | null>((resolve) => {
-            const request = indexedDB.open(name, 1);
-            // A later layout starts over rather than converting what is kept.
-            request.onupgradeneeded = () => {
+            const request = indexedDB.open(name, 2);
+            request.onupgradeneeded = ({ oldVersion }) => {
               const database = request.result;
-              for (const store of [...database.objectStoreNames]) database.deleteObjectStore(store);
-              database.createObjectStore('about');
-              database.createObjectStore('sessions', { keyPath: 'id' });
-              database.createObjectStore('events', { keyPath: ['sessionId', 'sequence'] });
+              if (!oldVersion) {
+                database.createObjectStore('about');
+                database.createObjectStore('sessions', { keyPath: 'id' });
+                database.createObjectStore('events', { keyPath: ['sessionId', 'sequence'] });
+              }
+              const events = request.transaction!.objectStore('events');
+              const keys = database.createObjectStore('pageKeys');
+              if (oldVersion) {
+                const rows = events.openCursor();
+                rows.onsuccess = () => {
+                  const cursor = rows.result;
+                  if (!cursor) return;
+                  keys.put(pageKey(cursor.value.event), cursor.primaryKey);
+                  cursor.continue();
+                };
+              }
             };
             request.onsuccess = () => resolve(request.result);
             request.onerror = request.onblocked = () => resolve(null);
@@ -127,13 +153,14 @@ export class HistoryCache {
     const name = `${historyId}/${PROTOCOL_VERSION}`;
     this.quietly(
       this.run(
-        ['about', 'sessions', 'events'],
+        ['about', 'sessions', 'events', 'pageKeys'],
         'readwrite',
         async (transaction) => {
           const about = transaction.objectStore('about');
           if ((await result(about.get('history'))) === name) return;
           transaction.objectStore('sessions').clear();
           transaction.objectStore('events').clear();
+          transaction.objectStore('pageKeys').clear();
           about.put(name, 'history');
         },
         false,
@@ -144,7 +171,7 @@ export class HistoryCache {
   retain(sessions: Session[]) {
     const known = new Set(sessions.map(({ id }) => id));
     this.quietly(
-      this.run(['sessions', 'events'], 'readwrite', async (transaction) => {
+      this.run(['sessions', 'events', 'pageKeys'], 'readwrite', async (transaction) => {
         for (const id of await result(transaction.objectStore('sessions').getAllKeys()))
           if (!known.has(String(id))) this.remove(transaction, String(id));
       }),
@@ -153,15 +180,13 @@ export class HistoryCache {
   write({ id: sessionId }: Session, events: SessionEvent[], range: Range) {
     if (!this.ready || (!events.length && range[1] <= range[0])) return;
     this.quietly(
-      this.run(['sessions', 'events'], 'readwrite', async (transaction) => {
+      this.run(['sessions', 'events', 'pageKeys'], 'readwrite', async (transaction) => {
         const store = transaction.objectStore('events');
-        for (const event of events)
-          store.put({
-            sessionId,
-            sequence: event.sequence,
-            size: JSON.stringify(event).length,
-            event,
-          } satisfies Kept);
+        const keys = transaction.objectStore('pageKeys');
+        for (const event of events) {
+          store.put({ sessionId, sequence: event.sequence, event } satisfies Kept);
+          keys.put(pageKey(event), [sessionId, event.sequence]);
+        }
         const sessions = transaction.objectStore('sessions');
         const held = (await result(sessions.get(sessionId))) as Held | undefined;
         sessions.put({ id: sessionId, ranges: addRange(held?.ranges ?? [], range) } satisfies Held);
@@ -170,22 +195,24 @@ export class HistoryCache {
   }
   drop(sessionId: string) {
     this.quietly(
-      this.run(['sessions', 'events'], 'readwrite', (transaction) =>
+      this.run(['sessions', 'events', 'pageKeys'], 'readwrite', (transaction) =>
         this.remove(transaction, sessionId),
       ),
     );
   }
   clear() {
     this.quietly(
-      this.run(['sessions', 'events'], 'readwrite', (transaction) => {
+      this.run(['sessions', 'events', 'pageKeys'], 'readwrite', (transaction) => {
         transaction.objectStore('sessions').clear();
         transaction.objectStore('events').clear();
+        transaction.objectStore('pageKeys').clear();
       }),
     );
   }
   private remove(transaction: IDBTransaction, sessionId: string) {
     transaction.objectStore('sessions').delete(sessionId);
     transaction.objectStore('events').delete(all(sessionId));
+    transaction.objectStore('pageKeys').delete(all(sessionId));
   }
 
   // The newest page held of a session, to show while the service is asked for what came since.
@@ -210,56 +237,39 @@ export class HistoryCache {
     stretch: (ranges: Range[]) => Range | undefined,
     before: number,
   ): Promise<HeldPage | null> {
-    return this.run(['sessions', 'events'], 'readonly', async (transaction) => {
+    return this.run(['sessions', 'events', 'pageKeys'], 'readonly', async (transaction) => {
       const held = (await result(transaction.objectStore('sessions').get(sessionId))) as
         Held | undefined;
       const range = held && stretch(held.ranges);
       if (!range) return null;
-      const events: SessionEvent[] = [];
-      let size = 0;
-      let more = false;
-      let continued = false;
-      await new Promise<void>((resolve, reject) => {
-        const request = transaction
-          .objectStore('events')
-          .openCursor(
-            IDBKeyRange.bound(
-              [sessionId, range[0]],
-              [sessionId, Math.min(before, range[1] + 1)],
-              true,
-              true,
-            ),
-            'prev',
-          );
-        request.onerror = () => reject(request.error);
-        request.onsuccess = () => {
-          const cursor = request.result;
-          if (!cursor) return resolve();
-          const kept = cursor.value as Kept;
-          const full = events.length >= pageEvents || size >= pageSize;
-          if (events.length && kept.event.runId !== events.at(-1)!.runId) {
-            if (full && !continued) {
-              more = true;
-              return resolve();
-            }
-            continued = false;
-          }
-          events.push(kept.event);
-          size += kept.size;
-          if (kept.event.payload.type === 'message.user')
-            continued = kept.event.payload.continued === true;
-          cursor.continue();
-        };
-      });
-      return { events: events.reverse(), hasEarlier: more || range[0] > 0 };
+      const store = transaction.objectStore('events');
+      const end = Math.min(before, range[1] + 1);
+      const keys = (await result(
+        transaction
+          .objectStore('pageKeys')
+          .getAll(IDBKeyRange.bound([sessionId, range[0]], [sessionId, end], true, true)),
+      )) as PageKey[];
+      const first = historyPageStart(keys);
+      if (first === undefined) return null;
+      const rows = (await result(
+        store.getAll(IDBKeyRange.bound([sessionId, first], [sessionId, end], false, true)),
+      )) as Kept[];
+      return {
+        events: rows.map((row) => row.event),
+        hasEarlier: first > keys[0][1] || range[0] > 0,
+      };
     });
   }
 
   async stats(): Promise<CacheStats | null> {
-    const counts = await this.run(['sessions', 'events'], 'readonly', async (transaction) => ({
-      sessions: await result(transaction.objectStore('sessions').count()),
-      events: await result(transaction.objectStore('events').count()),
-    })).catch(() => null);
+    const counts = await this.run(
+      ['sessions', 'events', 'pageKeys'],
+      'readonly',
+      async (transaction) => ({
+        sessions: await result(transaction.objectStore('sessions').count()),
+        events: await result(transaction.objectStore('events').count()),
+      }),
+    ).catch(() => null);
     if (!counts) return null;
     const estimate = await navigator.storage?.estimate?.().catch(() => undefined);
     return { ...counts, bytes: estimate?.usage ?? null };
