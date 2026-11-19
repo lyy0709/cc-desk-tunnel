@@ -374,16 +374,13 @@ console.log('PTY-FIXTURE',result.content[0].text);await client.close();
     await terminal.open(token, device);
     await terminal.channel(3000);
     try {
-      assert.equal(
-        terminal.devices.find((d: { id: string }) => d.id === device).name,
-        `设备 ${device.slice(0, 8)}`,
-      );
       terminal.bridge.projects.commands(sessionId, true);
       const output = new PassThrough();
       let printed = '';
       output.on('data', (b) => (printed += String(b)));
       const result = await relay(terminal, sessionId, {}, new PassThrough(), output);
       assert.equal(result.code, 0);
+      assert.equal(server.store.get(sessionId).session.device?.name, `设备 ${device.slice(0, 8)}`);
       assert.match(printed, /PTY-FIXTURE.*external edited/);
       assert.ok(!printed.includes(project));
       const summary = await terminal.request({ type: 'usage.summary', profile: 'terminal' });
