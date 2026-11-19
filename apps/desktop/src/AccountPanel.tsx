@@ -201,7 +201,7 @@ export default function AccountPanel({
                   <span>
                     {window.utilization == null
                       ? '使用量未提供'
-                      : `${window.utilization}% 已用 · ${Math.max(0, 100 - window.utilization)}% 剩余`}
+                      : `${window.utilization.toLocaleString('zh-CN')}% 已用 · ${Math.max(0, 100 - window.utilization).toLocaleString('zh-CN')}% 剩余`}
                   </span>
                 </div>
                 {window.utilization != null && (
