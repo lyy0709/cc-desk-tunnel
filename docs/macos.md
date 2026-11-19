@@ -18,19 +18,9 @@ macOS 上的客户端与 Windows 上的是同一套界面和同一条连接，�
 
 ## 与 Windows 的不同
 
-对 Claude 来说两者是一回事：用户的 shell 有一个收脚本的主机（`device-zsh` 或 `device-bash`），`device` 收命令和 scp。不同的只有本机这一侧。
+两端都由随包的 `project-files` 访问绑定项目。macOS 上已授权的命令使用本机登录 shell（zsh 或 bash），运行前读取该 shell 的环境，以便使用终端中的 Homebrew、nvm 等工具。Windows 使用 PowerShell 7，也可以选择已安装的 Git Bash。
 
-| 方面 | Windows | macOS |
-| --- | --- | --- |
-| 本机 SSH 服务 | 随包的 OpenSSH，连接期间运行 | 应用自身的一个进程（ssh2），连接期间运行；不开启系统的“远程登录” |
-| 执行脚本的程序 | 随包的 PowerShell 7 | 你自己的登录 shell（zsh 或 bash；其他 shell 的用户改用系统的 zsh） |
-| 命令的环境 | 客户端进程的环境 | 连接时以登录加交互方式运行一次你的 shell，记下环境，之后的命令都用它：终端里能用的 Homebrew、nvm 等在这里也能用 |
-| 命令结束时 | 它启动的后台进程不一定结束 | 它启动的进程全部结束，包括放到后台的。提示词对两者说的是同一句话：不指望进程比命令活得久，也不指望结束命令就能停掉进程 |
-| SFTP / scp | 随包的 `sftp-server.exe` | 系统的 `/usr/libexec/sftp-server` |
-| 快捷键 | Ctrl | Command；后退、前进是 ⌘[ 和 ⌘] |
-| 升级 | 应用内 | 手动下载安装 |
-
-shell 的启动脚本（`.zprofile`、`.zshrc` 等）在连接时执行一次。它等待输入或很久不结束时，连接会在“设置 → 连接”里的 SSH 等待时间之后失败并说明原因。改了启动脚本后重新连接才生效。
+macOS 的快捷键使用 Command，⌘[ 和 ⌘] 分别后退和前进。升级通过手动下载安装包完成。
 
 ## 文件夹授权
 
@@ -40,41 +30,32 @@ macOS 对“桌面”“文稿”“下载”、外接磁盘和网络磁盘里�
 
 ## 从源码运行与打包
 
-需要 Node.js 24。
+需要 Node.js 24 和 Go 1.25 或更新版本。
 
 ```sh
 npm ci
 npm run setup:desktop
 npm run build
+node scripts/build-project-files.mjs
 npm run desktop           # 从源码运行
 npm run package:macos     # 打出本机架构的 dmg 与 zip，在 artifacts/macos/
 ```
 
-打包只能在 macOS 上进行，可用 `--arm64` / `--x64` 指定架构、`--dir` 只生成应用目录。本机架构的包打好后会被离线启动一次：主进程、界面和本机 SSH 服务都要起得来，并按服务端发脚本的方式执行一段脚本。
+打包只能在 macOS 上进行，可用 `--arm64` / `--x64` 指定架构、`--dir` 只生成应用目录。本机架构的包会做离线启动检查，验证界面和随包的项目文件工具。
 
 没有 Mac 时由 GitHub 代为构建：`package` 工作流在两种架构的机器上各打一个包并启动检查，产物和一张窗口截图随该次运行保留 3 天；发布时由同一个工作流把安装包挂到发布页（见[开发约定](development.md#发布)）。
 
 ## 实现
 
-- `electron/posix-ssh.mjs` 与 `posix-ssh-worker.mjs`：本机 SSH 服务，接口与 `windows-ssh.mjs` 相同（端口、凭据、关闭）。只接受本次连接的密钥，只执行命令和 SFTP，拒绝终端、端口转发和其他子系统。它在一个由 IPC 看管的子进程里：客户端异常退出时它随之结束，并带走它启动的命令。
-- `process-supervisor.mjs`：每条命令一个进程组，通道关闭、连接断开或客户端退出时先 TERM、限期后 KILL。自己另起会话脱离进程组的程序不在此列。
-- `shell-environment.mjs`：取登录 shell 的环境。环境经一个私有的 Unix 套接字传回，启动脚本往标准输出打印的内容不会混进去。
-- `ssh-channel-output.mjs`：修正 ssh2 1.17.0 在标准输出与标准错误共用发送窗口时的一处问题，用到了它的内部字段，并在版本不符时拒绝加载。升级 ssh2 前要重新核对这一层。
-- 服务端一侧只有两处随系统变化：shell 的主机在设备上执行的命令（`tunnel.ts` 的 `shellCommand`），和提示词里讲脚本与命令行的两句话（`device-terms.ts`）。
+- `project-access.mjs` 核验会话与项目绑定，调用随包的文件工具，并检查本机命令授权。
+- `process-supervisor.mjs` 用进程组管理命令。断开或撤权时回收受管进程，已脱离进程组的后台程序可能继续运行。
+- `shell-environment.mjs` 通过私有 Unix socket 读取登录 shell 环境。
 
-同一套执行端也用于 [Linux 客户端](linux.md)。各系统的安装包只带自己的那一套：打包时连接桥按目标系统裁剪，Windows 的包里没有这里的任何一个模块和 ssh2，macOS 与 Linux 的包里没有 Windows 的 SSH 宿主脚本。
+[Linux 客户端](linux.md)使用同一套执行器。
 
 ## 已验证与未验证
 
-在 GitHub 的 macOS 15 机器（Apple 芯片与 Intel）上自动验证的：
-
-- 用系统的 `ssh`、`scp` 走通命令、标准输入输出、退出码、并发与大输出、Unicode 路径的文件传输。
-- 密钥认证、对终端与转发请求的拒绝、空闲连接与保活。
-- 通道关闭、连接断开、客户端被强行结束时命令及其子进程的回收。
-- 经真实的服务端、连接桥和执行通道，按服务端为设备生成的 SSH 配置执行脚本、并发命令、双向传输文件；断开客户端后命令被回收。
-- 打包后的应用离线启动。
-
-使用者在真机上试过的：一台 Mac mini 连接真实的服务端，对话、由 Claude 读取本机文件和执行命令正常。
+跨设备的测试覆盖 WSS 连接、项目内读写、授权附件、图片完整性、命令撤权和断线后禁止重放写入。
 
 尚未验证，需要真机：
 

@@ -10,5 +10,5 @@ export default defineConfig({
   // second ticking does not redraw the whole page.
   plugins: [react(), babel({ presets: [reactCompilerPreset()] })],
   server: { host: '127.0.0.1', strictPort: true, watch: { ignored: ['**/vendor/**'] } },
-  build: { outDir: 'dist' },
+  build: { outDir: 'dist', license: { fileName: 'THIRD-PARTY-web.md' } },
 });

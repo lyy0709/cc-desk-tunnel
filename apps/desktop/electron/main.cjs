@@ -35,7 +35,7 @@ const { gitDiff } = require('./git-changes.cjs');
 const fileLinks = require('./file-links.cjs');
 const { asOnDisk } = require('./disk-path.cjs');
 const { openLog } = require('./client-log.cjs');
-const { hostname, tmpdir } = require('node:os');
+const { tmpdir } = require('node:os');
 const { randomUUID } = require('node:crypto');
 const { execFile, spawn } = require('node:child_process');
 const { promisify } = require('node:util');
@@ -167,7 +167,33 @@ handle('project:choose', async (event) => {
     title: '添加项目',
     properties: ['openDirectory'],
   });
-  return result.canceled ? null : (result.filePaths[0] ?? null);
+  const folder = result.canceled ? null : result.filePaths[0];
+  if (folder && bridge?.projects) {
+    const projects = bridge.projects;
+    return projects.byId(await projects.bind(folder)).path;
+  }
+  return folder ?? null;
+});
+handle('project:revoke', (_event, id) => bridge?.projects?.revokeCommands(id));
+handle('project:commands', async (event, id) => {
+  const projects = bridge?.projects;
+  if (!projects) throw new Error('设备未连接。');
+  const enabled = projects.grants.has(id);
+  const folder = projects.byId(projects.sessions.get(id) ?? '')?.path;
+  if (!folder) throw new Error('请先在本机绑定项目。');
+  const result = await dialog.showMessageBox(BrowserWindow.fromWebContents(event.sender), {
+    message: enabled ? '撤销本次会话的本机命令权限？' : '允许本会话运行本机命令？',
+    detail: folder + '\n命令以当前系统用户身份运行。断开设备连接后需重新授权。',
+    buttons: ['取消', enabled ? '撤销' : '允许'],
+    defaultId: 0,
+    cancelId: 0,
+  });
+  if (
+    result.response === 1 &&
+    projects === bridge?.projects &&
+    folder === projects.byId(projects.sessions.get(id) ?? '')?.path
+  )
+    projects.commands(id, !enabled);
 });
 handle('project:spelling', (_event, written) => asOnDisk(String(written)));
 // Which of these folders are on this computer: a session that names no computer is here when its folder is.
@@ -499,6 +525,7 @@ handle('workspace:create', async (event) => {
     const directory = path.join(day, attempt ? `${name}-${attempt}` : name);
     try {
       await mkdir(directory);
+      await bridge?.projects?.bind(directory);
       return directory;
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
@@ -535,17 +562,40 @@ handle('proxy:connect', async (event, config) => {
     (app.isPackaged
       ? path.join(process.resourcesPath, 'vendor')
       : path.join(__dirname, '../vendor'));
-  const openssh = process.env.PROXY_OPENSSH_DIR ?? path.join(vendor, 'openssh');
   const powershell = app.isPackaged ? path.join(vendor, 'pwsh/pwsh.exe') : 'pwsh.exe';
   const connection = await openProxyBridge(
     config,
     {
-      openssh,
       powershell,
+      projects: {
+        database: path.join(base, 'project-access.sqlite'),
+        helper: path.join(
+          app.isPackaged ? process.resourcesPath : path.resolve(__dirname, '../../../.local'),
+          process.platform === 'win32' ? 'project-files.exe' : 'project-files',
+        ),
+        chooseRoot: async (folder) => {
+          const result = await dialog.showOpenDialog(BrowserWindow.fromWebContents(event.sender), {
+            title: '选择并授权此项目目录',
+            defaultPath: folder,
+            properties: ['openDirectory'],
+          });
+          return !result.canceled && result.filePaths[0] === folder;
+        },
+        confirmFile: async (file) =>
+          (
+            await dialog.showMessageBox(BrowserWindow.fromWebContents(event.sender), {
+              message: '仅允许本会话读取此附件？',
+              detail: file,
+              buttons: ['取消', '允许读取'],
+              defaultId: 0,
+              cancelId: 0,
+            })
+          ).response === 1,
+      },
       scriptDirectory: app.isPackaged
         ? path.join(process.resourcesPath, 'app.asar.unpacked/electron')
         : undefined,
-      // Where Claude finds the scheduled tasks to edit; the service names the variable, not the path.
+      // Available to commands explicitly authorized on this device.
       environment: { CC_DESK_TUNNEL_SCHEDULES: schedulesPath() },
       log,
       // The system's proxy settings (manual, script or automatic detection) as Chromium reads them.
@@ -758,7 +808,7 @@ handle('drafts:load', () => {
   }
 });
 handle('drafts:save', (_event, drafts) => replaceFile(draftsPath(), JSON.stringify(drafts)));
-// Scheduled tasks are one JSON file that the window, the user and Claude over SSH may all edit. The window
+// Scheduled tasks are one JSON file that the window and the user may edit. The window
 // decides what the text means; here it is only read, written and watched. An editor's byte-order mark is
 // dropped.
 const schedulesPath = () => path.join(app.getPath('userData'), 'schedules.json');
@@ -797,17 +847,16 @@ handle('app:version', () => app.getVersion());
 handle('release:notes', async (_event, version) => {
   if (!/^\d+\.\d+\.\d+$/.test(String(version))) throw new Error('Unexpected version');
   const response = await net.fetch(
-    `https://api.github.com/repos/sun168567/cc-desk-tunnel/releases/tags/v${version}`,
+    `https://api.github.com/repos${new URL(require('../package.json').repository).pathname}/releases/tags/v${version}`,
     { headers: { Accept: 'application/vnd.github+json' }, signal: AbortSignal.timeout(15000) },
   );
   if (!response.ok) throw new Error(`GitHub ${response.status}`);
   return String((await response.json()).body ?? '').slice(0, 100_000);
 });
-// Which of the user's computers this is to the service: an ID made once and kept, under the computer's name.
-handle('device:get', () => ({
-  id: readComputer().deviceId ?? writeComputer({ deviceId: randomUUID() }).deviceId,
-  name: hostname(),
-}));
+handle('device:get', () => {
+  const id = readComputer().deviceId ?? writeComputer({ deviceId: randomUUID() }).deviceId;
+  return { id, name: connections.deviceName(id) };
+});
 // A connection is named in its window and on its tray icon by its name or its service, and in its notifications
 // once there are several.
 const label = () => {

@@ -2,6 +2,8 @@
 !package.json
 !package-lock.json
 !CHANGELOG.md
+!LICENSE
+!NOTICE
 !apps/
 !apps/server/
 !apps/server/package.json
@@ -29,6 +31,8 @@
 !deploy/
 !deploy/docker/
 !deploy/docker/Dockerfile
+!deploy/docker/runtime-guard.c
+!deploy/docker/program.sh
 !deploy/docker/entrypoint.sh
 !deploy/docker/healthcheck.mjs
 !deploy/docker/runtime-level

@@ -11,7 +11,6 @@ import {
   eventSchema,
   serverMessageSchema,
   terminalControlSchema,
-  tunnelCredentialsSchema,
 } from '../src/index.ts';
 
 test('scheduled provenance is a bounded optional marker', () => {
@@ -26,6 +25,20 @@ test('scheduled provenance is a bounded optional marker', () => {
     assert.equal(commandSchema.safeParse({ ...command, scheduled }).success, true);
   assert.equal(commandSchema.safeParse({ ...command, scheduled: 'peer' }).success, false);
   assert.equal(commandSchema.safeParse({ ...command, origin: { kind: 'human' } }).success, false);
+});
+
+test('usage queries accept proxy wall times and reject viewer timezone fields', () => {
+  const query = { type: 'usage.query', requestId: randomUUID(), range: 'today' };
+  assert.equal(commandSchema.safeParse(query).success, true);
+  for (const field of [{ offsetMinutes: 345 }, { timeZone: 'Asia/Kathmandu' }])
+    assert.equal(commandSchema.safeParse({ ...query, ...field }).success, false);
+  const range = { serverFrom: '2026-11-01T00:15', serverTo: '2026-11-01T07:30' };
+  assert.equal(commandSchema.safeParse({ ...query, range }).success, true);
+  for (const serverFrom of ['2026-11-01T00:15+05:45', '2026-11-01T00:15Z', '2026-02-31T00:00'])
+    assert.equal(
+      commandSchema.safeParse({ ...query, range: { ...range, serverFrom } }).success,
+      false,
+    );
 });
 
 test('quota controls accept only a boolean preference or explicit refresh', () => {
@@ -58,54 +71,58 @@ test('manual message priority is bounded and does not change scheduled provenanc
   assert.equal(commandSchema.safeParse({ ...message, priority: 'urgent' }).success, false);
 });
 
-test('tunnel credentials accept spaces in usernames without allowing config delimiters', () => {
-  const credentials = {
-    type: 'tunnel.credentials',
-    connectionId: randomUUID(),
-    username: 'local user',
-    privateKey: 'test-key',
-    hostPublicKey: 'ssh-ed25519 AAAATEST',
-    shells: ['pwsh'],
-  };
-  for (const username of ['local user', 'domain\\local user', 'user@example.com', 'user-name']) {
-    assert.ok(tunnelCredentialsSchema.safeParse({ ...credentials, username }).success, username);
-  }
-  for (const username of [
-    '',
-    'user\nForwardAgent yes',
-    'user\rname',
-    'user\tname',
-    'user"name',
-    'user\0name',
-    'user*',
+test('retired SSH channel frames are rejected and previous clients can negotiate an upgrade', () => {
+  for (const type of [
+    'tunnel.offer',
+    'tunnel.open',
+    'tunnel.ready',
+    'tunnel.attach',
+    'tunnel.credentials',
   ]) {
-    assert.equal(
-      tunnelCredentialsSchema.safeParse({ ...credentials, username }).success,
-      false,
-      username,
-    );
+    const frame = {
+      type,
+      connectionId: randomUUID(),
+      channelId: randomUUID(),
+      secret: 'x'.repeat(40),
+    };
+    assert.equal(serverMessageSchema.safeParse(frame).success, false);
+    assert.equal(commandSchema.safeParse(frame).success, false);
   }
+  assert.ok(
+    authSchema.safeParse({
+      type: 'auth',
+      protocolVersion: 32,
+      deviceName: 'old',
+      token: 'x'.repeat(32),
+      tunnel: true,
+    }).success,
+  );
 });
 
-test('setup tokens are bounded single-line credentials and never part of account state', () => {
-  const message = {
-    type: 'account.token',
+test('credential mediation is absent from both wire directions', () => {
+  const terminal = {
+    type: 'account.login',
     requestId: randomUUID(),
-    token: ' setup-token-fixture ',
+    sessionId: randomUUID(),
+    cols: 80,
+    rows: 24,
   };
-  const command = commandSchema.parse(message);
-  assert.equal(command.type, 'account.token');
-  if (command.type === 'account.token') assert.equal(command.token, 'setup-token-fixture');
-  for (const token of ['', 'one\ntwo', 'one two', 'x'.repeat(8193)])
-    assert.equal(commandSchema.safeParse({ ...message, token }).success, false);
-  const state = serverMessageSchema.parse({
-    type: 'account.state',
-    loggedIn: true,
-    authMethod: 'oauth_token',
-    login: null,
-    token: message.token,
-  });
-  assert.equal('token' in state, false);
+  assert.equal(commandSchema.safeParse(terminal).success, true);
+  assert.equal(commandSchema.safeParse({ ...terminal, method: 'setup-token' }).success, false);
+  for (const [type, fields] of [
+    ['account.login', {}],
+    ['account.code', { code: 'test' }],
+    ['account.token', { token: 'test' }],
+  ])
+    assert.equal(
+      commandSchema.safeParse({ type, requestId: randomUUID(), ...Object(fields) }).success,
+      false,
+    );
+  assert.equal(
+    serverMessageSchema.safeParse({ type: 'account.token.created', token: 'test', saved: true })
+      .success,
+    false,
+  );
 });
 
 test('protocol validates UTF-8 text, IDs and bounded input', () => {

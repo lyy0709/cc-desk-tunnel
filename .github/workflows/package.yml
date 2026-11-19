@@ -19,6 +19,9 @@ on:
       - scripts/release-manifest.mjs
       - scripts/smoke-posix-package.mjs
       - scripts/prepare-windows.ps1
+      - scripts/build-project-files.mjs
+      - packages/project-files/**
+      - apps/desktop/electron/component-host.ps1
       - apps/cli/install/**
 permissions:
   contents: read
@@ -65,7 +68,7 @@ jobs:
       - run: npm ci
       - run: npm run setup:desktop || (sleep 60 && npm run setup:desktop)
         shell: bash
-      # The bundled OpenSSH and PowerShell, fetched and checked against the hashes the script names.
+      # The bundled PowerShell, fetched and checked against the hashes the script names.
       - run: npm run prepare:windows:package || (sleep 60 && npm run prepare:windows:package)
         shell: bash
       # Ends with the packaged program started offline; a package that does not start fails here.

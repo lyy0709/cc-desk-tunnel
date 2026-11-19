@@ -96,6 +96,7 @@ test('a run tells what it is doing, background tasks tell they are alive, and th
           target: 'Windows',
         }),
         event(building, 3, 5, { type: 'tool.progress', toolId: 't1', elapsedSeconds: 130 }),
+        event(building, 4, 4, { type: 'native.project_mcp', status: 'disabled' }),
       ],
     ],
     [
@@ -208,6 +209,7 @@ test('a run tells what it is doing, background tasks tell they are alive, and th
 
   // A tool at work is word of the run, however long it writes nothing; its own row tells its time.
   await open(building);
+  await expect(page.getByRole('status').filter({ hasText: '项目 MCP · 已禁用' })).toBeVisible();
   const status = page.locator('.transcript > .run-indicator');
   await expect(status).toHaveText('运行中');
   await expect(page.locator('.transcript')).toContainText('正在运行命令');
@@ -215,6 +217,7 @@ test('a run tells what it is doing, background tasks tell they are alive, and th
   await shot(page, '05-运行中-工具在执行');
   // A run from which nothing has come for minutes says so, and its dot rests.
   await open(silent);
+  await expect(page.getByText('项目 MCP · 已禁用')).toHaveCount(0);
   await expect(status).toHaveText('仍在运行 · 已 5 分钟没有新输出');
   await expect(status.locator('.running-dot')).not.toHaveClass(/breathing/);
   await shot(page, '06-运行中-长时间没有输出');

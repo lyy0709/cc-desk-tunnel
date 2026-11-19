@@ -15,6 +15,7 @@ import type { SessionMessage } from '@anthropic-ai/claude-agent-sdk';
 import type { EventPayload } from '@cc-desk-tunnel/protocol';
 import {
   statusLineContext,
+  subscriptionSnapshot,
   terminalActivity,
   terminalEvents,
   terminalHooks,
@@ -79,6 +80,8 @@ test('a terminal turn comes back as the events of a chat run, without what was t
   assert.equal(prompt.text, '终端里问的');
   assert.equal(first.text, '先看看');
   assert.equal(tool.name, 'Bash');
+  assert.equal(tool.input, '');
+  assert.equal(tool.privateInput, true);
   assert.equal(result.status, 'completed');
   assert.equal(result.output, 'a.txt');
   assert.equal(second.text, '有一个文件');
@@ -436,24 +439,40 @@ test('the terminal settings add the hooks to the provider settings, readable onl
   });
 });
 
-test("the terminal status line keeps what the CLI hands it, and still shows the user's own", (t) => {
+test("personal quota includes only documented display fields while the user's status line receives the original", (t) => {
   const directory = mkdtempSync(join(tmpdir(), 'cc-desk-tunnel-terminal-status-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const settings = join(directory, 'terminal.json');
   const status = join(directory, "it's.status");
   const user = join(directory, 'user.json');
+  const context = { model: { id: 'fixture' }, context_window: { context_window_size: 200000 } };
   const input = JSON.stringify({
-    rate_limits: { five_hour: { used_percentage: 12, resets_at: 1 } },
+    ...context,
+    rate_limits: {
+      five_hour: { used_percentage: 0, internal: 'private' },
+      seven_day: { used_percentage: 5, resets_at: 2000000000 },
+      hidden: { used_percentage: 99 },
+    },
   });
   const run = (command: string) =>
     execFileSync('sh', ['-c', command], { input, encoding: 'utf8', cwd: directory });
-  // Nothing of the user's: the line shows nothing, and the input is kept.
+  const projected = {
+    ...context,
+    rate_limits: {
+      five_hour: { used_percentage: 0, resets_at: null },
+      seven_day: { used_percentage: 5, resets_at: 2000000000 },
+    },
+  };
   terminalSettings(settings, join(directory, 'terminal.hooks'), undefined, status, user);
   const plain = JSON.parse(readFileSync(settings, 'utf8')).statusLine;
   assert.equal(plain.type, 'command');
   if (process.platform !== 'win32') {
     assert.equal(run(plain.command), '');
-    assert.equal(readFileSync(status, 'utf8'), `${input}\n`);
+    assert.deepEqual(JSON.parse(readFileSync(status, 'utf8')), projected);
+    assert.deepEqual(subscriptionSnapshot(status)?.windows, [
+      { name: 'five_hour', utilization: 0, resetsAt: null },
+      { name: 'seven_day', utilization: 5, resetsAt: new Date(2000000000000).toISOString() },
+    ]);
   }
   // The user's own status line, with its padding, gets the same input and prints what it did.
   writeFileSync(
@@ -466,7 +485,7 @@ test("the terminal status line keeps what the CLI hands it, and still shows the 
   if (process.platform !== 'win32') {
     rmSync(status);
     assert.equal(run(own.command).trim(), String(input.length));
-    assert.equal(readFileSync(status, 'utf8'), `${input}\n`);
+    assert.deepEqual(JSON.parse(readFileSync(status, 'utf8')), projected);
   }
 });
 

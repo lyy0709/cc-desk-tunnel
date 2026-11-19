@@ -1,4 +1,5 @@
 import { readFileSync } from 'node:fs';
+import desktop from '../../desktop/package.json' with { type: 'json' };
 import { resolve } from 'node:path';
 import type { ServerOptions } from './server.ts';
 
@@ -52,15 +53,13 @@ export function environmentConfig(env: NodeJS.ProcessEnv, defaultDataDir: string
             key: readFileSync(env.PROXY_TLS_KEY!),
           }
         : undefined,
-    tunnel: native ? {} : undefined,
     maxRuns,
     graceMs: grace === undefined ? undefined : grace * 1000,
     allowedOrigins: env.PROXY_ORIGINS?.split(','),
     claude: native
       ? {
-          executable: env.CLAUDE_PATH ?? 'claude',
+          executable: '/usr/local/bin/ccdt-runtime',
           model: env.CLAUDE_MODEL,
-          settingsPath: env.CLAUDE_SETTINGS_PATH,
           contextRetentionDays: retention,
         }
       : undefined,
@@ -68,10 +67,9 @@ export function environmentConfig(env: NodeJS.ProcessEnv, defaultDataDir: string
   // Releases are followed only by a real service; the entry script of the image says where programs and runtime are.
   if (native && env.PROXY_RELEASE_REPO !== 'none')
     options.updates = {
-      repository: env.PROXY_RELEASE_REPO ?? 'sun168567/cc-desk-tunnel',
+      repository: env.PROXY_RELEASE_REPO ?? new URL(desktop.repository).pathname.slice(1),
       token: env.PROXY_RELEASE_TOKEN || undefined,
-      programDir:
-        env.PROXY_PROGRAM_DIR && env.PROXY_RUNTIME_DIR ? env.PROXY_PROGRAM_DIR : undefined,
+      // Proxy and runtime use one image release, so both upgrade together through Compose.
       runtimeDir: env.PROXY_RUNTIME_DIR,
       restart: () => {
         process.kill(process.pid, 'SIGTERM');

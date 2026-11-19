@@ -1,7 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
 umask 077
-mkdir -p /data/home /data/state /data/workspace
+mkdir -p /data/home/.claude/projects /data/state /data/workspace /data/cc-runner /data/state/{native,terminals,project-sockets} /data/app-home/.claude
+# Only native transcripts migrate. The personal CLI home and its credentials stay separate.
+if [[ ! -e /data/app-home/.history-migrated ]]; then
+  if [[ -d /data/home/.claude/projects && ! -e /data/app-home/.claude/projects ]]; then
+    staged="$(mktemp -d /data/app-home/.claude/.history-XXXXXXXX)"
+    trap 'rm -rf -- "$staged"' EXIT
+    cp -a /data/home/.claude/projects/. "$staged/"
+    # Import regular history and memory files only. The broker must not follow legacy links.
+    find "$staged" ! -type d ! -type f -delete
+    mv -T -- "$staged" /data/app-home/.claude/projects
+    trap - EXIT
+  fi
+  touch /data/app-home/.history-migrated
+fi
 if [ ! -r /data/config/service.env ] || [ ! -w /data/home ] || [ ! -w /data/state ]; then
   echo "Run manage.sh init first; data must be writable by container uid 1000." >&2
   exit 1

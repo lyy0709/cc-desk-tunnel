@@ -7,7 +7,6 @@ import {
 import type { EventPayload } from '@cc-desk-tunnel/protocol';
 import type {
   AccountState,
-  SetupTokenResult,
   Command,
   Device,
   IdleCompaction,
@@ -47,6 +46,7 @@ type DataMessage = Extract<
       | 'session.stats'
       | 'session.outline'
       | 'session.read'
+      | 'approval.detail'
       | 'settings.state'
       | 'compaction.state'
       | 'instructions.state'
@@ -57,6 +57,7 @@ type DataMessage = Extract<
 >;
 // Commands answered with a data frame, and the frame each one gets.
 type Replies = {
+  'approval.inspect': 'approval.detail';
   'session.outline': 'session.outline';
   'session.read': 'session.read';
   'usage.summary': 'usage.summary';
@@ -95,6 +96,7 @@ export class RequestInterruptedError extends Error {
       'session.outline',
       'session.read',
       'session.status',
+      'approval.inspect',
       'account.status',
       'usage.summary',
       'usage.query',
@@ -171,8 +173,6 @@ export type ClientState = {
   capabilities: NativeCapabilities | null;
   metrics: NativeMetrics | null;
   account: AccountState | null;
-  // A newly generated token is held only until its one-time dialog closes or this connection ends.
-  setupToken: SetupTokenResult | null;
   // The service's idle compaction setting, as it last said; every window is told when it changes.
   compaction: IdleCompaction | null;
   // What each session's background tasks last said of themselves, by task: kept while the window is open
@@ -211,7 +211,6 @@ export class ProxyClient {
     capabilities: null,
     metrics: null,
     account: null,
-    setupToken: null,
     compaction: null,
     progress: {},
   };
@@ -553,6 +552,7 @@ export class ProxyClient {
         if (message.ok) request.resolve(message);
         else {
           this.results.delete(message.requestId);
+          if (request.type === 'account.status') this.update({ account: null });
           request.reject(new Error(message.message ?? '请求失败。'));
         }
       } else if (message.type === 'connection.error') {
@@ -570,20 +570,13 @@ export class ProxyClient {
               : null,
           });
         if (
-          [
-            'unauthorized',
-            'version_mismatch',
-            'tunnel_failed',
-            'ssh_failed',
-            'connection_lost',
-            'client_failed',
-          ].includes(message.code)
+          ['unauthorized', 'version_mismatch', 'connection_lost', 'client_failed'].includes(
+            message.code,
+          )
         ) {
           // The way to the service broke, or the service could not reach back: the next attempt may do.
           const passing =
-            this.established &&
-            credentials.reconnect &&
-            ['tunnel_failed', 'ssh_failed', 'connection_lost'].includes(message.code);
+            this.established && credentials.reconnect && message.code === 'connection_lost';
           if (!passing) this.credentials = null;
           socket.close();
         }
@@ -593,6 +586,7 @@ export class ProxyClient {
         message.type === 'session.stats' ||
         message.type === 'session.outline' ||
         message.type === 'session.read' ||
+        message.type === 'approval.detail' ||
         message.type === 'settings.state' ||
         message.type === 'instructions.state' ||
         message.type === 'web.settings.state' ||
@@ -616,9 +610,6 @@ export class ProxyClient {
             ? { update, error: `服务端已升级到 ${update.latest}，正在重启；请稍候重新连接。` }
             : { update },
         );
-      } else if (message.type === 'account.token.created') {
-        const { type: _type, ...setupToken } = message;
-        this.update({ setupToken });
       } else if (message.type === 'account.state') {
         const { type: _type, ...account } = message;
         // A signed-out account must not keep showing the previous one's identity and quota.
@@ -676,6 +667,10 @@ export class ProxyClient {
           !this.state.sessions.some((session) => session.id === message.session.id)
         )
           return;
+        // Chunked pages are reconstructed in the renderer. Keep the native bridge’s translated folder.
+        const local = this.state.sessions.find((s) => s.id === message.session.id);
+        if (credentials.bridge && message.session.projectPath.startsWith('project:') && local)
+          message.session = { ...message.session, projectPath: local.projectPath };
         this.upsert(message.session);
         const id = message.session.id;
         // History up to now ends where unfinished output begins; the service sends that again, whole.
@@ -732,9 +727,15 @@ export class ProxyClient {
         if (!['native.metrics', 'native.capabilities', 'native.context'].includes(payload.type))
           this.activity.set(message.event.sessionId, at);
         if (payload.type === 'native.capabilities') this.update({ capabilities: payload });
-        if (payload.type === 'native.metrics') this.update({ metrics: payload });
-        // The service streams the shown session's events, and only some events of the others (a terminal's quota goes
-        // to every connection): one of those in a cached history would move its cursor past what was never received,
+        if (payload.type === 'native.metrics')
+          this.update({
+            metrics:
+              payload.profile === 'terminal'
+                ? { ...payload, rateLimits: this.state.metrics?.rateLimits ?? null }
+                : payload,
+          });
+        // The service streams the shown session's events and only some events of the others.
+        // One of those in a cached history would move its cursor past what was never received,
         // and showing that session again would not fetch it.
         if (
           this.disk?.update &&
@@ -776,11 +777,10 @@ export class ProxyClient {
           status: 'disconnected',
           connectionId: null,
           error: this.state.error ?? (nativeClosed ? '原生连接已结束，请重新连接。' : null),
-          setupToken: null,
         });
         return;
       }
-      this.update({ status: 'reconnecting', connectionId: null, devices: [], setupToken: null });
+      this.update({ status: 'reconnecting', connectionId: null, devices: [] });
       this.retryTimer = setTimeout(
         () => {
           this.retryTimer = undefined;
@@ -816,7 +816,7 @@ export class ProxyClient {
     socket?.close();
     this.rejectPending();
     this.retryAttempt = 0;
-    this.update({ status: 'disconnected', offline: false, connectionId: null, setupToken: null });
+    this.update({ status: 'disconnected', offline: false, connectionId: null });
   }
   async openOffline(disk: DesktopHistoryCache, device: Device) {
     this.disconnect();
@@ -1322,6 +1322,32 @@ export class ProxyClient {
   }
 
   // Data replies arrive just before their response frame.
+  inspectApproval = async (
+    sessionId: string,
+    runId: string,
+    approvalId: string,
+    signal: AbortSignal,
+  ) => {
+    let offset = 0;
+    let title: string | undefined, description: string | undefined;
+    const parts: string[] = [];
+    for (;;) {
+      const page = await this.fetch(
+        { type: 'approval.inspect', sessionId, runId, approvalId, offset },
+        signal,
+      );
+      if (!offset) {
+        title = page.title;
+        description = page.description;
+      }
+      parts.push(page.input);
+      if (page.next === undefined) return { input: parts.join(''), title, description };
+      if (page.next !== offset + page.input.length || !page.input.length)
+        throw new Error('审批参数分页无效。');
+      offset = page.next;
+    }
+  };
+
   async fetch<T extends keyof Replies>(
     command: Extract<NewCommand, { type: T }>,
     signal?: AbortSignal,

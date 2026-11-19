@@ -43,7 +43,7 @@ import type {
 import Attachments from './Attachments.tsx';
 import { describe, duration, summarize } from './activity.ts';
 import type { Category } from './activity.ts';
-import type { HistoryState, TaskProgress, OutlineState } from './client.ts';
+import type { HistoryState, TaskProgress, OutlineState, ProxyClient } from './client.ts';
 import { RunStatus, TaskLine, sessionRuntime } from './RunStatus.tsx';
 import type { Clock } from './RunStatus.tsx';
 import QuestionCard, { questionsOf } from './QuestionCard.tsx';
@@ -83,6 +83,8 @@ type Tool = Extract<TranscriptItem, { kind: 'tool' }>;
 type Text = Extract<TranscriptItem, { kind: 'user' | 'assistant' | 'thinking' }>;
 // What the rows need from the session: the clock for running timers and how to answer an approval.
 type Live = {
+  sessionId?: string;
+  inspectApproval: ProxyClient['inspectApproval'];
   now: number;
   busy: boolean;
   canApprove: (tool: Tool) => boolean;
@@ -485,7 +487,67 @@ function CommandBody({
   );
 }
 
-function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Live }) {
+type ToolRowProps = { tool: Tool; active: boolean; live: Live };
+function ToolRow(props: ToolRowProps) {
+  const { tool, live } = props;
+  if (tool.privateInput && live.canApprove(tool) && !live.answered(tool))
+    return <PendingTool key={tool.approvalId} {...props} />;
+  return <ToolContent {...props} />;
+}
+
+function PendingTool({ tool, active, live }: ToolRowProps) {
+  const { sessionId, inspectApproval } = live;
+  const { runId, approvalId } = tool;
+  const [detail, setDetail] = useState<Awaited<ReturnType<typeof inspectApproval>>>();
+  const [error, setError] = useState('');
+  const [attempt, setAttempt] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    setError('');
+    void inspectApproval(sessionId!, runId, approvalId!, controller.signal).then(
+      (value) => {
+        if (!controller.signal.aborted) setDetail(value);
+      },
+      (cause) => {
+        if (!controller.signal.aborted)
+          setError(cause instanceof Error ? cause.message : '读取审批详情失败。');
+      },
+    );
+    return () => controller.abort();
+  }, [sessionId, runId, approvalId, inspectApproval, attempt]);
+  if (!detail)
+    return (
+      <div className="tool-detail">
+        <p role="status">{error || '正在读取审批详情…'}</p>
+        {error && (
+          <button type="button" className="button" onClick={() => setAttempt(attempt + 1)}>
+            重新读取
+          </button>
+        )}
+        <button
+          type="button"
+          className="button secondary"
+          disabled={live.busy}
+          onClick={() => live.reply(tool, false)}
+        >
+          拒绝
+        </button>
+      </div>
+    );
+  return (
+    <div className="approval-preview">
+      {detail.title && <strong>{detail.title}</strong>}
+      {detail.description && <p>{detail.description}</p>}
+      <details>
+        <summary>查看完整工具参数</summary>
+        <pre className="tool-input">{detail.input}</pre>
+      </details>
+      <ToolContent tool={{ ...tool, input: detail.input }} active={active} live={live} />
+    </div>
+  );
+}
+
+function ToolContent({ tool, active, live }: ToolRowProps) {
   const { category, command, description, verb, subject, added, removed, running, failed } =
     describe(tool, active);
   const Icon = icons[category];
@@ -553,10 +615,15 @@ function ToolRow({ tool, active, live }: { tool: Tool; active: boolean; live: Li
             />
           ) : (
             <>
-              <CopyButton text={tool.input} label="复制工具输入" />
-              <pre className="tool-input" data-search-content>
-                {tool.input}
-              </pre>
+              {!tool.privateInput && (
+                <>
+                  <CopyButton text={tool.input} label="复制工具输入" />
+                  <pre className="tool-input" data-search-content>
+                    {tool.input}
+                  </pre>
+                </>
+              )}
+              {tool.privateInput && !tool.input && <span>工具参数未留存</span>}
               {tool.liveOutput && !tool.output && (
                 <pre className="tool-output" data-search-content>
                   {tool.liveOutput}
@@ -986,6 +1053,7 @@ export default function Conversation({
   newSession,
   loadEarlier,
   replyApproval,
+  inspectApproval,
   stopTask,
   backgroundTask,
   stop,
@@ -1016,6 +1084,7 @@ export default function Conversation({
   offline?: boolean;
   native: boolean;
   ownsRun: boolean;
+  inspectApproval: ProxyClient['inspectApproval'];
   busy: boolean;
   newSession: () => void;
   loadEarlier: () => Promise<void>;
@@ -1177,6 +1246,8 @@ export default function Conversation({
     () => ({
       now,
       busy,
+      sessionId: session?.id,
+      inspectApproval,
       answered: (tool) => !!tool.approvalId && answered.has(tool.approvalId),
       canApprove: (tool) =>
         connected && ownsRun && activeRun === tool.runId && !tool.resolved && !!tool.approvalId,
@@ -1219,7 +1290,20 @@ export default function Conversation({
         actions.current.backgroundTask(tool.id);
       },
     }),
-    [now, busy, answered, connected, ownsRun, activeRun, editable, editMessage, taskSent, sendTask],
+    [
+      now,
+      busy,
+      answered,
+      connected,
+      ownsRun,
+      activeRun,
+      editable,
+      editMessage,
+      taskSent,
+      sendTask,
+      session?.id,
+      inspectApproval,
+    ],
   );
   const rows = useRef<{
     live: Live;

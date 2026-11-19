@@ -14,7 +14,8 @@ export type ToolState =
   | 'cancelled'
   | 'denied'
   | 'failed'
-  | 'unknown';
+  | 'unknown'
+  | 'deferred';
 export type TranscriptItem =
   | {
       kind: 'user' | 'assistant' | 'thinking';
@@ -50,6 +51,7 @@ export type TranscriptItem =
       runId: string;
       name: string;
       input: string;
+      privateInput?: boolean;
       target: string;
       approvalId?: string;
       approved?: boolean;
@@ -117,6 +119,7 @@ export function transcript(events: SessionEvent[]): TranscriptItem[] {
         runId,
         name: payload.name,
         input: payload.input,
+        ...(payload.privateInput && { privateInput: true }),
         target: payload.target,
         resolved: false,
         status: '已请求',
@@ -171,6 +174,7 @@ export function transcript(events: SessionEvent[]): TranscriptItem[] {
           denied: '已拒绝',
           failed: '失败',
           unknown: '结果未知',
+          deferred: '已延后',
         }[payload.status];
         tool.state = payload.status;
         tool.endedAt = at;

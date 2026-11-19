@@ -1,6 +1,6 @@
 # Installs ccdt, the terminal client of CC Desk Tunnel, for the current user, in Windows PowerShell or PowerShell 7:
 #
-#   irm https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.ps1 | iex
+#   irm https://raw.githubusercontent.com/lyy0709/cc-desk-tunnel/main/deploy/install-ccdt.ps1 | iex
 #
 # It downloads the Windows package of the newest release, checks it against the release's SHA256SUMS and puts it in
 # place with the install script the package carries, which adds ccdt to the user's PATH; this window can use it at
@@ -11,7 +11,7 @@
   # Windows PowerShell draws a progress bar for every block it downloads, which makes a large file slow.
   $ProgressPreference = 'SilentlyContinue'
   [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-  $repository = 'sun168567/cc-desk-tunnel'
+  $repository = if ($env:CC_DESK_TUNNEL_REPO) { $env:CC_DESK_TUNNEL_REPO } else { 'lyy0709/cc-desk-tunnel' }
   $version = $env:CCDT_VERSION
   if (-not $version) {
     $version = (Invoke-RestMethod "https://api.github.com/repos/$repository/releases/latest").tag_name

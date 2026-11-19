@@ -7,10 +7,10 @@ Ubuntu amd64 优先；arm64 为实验性支持：镜像构建、部署自测和�
 最省事的方式是一条命令。脚本检查 Docker 等依赖（缺少时给出安装命令，不代为安装），从发布页下载最新的服务端程序包并校验，解压到 `/opt/cc-desk-tunnel`，随后进入下面的交互安装；已有部署时改为询问是否升级。程序目录可用环境变量 `CC_DESK_TUNNEL_DIR` 更改，`CC_DESK_TUNNEL_VERSION=X.Y.Z` 可指定版本（写在 `sudo env` 之后）。
 
 ```sh
-sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install.sh)"
+sudo bash -c "$(curl -fsSL https://raw.githubusercontent.com/lyy0709/cc-desk-tunnel/main/deploy/install.sh)"
 ```
 
-镜像用 GitHub 上预先构建好的 `ghcr.io/sun168567/cc-desk-tunnel:X.Y.Z`，版本与程序包相同，x86_64 和 arm64 用同一个标签，Docker 自动选择。拉取不到时（服务器连不上 ghcr.io，或这个版本发布时还没有镜像），改为在服务器上从程序包构建，首次需要几分钟，期间联网下载系统包、Node.js、Claude Code 和 npm 依赖。想始终在本机构建（例如改过 Dockerfile）时设置 `CC_DESK_TUNNEL_BUILD=1`；只用预构建镜像、拉取不到就停下时设置 `CC_DESK_TUNNEL_BUILD=0`。
+镜像用 GitHub 上预先构建好的 `ghcr.io/lyy0709/cc-desk-tunnel:X.Y.Z`，版本与程序包相同，x86_64 和 arm64 用同一个标签，Docker 自动选择。拉取不到时（服务器连不上 ghcr.io，或这个版本发布时还没有镜像），改为在服务器上从程序包构建，首次需要几分钟，期间联网下载系统包、Node.js、Claude Code 和 npm 依赖。想始终在本机构建（例如改过 Dockerfile）时设置 `CC_DESK_TUNNEL_BUILD=1`；只用预构建镜像、拉取不到就停下时设置 `CC_DESK_TUNNEL_BUILD=0`。
 
 镜像不含 Windows 安装包：服务启动后自己下载同版本的安装包，放在数据目录里供客户端升级，下载失败不影响服务。
 
@@ -85,7 +85,7 @@ sudo bash deploy/manage.sh connection
 
 `install.sh` 只检查 Docker / Compose 等依赖，缺少或 Docker 未运行时给出安装命令后退出；不安装系统软件，不修改 nginx、防火墙、SSH 或账号。在服务器上构建镜像时联网下载系统包、固定 Node / CLI 和锁定 npm 依赖；非 JS 编译安装，node-pty 在镜像构建阶段准备。Node 24 原生执行 TypeScript；发行检查仍必须 typecheck。
 
-默认一个公网 TCP 端口：WSS / HTTPS `8787`，登录、对话和执行通道都经它。运维 SSH 遵循服务器已有端口。云防火墙与主机策略自行放行，**不需要 UDP 或公开 Windows / Linux 随机 SSH 端口**。从 0.2.9 及更早版本升级的部署原先还放行了 `7000`，不再使用，可以去掉；用 `manage.sh upgrade` 升级时容器也不再发布它。Docker 发布端口可能绕过 UFW 的常规 INPUT 规则，应采用云安全组或 Docker 对应防火墙策略，不把启用 UFW 当成已限制发布端口。
+默认一个公网 TCP 端口：WSS / HTTPS `8787`，登录、对话和执行通道都经它。运维 SSH 遵循服务器已有端口。云防火墙与主机策略自行放行，项目所在设备仅需出站 WSS。从 0.2.9 及更早版本升级的部署原先还放行了 `7000`，不再使用，可以去掉；用 `manage.sh upgrade` 升级时容器也不再发布它。Docker 发布端口可能绕过 UFW 的常规 INPUT 规则，应采用云安全组或 Docker 对应防火墙策略，不把启用 UFW 当成已限制发布端口。
 
 nginx 模式下服务按 `X-Real-IP` 区分来源地址做登录限速，请保留示例里的这一行。
 
@@ -110,20 +110,22 @@ nginx 的配置步骤、检查方法和常见问题见[用 nginx 反代](nginx.m
 
 客户端填 `connection` 输出的 URL / token。自签模式填指纹；真实可信 CA 或 nginx 域名证书将指纹留空，使用 CA、有效期和主机名校验。私有 CA 可选择明确指纹；指纹模式不额外验证有效期 / 域名，首次信任应由可信 SSH 渠道获得。没有任何关闭验证且不校验指纹的模式。
 
-执行通道与控制连接用同一个地址和同一张证书，没有单独的隧道证书；每次连接另有随机生成的通道密钥，经已验证的 WSS 下发。自签证书默认一年。
+对话和项目工具请求共用设备发起的已认证 WSS 连接。自签证书默认一年。
 
 ## 模型与可写空间
 
-`config/provider.json` 是官方 Claude settings 结构，初始 `{}`；API 环境配置可写入 `env` 中的 `ANTHROPIC_BASE_URL`、`ANTHROPIC_AUTH_TOKEN`、`ANTHROPIC_MODEL`，使用提供方正式支持的接口。不要将 key 放进命令行、Git 或截图。使用订阅登录还是 API key，以及是否符合提供方条款，由使用者自行确认。
+在服务器数据目录的 `config/provider.json` 中配置自己的模型凭据，例如 `{"env":{"ANTHROPIC_API_KEY":"<your-console-key>"}}`。受支持云提供方使用相应的官方环境变量。文件应仅对部署账户可读；不要在桌面、聊天或 issue 中填写凭据。
+
+从 0.3.x 升级时先运行 `manage.sh backup`，同步升级 Compose 文件、proxy/runtime 镜像及客户端，然后执行 `manage.sh up`。两容器都应报告 healthy。新环境保留原有 home，只导入项目历史，命令授权需在设备上重新给予。回退使用旧镜像、旧 Compose 和升级前备份。
 
 持久数据位于指定 `--data`：
 
 - `home/`：原生 Claude 账号 / 配置 / 上下文、用户安装工具及缓存。
-- `state/`：代理 SQLite / WAL、原生工作目录、连接期临时 SSH 配置。
+- `state/`：代理 SQLite / WAL、原生工作目录、每次运行的项目工具 socket。
 - `workspace/`：Linux 辅助工作空间。
 - `config/`、`tls/`：服务秘密、模型配置和两套 TLS 身份。
 
-预装 Git / SSH / rsync、Node / npm、Python / pip / venv、GCC / make、curl / wget、jq / rg、文本编辑器、压缩工具、SQLite、网络与进程工具。普通用户可往 `home` / `workspace` / `/tmp` 写入、建 venv 或用户级安装 npm 包；不能直接 apt 安装系统软件。需要更多系统组件时扩展 Dockerfile。容器 root 文件层也并非全盘只读，但升级重建会丢弃其中临时修改；重要工具和记忆须存 `/data`。默认项目任务仍通过 Windows SSH。
+预装 Git / SSH / rsync、Node / npm、Python / pip / venv、GCC / make、curl / wget、jq / rg、文本编辑器、压缩工具、SQLite、网络与进程工具。普通用户可往 `home` / `workspace` / `/tmp` 写入、建 venv 或用户级安装 npm 包；不能直接 apt 安装系统软件。需要更多系统组件时扩展 Dockerfile。容器 root 文件层也并非全盘只读，但升级重建会丢弃其中临时修改；重要工具和记忆须存 `/data`。设备项目的文件与命令由所在设备经 MCP 执行。
 
 ## 运维
 
@@ -143,7 +145,7 @@ Compose 崩溃 / 主机重启恢复，`tini -g` 管理信号与孤儿进程；�
 
 升级先拉取（或构建）新镜像，失败时不改配置、不停旧容器；成功后替换容器，数据保留，被替换下来的本项目镜像随后删除，以免每次升级多占几 GB。数据迁移在新程序启动时进行，换回旧镜像不等于回到旧数据，需要回退时用升级前的备份。没有外网的服务器可在别处 `docker save`、在服务器上 `docker load`，再在私有 `docker.env` 中把 `PROXY_IMAGE` 改成导入的标签后 `up`。
 
-仅导入镜像、手工 Compose 管理时，使用 `deploy/compose.yml`（无 build）。在独立部署目录复制为 `compose.yml`，将初始化生成的 `docker.env` 复制为同目录 `.env`，确认 `PROXY_IMAGE` 为 `ghcr.io/sun168567/cc-desk-tunnel:X.Y.Z` 或已导入的标签；该配置不含 token / API key，但目录和文件仍保持私有。运行 `sudo docker compose up -d` / `ps` / `logs` / `stop`。调用备份等脚本时设置 `PROXY_DEPLOY_CONFIG=/部署目录/.env`、`PROXY_COMPOSE_FILE=/部署目录/compose.yml`，确保使用相同数据和项目。升级时改 `.env` 里的版本号，执行 `sudo docker compose pull` 和 `sudo docker compose up -d`。
+仅导入镜像、手工 Compose 管理时，使用 `deploy/compose.yml`（无 build）。在独立部署目录复制为 `compose.yml`，将初始化生成的 `docker.env` 复制为同目录 `.env`，确认 `PROXY_IMAGE` 为 `ghcr.io/lyy0709/cc-desk-tunnel:X.Y.Z` 或已导入的标签；该配置不含 token / API key，但目录和文件仍保持私有。运行 `sudo docker compose up -d` / `ps` / `logs` / `stop`。调用备份等脚本时设置 `PROXY_DEPLOY_CONFIG=/部署目录/.env`、`PROXY_COMPOSE_FILE=/部署目录/compose.yml`，确保使用相同数据和项目。升级时改 `.env` 里的版本号，执行 `sudo docker compose pull` 和 `sudo docker compose up -d`。
 
 镜像构建后，`sudo bash deploy/test.sh` 可运行不调用模型的隔离部署回归；占用测试端口 19871..19874，创建临时数据并在结束时回收。不会改既有服务；测试数据被删除，不用来测试生产数据。`sudo bash deploy/test-image.sh` 用临时的本地镜像仓库走一遍拉取、拉取失败、替换容器和旧数据迁移；`bash deploy/test-scripts.sh` 不需要 Docker，用替身检查部署脚本的各种选择。三者都在 CI 里运行。
 

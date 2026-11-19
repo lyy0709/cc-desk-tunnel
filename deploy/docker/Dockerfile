@@ -11,14 +11,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN userdel -r ubuntu && useradd --uid 1000 --create-home --shell /bin/bash ccdesktunnel
 
 FROM base AS build
+RUN apt-get update && apt-get install -y --no-install-recommends gpg gpgv && rm -rf /var/lib/apt/lists/*
 # Legacy Docker builders create WORKDIR as root, even after USER.
 RUN install -d -o ccdesktunnel -g ccdesktunnel /app
+COPY deploy/docker/runtime-guard.c /tmp/runtime-guard.c
+RUN cc -O2 -Wall -Wextra -Werror /tmp/runtime-guard.c -o /tmp/ccdt-guard
 COPY scripts/install-linux.sh /tmp/install-linux.sh
 USER ccdesktunnel
 RUN CC_DESK_TUNNEL_RUNTIME=/home/ccdesktunnel/runtime bash /tmp/install-linux.sh
 ENV PATH=/home/ccdesktunnel/runtime/node/bin:$PATH
 WORKDIR /app
-COPY --chown=ccdesktunnel:ccdesktunnel package.json package-lock.json ./
+COPY --chown=ccdesktunnel:ccdesktunnel package.json package-lock.json LICENSE NOTICE ./
 COPY --chown=ccdesktunnel:ccdesktunnel apps/server/package.json apps/server/package.json
 COPY --chown=ccdesktunnel:ccdesktunnel apps/desktop/package.json apps/desktop/package.json
 COPY --chown=ccdesktunnel:ccdesktunnel packages/protocol/package.json packages/protocol/package.json
@@ -43,8 +46,11 @@ RUN if [ ! -s apps/server/web/index.html ] && [ -f apps/desktop/src/main.tsx ]; 
 
 FROM base
 COPY --from=build --chown=root:root /home/ccdesktunnel/runtime /opt/runtime
+RUN cd /opt/runtime && sha256sum -c claude.sha256
 COPY --from=build --chown=root:root /app /app
+COPY --from=build /tmp/ccdt-guard /usr/local/bin/ccdt-guard
 COPY --from=web-build --chown=root:root /app/apps/server/web /app/apps/server/web
+RUN chmod 755 /app/apps/server/src/runtime-relay.mjs && ln -s /app/apps/server/src/runtime-relay.mjs /usr/local/bin/ccdt-runtime
 COPY deploy/docker/program.sh /usr/local/lib/cc-desk-tunnel/program.sh
 COPY deploy/docker/entrypoint.sh /usr/local/bin/proxy-entrypoint
 COPY deploy/docker/healthcheck.mjs /app/healthcheck.mjs

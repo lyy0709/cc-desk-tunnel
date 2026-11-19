@@ -1,9 +1,9 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { ArrowLeft, ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
 import type { UsagePage, UsageSummary } from '@cc-desk-tunnel/protocol';
 import type { ProxyClient } from './client.ts';
 import { IconButton } from './ui.tsx';
-import { ModelBreakdown, TokenTrend, cacheHitRate, percent } from './UsageCharts.tsx';
+import { ModelBreakdown, TokenTrend, cacheHitRate, percent, usageBars } from './UsageCharts.tsx';
 
 const pageSize = 50;
 const quotaNames: Record<string, string | undefined> = {
@@ -33,7 +33,7 @@ const total = (item: {
 }) => item.inputTokens + item.outputTokens + item.cacheReadTokens + item.cacheCreationTokens;
 const hour = 3600_000;
 const presets = [
-  ['today', '今日'],
+  ['today', '代理今日'],
   ['24h', '24 小时'],
   ['7d', '7 天'],
   ['30d', '30 天'],
@@ -41,109 +41,97 @@ const presets = [
 ] as const;
 const measures = { costUsd: '等价费用', tokens: 'Token', requests: '请求数' } as const;
 type Measure = keyof typeof measures;
-const localInput = (date: Date) =>
-  new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16);
+function serverInput(at: number, timeZone: string) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hourCycle: 'h23',
+  }).formatToParts(at);
+  const fields = Object.fromEntries(parts.map(({ type, value }) => [type, value]));
+  return `${fields.year}-${fields.month}-${fields.day}T${fields.hour}:${fields.minute}`;
+}
 
 export default function UsagePanel({
   client,
   summary,
   initial,
+  profile,
   back,
 }: {
   client: ProxyClient;
   summary: UsageSummary | null;
   initial: string;
+  profile: 'sdk' | 'terminal';
   back: () => void;
 }) {
   const [preset, setPreset] = useState(initial);
-  const [customFrom, setCustomFrom] = useState(() => localInput(new Date(Date.now() - 24 * hour)));
-  const [customTo, setCustomTo] = useState(() => localInput(new Date()));
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
   const [model, setModel] = useState('');
   const [measure, setMeasure] = useState<Measure>('costUsd');
   const [page, setPage] = useState<UsagePage | null>(null);
-  // Which page of the records is shown, from the newest.
-  const [index, setIndex] = useState(0);
+  const [paging, setPaging] = useState<{ index: number; range?: { from: string; to: string } }>({
+    index: 0,
+  });
+  const { index } = paging;
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [hover, setHover] = useState<number | null>(null);
-  const [loadedAt, setLoadedAt] = useState(() => Date.now());
+  const quotaStart = summary?.windows.find((item) => item.name === preset)?.startedAt;
   const range = useMemo(() => {
-    const now = loadedAt;
-    const window = summary?.windows.find((item) => item.name === preset);
-    const midnight = new Date(now);
-    midnight.setHours(0, 0, 0, 0);
-    const from = window
-      ? Date.parse(window.startedAt)
-      : preset === 'today'
-        ? midnight.getTime()
-        : preset === '24h'
-          ? now - 24 * hour
-          : preset === '7d'
-            ? now - 7 * 24 * hour
-            : preset === '30d'
-              ? now - 30 * 24 * hour
-              : new Date(customFrom).getTime() || now - 24 * hour;
-    const to = preset === 'custom' ? new Date(customTo).getTime() || now : now;
-    const span = Math.max(to - from, hour);
-    return {
-      from,
-      to,
-      bucketMinutes: span <= 6 * hour ? 30 : span <= 48 * hour ? 60 : 1440,
-      bounded: preset === 'custom',
-    };
-  }, [preset, customFrom, customTo, summary, loadedAt]);
-  // The range ends where it was last read, so records arriving meanwhile do not shift the pages; refreshing
-  // moves the end.
-  const load = useCallback(
-    async (index: number) => {
-      setLoading(true);
-      setError(null);
-      try {
-        const result = await client.fetch({
-          type: 'usage.query',
-          from: new Date(range.from).toISOString(),
-          to: new Date(range.to).toISOString(),
-          ...(model && { model }),
-          offset: index * pageSize,
-          limit: pageSize,
-          bucketMinutes: range.bucketMinutes,
-          offsetMinutes: -new Date().getTimezoneOffset(),
-        });
-        setPage(result);
-        setIndex(index);
-      } catch (error) {
-        setError(error instanceof Error ? error.message : '读取失败。');
-      } finally {
-        setLoading(false);
-      }
-    },
-    [client, range, model],
-  );
+    if (preset === 'today' || preset === '24h' || preset === '7d' || preset === '30d')
+      return preset;
+    if (preset === 'custom')
+      return customFrom && customTo ? { serverFrom: customFrom, serverTo: customTo } : null;
+    return quotaStart ? { from: quotaStart } : null;
+  }, [preset, customFrom, customTo, quotaStart]);
   useEffect(() => {
-    void load(0);
-  }, [load]);
-  // Empty buckets are drawn too, so the time axis stays even.
-  const bars = useMemo(() => {
-    const step = range.bucketMinutes * 60_000,
-      offset = -new Date().getTimezoneOffset() * 60_000;
-    const align = (time: number) => Math.floor((time + offset) / step) * step - offset;
-    const values = new Map((page?.series ?? []).map((item) => [Date.parse(item.at), item]));
-    const result = [];
-    for (let at = align(range.from); at <= range.to && result.length < 400; at += step)
-      result.push(
-        values.get(at) ?? {
-          at: new Date(at).toISOString(),
-          requests: 0,
-          tokens: 0,
-          inputTokens: 0,
-          outputTokens: 0,
-          cacheReadTokens: 0,
-          cacheCreationTokens: 0,
-          costUsd: 0,
+    const requested = paging.range ?? range;
+    setError(null);
+    if (!requested) {
+      setPage(null);
+      setLoading(false);
+      return;
+    }
+    let current = true;
+    setLoading(true);
+    void client
+      .fetch({
+        type: 'usage.query',
+        range: requested,
+        ...(quotaStart && { profile }),
+        ...(model && { model }),
+        offset: paging.index * pageSize,
+        limit: pageSize,
+      })
+      .then(
+        (result) => {
+          if (current) setPage(result);
         },
-      );
-    return result;
-  }, [page?.series, range]);
+        (cause) => {
+          if (current) {
+            setPage(null);
+            setError(cause instanceof Error ? cause.message : '读取失败。');
+          }
+        },
+      )
+      .finally(() => {
+        if (current) setLoading(false);
+      });
+    return () => {
+      current = false;
+    };
+  }, [client, model, range, paging, quotaStart, profile]);
+  const turnPage = (index: number) => {
+    if (page) setPaging({ index, range: { from: page.from, to: page.to } });
+  };
+  const span = page ? Date.parse(page.to) - Date.parse(page.from) : 0;
+  const bucketMinutes = span <= 6 * hour ? 30 : span <= 48 * hour ? 60 : 1440;
+  const bars = useMemo(() => (page ? usageBars(page, bucketMinutes) : []), [page, bucketMinutes]);
   const peak = Math.max(...bars.map((bar) => bar[measure]), 0);
   const format = (value: number) =>
     measure === 'costUsd'
@@ -154,9 +142,15 @@ export default function UsagePanel({
   const bucketLabel = (at: string) =>
     new Date(at).toLocaleString(
       'zh-CN',
-      range.bucketMinutes >= 1440
+      bucketMinutes >= 1440
         ? { month: 'numeric', day: 'numeric' }
-        : { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' },
+        : {
+            month: 'numeric',
+            day: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            timeZoneName: 'shortOffset',
+          },
     );
   const totals = page?.totals;
   const pages = Math.max(Math.ceil((totals?.requests ?? 0) / pageSize), 1);
@@ -167,7 +161,7 @@ export default function UsagePanel({
           <ArrowLeft />
         </IconButton>
         <h1>调用日志</h1>
-        <IconButton title="刷新调用日志" disabled={loading} onClick={() => setLoadedAt(Date.now())}>
+        <IconButton title="刷新调用日志" disabled={loading} onClick={() => setPaging({ index: 0 })}>
           <RefreshCw className={loading ? 'spinning' : ''} />
         </IconButton>
       </header>
@@ -184,9 +178,15 @@ export default function UsagePanel({
                 type="button"
                 key={value}
                 aria-pressed={preset === value}
+                disabled={value === 'custom' && !page && !customTo}
                 onClick={() => {
+                  if (value === 'custom' && !customTo && page) {
+                    const end = Date.parse(page.to);
+                    setCustomFrom(serverInput(end - 24 * hour, page.timeZone));
+                    setCustomTo(serverInput(end, page.timeZone));
+                  }
                   setPreset(value);
-                  setLoadedAt(Date.now());
+                  setPaging({ index: 0 });
                 }}
               >
                 {label}
@@ -196,7 +196,10 @@ export default function UsagePanel({
           <select
             aria-label="模型"
             value={model}
-            onChange={(event) => setModel(event.target.value)}
+            onChange={(event) => {
+              setModel(event.target.value);
+              setPaging({ index: 0 });
+            }}
           >
             <option value="">全部模型</option>
             {[...new Set([...(page?.models ?? []), ...(model ? [model] : [])])].map((name) => (
@@ -212,7 +215,10 @@ export default function UsagePanel({
                 aria-label="开始时间"
                 value={customFrom}
                 max={customTo}
-                onChange={(event) => setCustomFrom(event.target.value)}
+                onChange={(event) => {
+                  setCustomFrom(event.target.value);
+                  setPaging({ index: 0 });
+                }}
               />
               <span>至</span>
               <input
@@ -220,11 +226,19 @@ export default function UsagePanel({
                 aria-label="结束时间"
                 value={customTo}
                 min={customFrom}
-                onChange={(event) => setCustomTo(event.target.value)}
+                onChange={(event) => {
+                  setCustomTo(event.target.value);
+                  setPaging({ index: 0 });
+                }}
               />
             </div>
           )}
         </div>
+        {page && (
+          <p className="muted">
+            今日和自定义范围使用代理时区 {page.timeZone}，图表和记录按本机时间显示。
+          </p>
+        )}
         {error && (
           <p className="error-text" role="alert">
             {error}
@@ -274,11 +288,7 @@ export default function UsagePanel({
         <figure className="usage-chart">
           <figcaption>
             <span>
-              {range.bucketMinutes >= 1440
-                ? '每日'
-                : range.bucketMinutes === 60
-                  ? '每小时'
-                  : '每 30 分钟'}
+              {bucketMinutes >= 1440 ? '每日' : bucketMinutes === 60 ? '每小时' : '每 30 分钟'}
               {measures[measure]}
             </span>
             <div className="segmented" role="group" aria-label="图表指标">
@@ -401,7 +411,7 @@ export default function UsagePanel({
                 title="上一页"
                 disabled={loading || index === 0}
                 onClick={() => {
-                  void load(index - 1);
+                  turnPage(index - 1);
                 }}
               >
                 <ChevronLeft />
@@ -417,7 +427,7 @@ export default function UsagePanel({
                   onKeyDown={(event) => {
                     if (event.key !== 'Enter') return;
                     const wanted = Math.round(Number(event.currentTarget.value));
-                    if (wanted >= 1 && wanted <= pages) void load(wanted - 1);
+                    if (wanted >= 1 && wanted <= pages) turnPage(wanted - 1);
                     else event.currentTarget.value = String(index + 1);
                   }}
                   onBlur={(event) => {
@@ -430,7 +440,7 @@ export default function UsagePanel({
                 title="下一页"
                 disabled={loading || !page.hasMore}
                 onClick={() => {
-                  void load(index + 1);
+                  turnPage(index + 1);
                 }}
               >
                 <ChevronRight />

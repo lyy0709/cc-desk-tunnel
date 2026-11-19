@@ -17,6 +17,8 @@ contextBridge.exposeInMainWorld('desktop', {
   renameAccount: (id, name) => ipcRenderer.invoke('accounts:rename', id, name),
   forgetAccount: (id) => ipcRenderer.invoke('accounts:forget', id),
   newLoginWindow: () => ipcRenderer.invoke('login:window'),
+  revokeSessionCommands: (id) => ipcRenderer.invoke('project:revoke', id),
+  sessionCommands: (id) => ipcRenderer.invoke('project:commands', id),
   chooseProject: () => ipcRenderer.invoke('project:choose'),
   asOnDisk: (path) => ipcRenderer.invoke('project:spelling', path),
   foldersExist: (folders) => ipcRenderer.invoke('folders:exist', folders),

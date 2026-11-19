@@ -1,13 +1,13 @@
 #!/bin/sh
 # Installs ccdt, the terminal client of CC Desk Tunnel, for the current user on macOS or Linux:
 #
-#   curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/lyy0709/cc-desk-tunnel/main/deploy/install-ccdt.sh | sh
 #
 # It downloads the package of the newest release for this system, checks it against the release's SHA256SUMS and puts
 # it in place with the install script the package carries. No root is needed. CCDT_VERSION=0.3.9 takes that release
 # instead, the one of the service; CCDT_DOWNLOAD_ONLY=1 only unpacks the checked package into the current directory.
 set -eu
-repository=sun168567/cc-desk-tunnel
+repository=${CC_DESK_TUNNEL_REPO:-lyy0709/cc-desk-tunnel}
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) system=mac-arm64 ;;
   Darwin-x86_64) system=mac-x64 ;;

@@ -84,7 +84,7 @@ test('native partial text/thinking are not duplicated by complete assistant even
   assert.equal(events.filter((event) => event.type === 'thinking.delta').length, 1);
   assert.equal(stream.result?.failed, false);
 });
-test('native Bash input, permission identity and unmodified tool results remain correlated', () => {
+test('native tool identity and results stay correlated without retaining complete or streamed inputs', () => {
   const events: EventPayload[] = [];
   const stream = new ClaudeStream((event) => events.push(event));
   const toolId = 'call_native_not_uuid';
@@ -102,7 +102,7 @@ test('native Bash input, permission identity and unmodified tool results remain 
     event: {
       type: 'content_block_delta',
       index: 0,
-      delta: { type: 'input_json_delta', partial_json: '{"command":"ssh -F config windows"}' },
+      delta: { type: 'input_json_delta', partial_json: '{"command":"echo private-fixture"}' },
     },
   });
   stream.accept({
@@ -113,12 +113,14 @@ test('native Bash input, permission identity and unmodified tool results remain 
           type: 'tool_use',
           id: toolId,
           name: 'Bash',
-          input: { command: 'ssh -F config windows' },
+          input: { command: 'echo private-fixture' },
         },
       ],
     },
   });
-  assert.equal(stream.tool('Bash', { command: 'ssh -F config windows' }, toolId).id, toolId);
+  assert.equal(stream.tool('Bash', toolId).id, toolId);
+  assert.ok(!JSON.stringify(events).includes('echo private-fixture'));
+  assert.ok(events.some((e) => e.type === 'tool.requested' && e.privateInput && e.input === ''));
   stream.accept({
     type: 'user',
     message: {
@@ -143,7 +145,7 @@ test('native Bash input, permission identity and unmodified tool results remain 
 test('native denials and upstream failures are represented without inventing a policy', () => {
   const events: EventPayload[] = [];
   const stream = new ClaudeStream((event) => events.push(event));
-  stream.tool('Bash', { command: 'example' }, 'native-tool').denied = true;
+  stream.tool('Bash', 'native-tool').denied = true;
   stream.accept({
     type: 'user',
     message: {
@@ -172,8 +174,8 @@ test('native denials and upstream failures are represented without inventing a p
 test('identical concurrent native calls keep their IDs and progress uses real SDK events', () => {
   const events: EventPayload[] = [];
   const stream = new ClaudeStream((event) => events.push(event));
-  stream.tool('Bash', { command: 'same' }, 'call-1');
-  stream.tool('Bash', { command: 'same' }, 'call-2');
+  stream.tool('Bash', 'call-1');
+  stream.tool('Bash', 'call-2');
   assert.equal(stream.tools.size, 2);
   stream.accept({ type: 'tool_progress', tool_use_id: 'call-2', elapsed_time_seconds: 3 });
   assert.ok(
@@ -207,7 +209,7 @@ test('identical concurrent native calls keep their IDs and progress uses real SD
 test("a call waiting on a foreground task names it; a background task or another agent's call does not", () => {
   const events: EventPayload[] = [];
   const stream = new ClaudeStream((event) => events.push(event));
-  stream.tool('Bash', { command: 'npm test' }, 'call-1');
+  stream.tool('Bash', 'call-1');
   const started = { type: 'system', subtype: 'task_started', description: 'npm test' };
   stream.accept({ ...started, task_id: 'b1', tool_use_id: 'call-1', is_backgrounded: false });
   stream.accept({ ...started, task_id: 'b2', tool_use_id: 'call-1', is_backgrounded: true });
@@ -217,6 +219,29 @@ test("a call waiting on a foreground task names it; a background task or another
     events.filter((event) => event.type === 'tool.task'),
     [{ type: 'tool.task', toolId: 'call-1', taskId: 'b1' }],
   );
+});
+
+test('a deferred native tool ends in its own state without mirroring its input', () => {
+  const events: EventPayload[] = [];
+  const stream = new ClaudeStream((event) => events.push(event));
+  stream.accept({
+    type: 'result',
+    subtype: 'success',
+    deferred_tool_use: {
+      id: 'deferred-1',
+      name: 'mcp__project__edit',
+      input: { new: 'private replacement' },
+    },
+  });
+  assert.equal(stream.tools.get('deferred-1')?.finished, true);
+  assert.deepEqual(events.at(-1), {
+    type: 'tool.result',
+    toolId: 'deferred-1',
+    status: 'deferred',
+    output: '',
+    exitCode: null,
+  });
+  assert.ok(!JSON.stringify(events).includes('private replacement'));
 });
 
 test('requested and effective native approval modes remain distinct', () => {

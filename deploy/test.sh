@@ -29,7 +29,7 @@ manage up
 source "$PROXY_DEPLOY_CONFIG"
 compose=(docker compose --env-file "$PROXY_DEPLOY_CONFIG" -p "$PROJECT_NAME" -f "$ROOT/deploy/docker/compose.yaml")
 id="$("${compose[@]}" ps -q proxy)"
-docker exec "$id" bash -c 'test "$(id -u)" = 1000; test ! -w /app/apps/server/src/main.ts; test ! -w /opt/runtime/cli/bin/claude; printf native-memory > /data/home/deploy-marker; printf workspace-memory > /data/workspace/deploy-marker; node --version; claude --version; python3 --version; git --version; command -v ssh g++ make jq rg'
+docker exec "$id" bash -c 'test "$(id -u)" = 1000; test ! -w /app/apps/server/src/main.ts; test ! -w /opt/runtime/cli/bin/claude; printf native-memory > /data/home/deploy-marker; printf workspace-memory > /data/workspace/deploy-marker; node --version; test -x /opt/runtime/cli/bin/claude; python3 --version; git --version; command -v ssh g++ make jq rg'
 curl --cacert "$TEMP/data/tls/control.crt" --resolve cc-desk-tunnel.local:19871:127.0.0.1 -fsS https://cc-desk-tunnel.local:19871/health
 manage renew
 manage backup "$TEMP/backup.tar.gz"

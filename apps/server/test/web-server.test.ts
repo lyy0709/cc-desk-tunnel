@@ -333,8 +333,6 @@ test('browser controls an existing device session but cannot claim a device or i
     { type: 'session.fork', sessionId: created.sessionId },
     { type: 'session.move', sessionId: created.sessionId, projectPath: '/tmp' },
     { type: 'project.move', from: 'C:\\project', to: 'C:\\other' },
-    { type: 'account.logout' },
-    { type: 'account.token', token: 'test-only-token' },
     { type: 'web.certificate.get' },
     { type: 'service.update.check' },
   ])
@@ -489,16 +487,10 @@ test('background read types do not renew activity; a browser opens no terminal; 
   }
   assert.equal(browserActivity.has('message.send'), true);
   assert.equal(browserCommands.has('terminal.open'), false);
-  const args = terminalArguments(
-    { executable: 'claude' },
-    { permissionMode: 'auto' } as never,
-    undefined,
-    {
-      resume: false,
-      settingsPath: '/t.json',
-      execution: { platform: 'win32', shells: ['pwsh'] },
-    },
-  );
+  const args = terminalArguments({ executable: 'claude' }, { permissionMode: 'auto' } as never, {
+    resume: false,
+    settingsPath: '/t.json',
+  });
   assert.equal(args.includes('--append-system-prompt'), false);
   assert.equal(
     args.some((arg) => /SSH|device-/.test(arg)),

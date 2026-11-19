@@ -5,10 +5,7 @@ import { dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { _electron } from '@playwright/test';
 
-// Starts a packaged macOS or Linux application offline, with a profile of its own: the main process, the
-// preload and the page have to come up, and the SSH service has to start from the packaged files alone and
-// run a script the way the service sends one. The package's own program serves as the Node that checks the
-// latter. Takes the application (the .app of macOS, the program file of Linux) and further arguments for it.
+// Launch the packaged app offline and read a fixture with its shipped project-files helper.
 const mac = process.platform === 'darwin';
 if (process.platform === 'win32' || !process.argv[2] || mac !== process.argv[2].endsWith('.app'))
   throw new Error('Usage: node scripts/smoke-posix-package.mjs <application> [arguments]');
@@ -16,6 +13,8 @@ const executable = mac
   ? join(resolve(process.argv[2]), 'Contents/MacOS/CC Desk Tunnel')
   : resolve(process.argv[2]);
 const archive = join(dirname(executable), mac ? '../Resources/app.asar' : 'resources/app.asar');
+for (const name of ['LICENSE', 'NOTICE'])
+  assert.deepEqual(readFileSync(join(dirname(archive), 'licenses', name)), readFileSync(name));
 // The shell each system gives its users: the script host has to work with both.
 const shell = mac ? '/bin/zsh' : '/bin/bash';
 const root = resolve('.local/package-smoke');
@@ -129,33 +128,19 @@ try {
       assert.ok(stats.bytes > 0);
       assert.equal(stats.events, 0);
     } finally { await cache.close(); }
-    // The bridge as it is packaged: one file, which starts the SSH service's process from the files beside it.
     const bridge = await import(pathToFileURL(join(root, 'electron/proxy-bridge.mjs')));
     assert.equal(typeof bridge.openProxyBridge, 'function');
-    const service = await bridge.startLocalSsh(randomUUID(), {
-      shellPath: process.env.CC_PACKAGE_SHELL,
-      env: { HOME: directory, ZDOTDIR: directory, PATH: '/usr/bin:/bin:/usr/sbin:/sbin' },
-      environment: { CC_DESK_TUNNEL_SCHEDULES: join(directory, 'schedules.json') },
-      cwd: directory,
-    }, new AbortController().signal, (message) => { throw new Error(message); });
-    try {
-      const identity = join(directory, 'identity');
-      const known = join(directory, 'known_hosts');
-      await writeFile(identity, service.credentials.privateKey, { mode: 0o600 });
-      await writeFile(known, '[127.0.0.1]:' + service.port + ' ' + service.credentials.hostPublicKey + '\n');
-      // What the service's SSH configuration has for the host of the user's shell: see shellCommand in tunnel.ts.
-      assert.deepEqual(service.credentials.shells, [process.env.CC_PACKAGE_SHELL.split('/').pop()]);
-      const output = await new Promise((done, fail) => {
-        const child = execFile('/usr/bin/ssh', [
-          '-p', String(service.port), '-i', identity, '-o', 'BatchMode=yes', '-o', 'IdentitiesOnly=yes',
-          '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + known,
-          service.credentials.username + '@127.0.0.1', 'exec "$CC_DESK_TUNNEL_SHELL" -s',
-        ], { timeout: 15000 }, (error, stdout) => (error && error.code !== 7 ? fail(error) : done({ stdout, code: error?.code ?? 0 })));
-        child.stdin.end('echo "packaged $CC_DESK_TUNNEL_SCHEDULES"\nexit 7\n');
-      });
-      assert.equal(output.stdout, 'packaged ' + join(directory, 'schedules.json') + '\n');
-      assert.equal(output.code, 7);
-    } finally { await service.close(); }
+    const helper=join(root,'..','project-files');
+    const files = (request) => new Promise((ok,fail)=>{
+      const child=execFile(helper,[directory],(err,stdout)=>err?fail(err):ok(JSON.parse(stdout)));
+      child.stdin.end(JSON.stringify(request));
+    });
+    const { text: identity } = await files({op:'bind'});
+    assert.ok(identity);
+    const created = await files({op:'create', identity, path:'smoke.txt', new:'packaged helper'});
+    assert.ifError(created.error);
+    assert.equal((await files({op:'read',identity,path:'smoke.txt'})).text,'packaged helper');
+
   `,
     ],
     {
@@ -252,7 +237,7 @@ try {
     }
   }
   console.log(
-    'PASS: the packaged client starts offline, its SSH service runs a script and a connection opens in a process of its own.',
+    'PASS: the packaged client starts offline, its packaged helper reads a project file and a connection opens in a process of its own.',
   );
 } finally {
   // The sign-in window may have gone already.

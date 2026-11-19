@@ -2,12 +2,15 @@ name: ${PROJECT_NAME:-cc-desk-tunnel}
 services:
   proxy:
     image: ${PROXY_IMAGE:?Run manage.sh init and pull, or specify a versioned image in .env}
+    environment:
+      HOME: /data/app-home
+      CLAUDE_CONFIG_DIR: /data/app-home/.claude
     restart: unless-stopped
     stop_grace_period: 30s
     ports:
       - "${CONTROL_BIND:-0.0.0.0}:${CONTROL_PORT:-8787}:8787"
     volumes:
-      - "${DATA_DIR:?Specify the initialized data directory in .env}:/data:Z"
+      - "${DATA_DIR:?Specify the initialized data directory in .env}:/data:z"
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -17,3 +20,35 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  runtime:
+    user: "0:0"
+    image: ${PROXY_IMAGE:?Run manage.sh init and pull, or specify a versioned image in .env}
+    depends_on:
+      proxy:
+        condition: service_healthy
+    restart: unless-stopped
+    network_mode: service:proxy
+    environment:
+      HOME: /data/app-home
+      CLAUDE_CONFIG_DIR: /data/app-home/.claude
+    working_dir: /tmp
+    entrypoint: ["/usr/bin/tini", "-g", "--", "node", "/app/apps/server/src/runtime-worker.ts"]
+    volumes:
+      - "${DATA_DIR:?Run manage.sh init}/app-home:/data/app-home:rw,z"
+      - "${DATA_DIR:?Run manage.sh init}/home:/data/home:rw,z"
+      - "${DATA_DIR:?Run manage.sh init}/state/native:/data/state/native:rw,z"
+      - "${DATA_DIR:?Run manage.sh init}/state/terminals:/data/state/terminals:rw,z"
+      - "${DATA_DIR:?Run manage.sh init}/state/project-sockets:/data/state/project-sockets:rw,z"
+      - "${DATA_DIR:?Run manage.sh init}/cc-runner:/data/cc-runner:rw,z"
+      - "${DATA_DIR:?Run manage.sh init}/config/provider.json:/data/provider.json:ro,z"
+    tmpfs:
+      - /data/home/.claude/projects:mode=0711,uid=0,gid=0
+    cap_drop: [ALL]
+    cap_add: [CHOWN, FOWNER, SETUID, SETGID, DAC_OVERRIDE, KILL]
+    security_opt: [no-new-privileges:true]
+    healthcheck:
+      test: ["CMD", "node", "-e", "const s=require('net').connect('/data/cc-runner/launch.sock',()=>s.end());s.on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 3

@@ -5,6 +5,9 @@ ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG="${PROXY_DEPLOY_CONFIG:-$ROOT/.local/docker.env}"
 COMPOSE="${PROXY_COMPOSE_FILE:-$ROOT/deploy/compose.yml}"
 
+# Use the publication repository recorded in this copy of the server bundle.
+REPOSITORY="${CC_DESK_TUNNEL_REPO:-$(sed -n 's|^ *"repository": "https://github.com/\([^"]*\)".*|\1|p' "$ROOT/apps/desktop/package.json")}"
+
 usage() {
   cat <<'HELP'
 Usage:
@@ -26,7 +29,7 @@ Requires Docker Engine + Compose v2+, Bash, OpenSSL, curl, tar.
 Use sudo if your user cannot access Docker. Config defaults to .local/docker.env;
 set PROXY_DEPLOY_CONFIG to manage a different isolated installation.
 Set PROXY_COMPOSE_FILE when managing an image-only standalone compose.yml.
-The image is the prebuilt one of this program's version (ghcr.io/sun168567/cc-desk-tunnel:X.Y.Z), built here
+The image is the prebuilt one of this program's version (ghcr.io/lyy0709/cc-desk-tunnel:X.Y.Z), built here
 when it cannot be pulled. CC_DESK_TUNNEL_BUILD=1 always builds here, CC_DESK_TUNNEL_BUILD=0 never does.
 upgrade fetches the newest release; CC_DESK_TUNNEL_VERSION=X.Y.Z picks another.
 After an install with sudo, `sudo cc-desk-tunnel COMMAND` runs this script from anywhere.
@@ -49,7 +52,17 @@ host_of() {
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535)); }
 safe_value() { [[ "$1" != *"'"* && "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *'$'* && "$1" != *'`'* ]]; }
 write_var() { safe_value "$2" || fail "Unsupported characters in $1"; printf "%s='%s'\n" "$1" "$2"; }
-dc() { docker compose --env-file "$CONFIG" -p "$PROJECT_NAME" -f "$COMPOSE" "$@"; }
+dc() {
+  if [[ "${1:-}" = up ]]; then
+    # Bind sources must exist before Compose creates either container (otherwise Docker makes them root-owned).
+    for part in app-home cc-runner state/native state/terminals state/project-sockets; do
+      if [[ ! -e "$DATA_DIR/$part" ]]; then
+        mkdir -p -- "$DATA_DIR/$part"
+        [[ "$(id -u)" != 0 ]] || chown 1000:1000 "$DATA_DIR/$part"
+      fi
+    done
+  fi
+  docker compose --env-file "$CONFIG" -p "$PROJECT_NAME" -f "$COMPOSE" "$@"; }
 load() {
   [[ -f "$CONFIG" ]] || fail "Run init first."
   # This file is a private, locally generated deployment configuration.
@@ -87,7 +100,10 @@ wait_healthy() {
   [[ -n "$id" ]] || fail "Container did not start."
   for _ in {1..60}; do
     state="$(docker inspect --format '{{.State.Health.Status}}' "$id")"
-    [[ "$state" = healthy ]] && return
+    if [[ "$state" = healthy ]]; then
+      local runtime_id; runtime_id="$(dc ps -q runtime)"
+      if [[ -n "$runtime_id" && "$(docker inspect --format '{{.State.Health.Status}}' "$runtime_id")" = healthy ]]; then return; fi
+    fi
     [[ "$(docker inspect --format '{{.State.Running}}' "$id")" = true ]] || break
     sleep 2
   done
@@ -119,7 +135,7 @@ pull_image() {
   local version image
   version="$(version_of)"
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "No program version in $ROOT/apps/desktop/package.json."
-  image="${CC_DESK_TUNNEL_IMAGE:-ghcr.io/sun168567/cc-desk-tunnel}:$version"
+  image="${CC_DESK_TUNNEL_IMAGE:-ghcr.io/${REPOSITORY,,}}:$version"
   echo "拉取镜像 $image …"
   docker pull "$image" || return
   # Only a pulled image is configured: a failed pull leaves the deployment as it was.
@@ -139,7 +155,7 @@ prepare_image() {
 }
 # The newest release's server archive (or CC_DESK_TUNNEL_VERSION's), checked against its SHA256SUMS.
 fetch_release() {
-  local releases=https://github.com/sun168567/cc-desk-tunnel/releases name version current
+  local releases="https://github.com/$REPOSITORY/releases" name version current
   local listed="$releases/latest/download"
   if [[ -n "${CC_DESK_TUNNEL_VERSION:-}" ]]; then
     [[ "$CC_DESK_TUNNEL_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "CC_DESK_TUNNEL_VERSION must be X.Y.Z."
@@ -212,8 +228,8 @@ summary() {
   echo "下一步"
   echo "  1. 云防火墙只放行上面“需放行端口”一项；本项目不需要其他入站端口。"
   echo "  2. Windows 客户端填入服务地址、指纹和凭据并连接。"
-  echo "  3. 在客户端账号页登录 Claude 账号。"
-  echo "  使用第三方 API 时编辑 $DATA_DIR/config/provider.json 后执行 sudo $(self) restart。"
+  echo "  3. 在服务器 config/provider.json 配置你自己的 API key 或云提供方。"
+  echo "  模型提供方配置位于 $DATA_DIR/config/provider.json 后执行 sudo $(self) restart。"
   echo "  日常管理：sudo $(self) status | logs | upgrade | help"
   echo "以上凭据等同于服务器登录权限，请勿外传。"
   echo "======================================================="
@@ -270,7 +286,7 @@ make_backup() {
     "$(date '+%Y-%m-%d %H:%M:%S %z')" "$(hostname 2>/dev/null || true)" "$MODE" "$CONNECTION_URL" > "$note/$NOTE"; then
     rm -rf -- "$note" "$partial"; return 1
   fi
-  if ! tar --exclude=./state/connections --exclude=./state/devices --exclude=./state/backups --exclude=./home/.cache \
+  if ! tar --exclude=./state/connections --exclude=./cc-runner --exclude=./state/project-sockets --exclude=./state/terminals --exclude=./state/devices --exclude=./state/backups --exclude=./home/.cache \
     --exclude=./.restore --exclude=./.replaced -czf "$partial" -C "$note" "$NOTE" -C "$DATA_DIR" .; then
     rm -rf -- "$note" "$partial"
     return 1
@@ -479,7 +495,7 @@ case "$command" in
     if grep -q '^FRPS_PORT=' "$CONFIG"; then sed -i '/^FRPS_PORT=/d' "$CONFIG"; fi
     dc up -d --no-build; wait_healthy
     # Each image is a few gigabytes. The one replaced goes, if it is one of this project's that can be had again.
-    if [[ "$previous" != "$PROXY_IMAGE" && "$previous" =~ ^(ghcr\.io/sun168567/cc-desk-tunnel:.+|cc-desk-tunnel:local)$ ]] \
+    if [[ "$previous" != "$PROXY_IMAGE" && ( "$previous" = "ghcr.io/${REPOSITORY,,}:"* || "$previous" = cc-desk-tunnel:local ) ]] \
       && [[ "$(docker image inspect -f '{{.Id}}' "$previous" 2>/dev/null)" != "$(docker image inspect -f '{{.Id}}' "$PROXY_IMAGE")" ]] \
       && docker image rm "$previous" >/dev/null 2>&1; then
       echo "已删除替换下来的镜像 ${previous}。"
@@ -683,7 +699,7 @@ NOTICE
     [[ "$(id -u)" != 0 ]] || chown -R 1000:1000 "$DATA_DIR"
     echo "已还原。还原前的数据另存在 ${safety}，确认无误后可以删除。"
     docker image inspect "$PROXY_IMAGE" >/dev/null 2>&1 || prepare_image
-    dc up -d --no-build; wait_healthy
+    dc up -d --no-build --force-recreate; wait_healthy
     summary
     ;;
   certificate|renew)

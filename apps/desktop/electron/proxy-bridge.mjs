@@ -7,17 +7,14 @@ import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { WebSocket, WebSocketServer } from 'ws';
 import { serverMessageSchema, MAX_FRAME_BYTES } from '@cc-desk-tunnel/protocol';
-import { startWindowsSsh } from './windows-ssh.mjs';
-import { startPosixSsh } from './posix-ssh.mjs';
-import { openChannels } from './tunnel-channels.mjs';
+import { findGitBash } from './git-bash.mjs';
+import { basename } from 'node:path';
+import { resolvePosixShell } from './shell-environment.mjs';
+import { ProjectAccess } from './project-access.mjs';
 import { httpProxy, openSocket } from './system-proxy.mjs';
-import { channelFailure, controlFailure, passing } from './connect-errors.mjs';
+import { controlFailure, passing } from './connect-errors.mjs';
 // Loaded by the main process from here, so that the package's bundle of this module holds it.
 export { upgradeService } from './service-upgrade.mjs';
-
-// The SSH service of a connection. The two are started and closed alike and give the same credentials; what
-// is behind them differs with the system: see each module.
-export const startLocalSsh = process.platform === 'win32' ? startWindowsSsh : startPosixSsh;
 
 export function certificateMatches(observed, trusted) {
   if (typeof trusted !== 'string' || typeof observed !== 'string') return false;
@@ -30,16 +27,13 @@ export function controlTlsOptions(config) {
     throw new Error('请输入可信安装信息中的 SHA256 证书指纹，或留空使用 CA 验证。');
   return { rejectUnauthorized: false };
 }
-// The waits of connecting, in milliseconds. Whatever is not a sensible number of seconds takes the default, and
-// the whole is never shorter than the local SSH service is given plus the rest of the way.
+// Network and service handshake timeouts in milliseconds.
 export function connectionWaits(values) {
   const wait = (seconds, fallback) =>
     (Number.isInteger(seconds) && seconds >= 5 && seconds <= 600 ? seconds : fallback) * 1000;
-  const ssh = wait(values?.ssh, 10);
   return {
     connect: wait(values?.connect, 15),
-    ssh,
-    ready: Math.max(wait(values?.ready, 45), ssh + 35000),
+    ready: wait(values?.ready, 45),
   };
 }
 // Starts TLS with the service, through the system's HTTP proxy when the Windows settings name one for it. The proxy
@@ -114,6 +108,15 @@ export async function openProxyBridge(
   const waits = connectionWaits(config.waits);
   const log = binaries.log ?? (() => {});
   const heartbeatMs = binaries.heartbeatMs ?? 15000;
+  const projects = binaries.projects
+    ? new ProjectAccess({
+        ...binaries.projects,
+        service: address.href,
+        powershell: binaries.powershell,
+        scriptDirectory: binaries.scriptDirectory,
+        environment: binaries.environment,
+      })
+    : undefined;
   const nonce = randomBytes(32).toString('hex');
   const server = createServer();
   const wss = new WebSocketServer({ noServer: true, maxPayload: MAX_FRAME_BYTES });
@@ -154,15 +157,10 @@ export async function openProxyBridge(
       local,
       remote,
       controller: new AbortController(),
-      ssh: null,
-      channels: null,
-      preparing: null,
     };
     const current = pair;
     const queue = [];
     let verified = false;
-    let nativeReady;
-    let offerReceived = false;
     const target = `${address.hostname}:${address.port || 443}`;
     const began = Date.now();
     log(`Connecting to ${target}.`);
@@ -177,53 +175,11 @@ export async function openProxyBridge(
     const timer = setTimeout(
       () =>
         fail(
-          offerReceived
-            ? channelFailure(waits.ready / 1000, current.channels?.lastError, target, route.proxy)
-            : `服务端在 ${waits.ready / 1000} 秒内没有完成应答。\n请检查网络是否稳定，或稍后重试；反复出现时查看服务端日志。`,
+          `服务端在 ${waits.ready / 1000} 秒内没有完成应答。\n请检查网络是否稳定，或稍后重试；反复出现时查看服务端日志。`,
           'connection_lost',
         ),
       waits.ready,
     );
-    // One more connection to the service, for one SSH connection. It is checked like the control connection
-    // before anything is sent on it.
-    function dialChannel() {
-      return new Promise((resolve, reject) => {
-        const channel = new WebSocket(address, {
-          handshakeTimeout: waits.connect,
-          // SSH traffic is already encrypted and does not compress.
-          perMessageDeflate: false,
-          createConnection: (_options, created) => {
-            connectService(address, config, binaries.resolveProxy).then(
-              (socket) => created(null, socket),
-              created,
-            );
-          },
-        });
-        channel.once('error', (error) => {
-          channel.terminate();
-          reject(error);
-        });
-        channel.once('open', () => {
-          if (
-            config.fingerprint &&
-            !certificateMatches(
-              channel._socket.getPeerCertificate().fingerprint256,
-              config.fingerprint,
-            )
-          ) {
-            channel.terminate();
-            reject(
-              Object.assign(
-                new Error(
-                  '执行通道连到的服务证书指纹不匹配；未发送任何凭据。\n控制连接校验通过之后，同一地址应答了另一张证书：请确认服务地址没有被劫持或指向多台服务器。',
-                ),
-                { fatal: true },
-              ),
-            );
-          } else resolve(channel);
-        });
-      });
-    }
     // `connection_lost` is a fault on the way, which the window may try again; `client_failed` is something
     // that trying again does not change.
     function fail(message, code = 'client_failed') {
@@ -261,28 +217,75 @@ export async function openProxyBridge(
       }, heartbeatMs);
       current.controller.signal.addEventListener('abort', () => clearInterval(heartbeat));
     });
+    let forwarding = Promise.resolve();
     local.on('message', (raw) => {
-      try {
-        const message = JSON.parse(raw.toString('utf8'));
-        if (message.type?.startsWith('tunnel.')) throw new Error('Renderer tunnel message');
-        if (message.type === 'leave') {
-          leaving = true;
-          return;
-        }
-        if (message.type === 'auth') {
-          message.tunnel = true;
-          token = String(message.token);
-        }
-        // The system this computer runs is said here, not by the page. Windows is what none means.
-        if (message.type === 'device') {
-          delete message.platform;
-          if (process.platform !== 'win32') message.platform = process.platform;
-        }
-        if (verified && remote.readyState === WebSocket.OPEN) remote.send(JSON.stringify(message));
-        else queue.push(JSON.stringify(message));
-      } catch {
-        fail('客户端消息格式错误。');
-      }
+      forwarding = forwarding
+        .then(async () => {
+          const message = JSON.parse(raw.toString('utf8'));
+          if (
+            message.type?.startsWith('tunnel.') ||
+            ['project.result', 'project.call', 'project.cancel', 'project.commands'].includes(
+              message.type,
+            )
+          )
+            throw new Error('Invalid renderer frame');
+          if (message.type === 'leave') {
+            leaving = true;
+            return;
+          }
+          if (message.type === 'auth') {
+            delete message.tunnel;
+            token = String(message.token);
+          }
+          if (message.type === 'device') {
+            delete message.platform;
+            if (process.platform !== 'win32') message.platform = process.platform;
+            message.files = !!projects || undefined;
+            if (projects)
+              message.shells =
+                process.platform === 'win32'
+                  ? ['pwsh', ...((await findGitBash()) ? ['bash'] : [])]
+                  : [basename(await resolvePosixShell())];
+          }
+          try {
+            if (projects && message.projectPath)
+              message.projectPath = await projects.reference(message.projectPath);
+            if (projects && message.type === 'project.move') {
+              message.from = projects.byPath(message.from)?.id ?? message.from;
+              message.to = await projects.reference(message.to);
+            }
+            if (projects && message.attachments)
+              message.attachments = await Promise.all(
+                message.attachments.map((file) => projects.attachment(message.sessionId, file)),
+              );
+          } catch (error) {
+            local.send(
+              JSON.stringify({
+                type: 'response',
+                requestId: message.requestId,
+                ok: false,
+                code: 'project_binding',
+                message: error.message,
+              }),
+            );
+            return;
+          }
+          if (verified && remote.readyState === WebSocket.OPEN)
+            remote.send(JSON.stringify(message));
+          else queue.push(JSON.stringify(message));
+          if (projects && message.type === 'device') {
+            // Shell discovery can still be running when ready arrives. Send grants after the device identity.
+            projects.onCommandsChanged = (sessionId, project, enabled) => {
+              if (!closed && verified && remote.readyState === WebSocket.OPEN)
+                remote.send(
+                  JSON.stringify({ type: 'project.commands', sessionId, project, enabled }),
+                );
+            };
+            for (const [sessionId, project] of projects.grants)
+              projects.onCommandsChanged(sessionId, project, true);
+          }
+        })
+        .catch(() => fail('客户端消息格式错误。'));
     });
     remote.on('message', (raw) => {
       alive();
@@ -299,47 +302,37 @@ export async function openProxyBridge(
       if (message.type === 'connection.error' && message.client) release = message.client;
       if (message.type === 'connection.error')
         log(`The service refused or ended the connection: ${message.code}.`);
-      if (message.type === 'tunnel.offer') {
-        if (offerReceived || !nativeReady || nativeReady.connectionId !== message.connectionId) {
-          fail('隧道连接标识不匹配。');
-          return;
-        }
-        offerReceived = true;
-        current.preparing = startLocalSsh(
-          message.connectionId,
-          binaries,
-          current.controller.signal,
-          fail,
-          waits.ssh,
-        )
-          .then((ssh) => {
-            current.ssh = ssh;
-            if (closed || remote.readyState !== WebSocket.OPEN) return;
-            current.channels = openChannels(message, ssh.port, dialChannel, fail);
-            remote.send(JSON.stringify(ssh.credentials));
-          })
-          .catch((error) => fail(error.message));
-      } else if (message.type === 'tunnel.open') {
-        // Only ever follows the credentials, which are sent once the channels can be opened.
-        if (message.connectionId === nativeReady?.connectionId)
-          current.channels?.open(message.channelId);
-      } else if (message.type === 'ready' && message.adapter === 'claude-code') {
-        nativeReady = message;
-        release = message.client;
-      } else if (message.type === 'tunnel.ready') {
-        if (!offerReceived || message.connectionId !== nativeReady?.connectionId) {
-          fail('隧道就绪标识不匹配。');
-          return;
-        }
-        clearTimeout(timer);
-        log(
-          `Connected as ${message.connectionId.slice(0, 8)} to service ${nativeReady.version ?? 'of unknown version'}; commands can run.`,
-        );
-        if (local.readyState === WebSocket.OPEN) local.send(JSON.stringify(nativeReady));
-      } else if (local.readyState === WebSocket.OPEN) {
-        if (message.type === 'ready') clearTimeout(timer);
-        local.send(raw.toString('utf8'));
+      if (message.type === 'project.cancel') {
+        projects?.calls.get(message.requestId)?.controller.abort();
+        return;
       }
+      if (message.type === 'project.call') {
+        if (!projects || !verified) return;
+        const result = {
+          type: 'project.result',
+          sessionId: message.sessionId,
+          requestId: message.requestId,
+        };
+        void projects
+          .call(message)
+          .then(
+            (text) => ({ ...result, text }),
+            (error) => ({ ...result, error: true, text: error.message }),
+          )
+          .then((reply) => {
+            if (!closed && remote.readyState === WebSocket.OPEN) remote.send(JSON.stringify(reply));
+          });
+        return;
+      }
+      if (message.type === 'ready') {
+        clearTimeout(timer);
+        release = message.client;
+        if (projects) message.sessions = message.sessions.map((s) => projects.session(s));
+      }
+      if (projects && (message.type === 'session.updated' || message.type === 'session.snapshot'))
+        message.session = projects.session(message.session);
+      if (message.type === 'session.deleted') projects?.revoke(message.sessionId);
+      if (local.readyState === WebSocket.OPEN) local.send(JSON.stringify(message));
     });
     for (const socket of [local, remote]) {
       socket.on('close', (code) => {
@@ -367,6 +360,7 @@ export async function openProxyBridge(
     if (closing) return closing;
     if (pair && !notify) log('Connection closed from this client.');
     closed = true;
+    projects?.close();
     closing = (async () => {
       pair?.controller.abort();
       pair?.local.close();
@@ -380,9 +374,6 @@ export async function openProxyBridge(
           remote.send(JSON.stringify({ type: 'leave' }), () => remote.close(1000));
         });
       remote?.terminate();
-      await pair?.preparing;
-      pair?.channels?.close();
-      await pair?.ssh?.close();
       for (const socket of wss.clients) socket.terminate();
       await new Promise((resolve) => wss.close(resolve));
       await new Promise((resolve) => server.close(resolve));
@@ -421,6 +412,7 @@ export async function openProxyBridge(
     return target;
   }
   return {
+    projects,
     url: `ws://127.0.0.1:${server.address().port}/bridge/${nonce}`,
     close,
     downloadInstaller,

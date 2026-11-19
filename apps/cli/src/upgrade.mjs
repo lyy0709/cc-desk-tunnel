@@ -3,9 +3,7 @@ import { createHash } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { packageName } from './runtime.mjs';
-
-const RELEASES = 'https://github.com/sun168567/cc-desk-tunnel/releases/download';
+import { packageName, releases } from './runtime.mjs';
 // The first release whose install script replaces a ccdt while it runs; an earlier one's would leave it half removed.
 export const FIRST_UPGRADABLE = '0.3.9';
 
@@ -19,7 +17,7 @@ export async function download(release, { system, get = fetch } = {}) {
   const fetched = async (file) => {
     let response;
     try {
-      response = await get(`${RELEASES}/v${release}/${file}`, {
+      response = await get(`${releases}/download/v${release}/${file}`, {
         signal: AbortSignal.timeout(300_000),
       });
     } catch (error) {

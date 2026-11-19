@@ -1,3 +1,4 @@
+import { buildProjectFiles } from './build-project-files.mjs';
 import { existsSync, readFileSync } from 'node:fs';
 import files from 'node:fs/promises';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -14,13 +15,11 @@ const output = join(root, 'artifacts/windows');
 const unpacked = process.argv.includes('--dir');
 if (process.platform !== 'win32' || process.arch !== 'x64')
   throw new Error('Build the Windows x64 package on Windows x64.');
-for (const file of ['openssh/sshd.exe', 'openssh/ssh-keygen.exe', 'pwsh/pwsh.exe']) {
-  if (!existsSync(join(vendor, file)))
-    throw new Error(`Missing bundled component: ${file}. Run npm run prepare:windows:package.`);
-}
+if (!existsSync(join(vendor, 'pwsh/pwsh.exe')))
+  throw new Error('Missing bundled PowerShell. Run npm run prepare:windows:package.');
 await stageDesktop(root, app, {
   description: 'Windows client for a native remote Claude Code session',
-  files: ['prepare-ssh.ps1', 'component-host.ps1'],
+  files: ['component-host.ps1'],
 });
 const electron = JSON.parse(readFileSync(join(root, 'node_modules/electron/package.json'), 'utf8'));
 // Security software may hold an executable for some seconds after it is copied, while it scans it; electron-builder
@@ -52,10 +51,15 @@ const results = await electronBuild({
     asarUnpack: ['electron/*.ps1'],
     files: ['package.json', 'electron/**', 'dist/**', 'node_modules/**'],
     extraResources: [
+      { from: join(app, 'licenses'), to: 'licenses' },
       {
-        from: vendor,
-        to: 'vendor',
-        filter: ['openssh/**', 'pwsh/**', '!**/runtime.json'],
+        from: buildProjectFiles(join(root, '.local/windows-package/helper')),
+        to: 'project-files.exe',
+      },
+      {
+        from: join(vendor, 'pwsh'),
+        to: 'vendor/pwsh',
+        filter: ['**/*', '!**/runtime.json'],
       },
     ],
     win: {

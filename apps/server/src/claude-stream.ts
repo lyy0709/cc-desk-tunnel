@@ -29,7 +29,6 @@ export function shownToday(text: string, now = Date.now()) {
 export type NativeTool = {
   id: string;
   name: string;
-  input: Record<string, unknown>;
   finished: boolean;
   denied?: boolean;
 };
@@ -44,7 +43,6 @@ export class ClaudeStream {
   // Model requests seen since the counter was last cleared; the service waits for as many call-log records.
   requests = 0;
   result: { failed: boolean; text: string } | null = null;
-  blocks = new Map<number, string>();
   requestedPermissionMode?: PermissionMode;
   requestedEffort?: Effort | null;
   constructor(
@@ -56,21 +54,18 @@ export class ClaudeStream {
     this.requestedPermissionMode = permissionMode;
     this.requestedEffort = effort;
   }
-  tool(name: string, input: Record<string, unknown>, id: string = randomUUID()): NativeTool {
+  tool(name: string, id: string = randomUUID()): NativeTool {
     const sameId = this.tools.get(id);
-    if (sameId) {
-      sameId.input = input;
-      this.emit({ type: 'tool.input', toolId: id, input: JSON.stringify(input, null, 2) });
-      return sameId;
-    }
-    const tool = { id, name, input, finished: false };
+    if (sameId) return sameId;
+    const tool = { id, name, finished: false };
     this.tools.set(id, tool);
     this.emit({
       type: 'tool.requested',
       toolId: id,
       name,
-      input: JSON.stringify(input, null, 2),
-      target: 'Linux',
+      input: '',
+      privateInput: true,
+      target: name.startsWith('mcp__project__') ? '项目设备' : 'Linux',
     });
     return tool;
   }
@@ -179,17 +174,11 @@ export class ClaudeStream {
         this.messageId = randomUUID();
         this.streamed = false;
         this.thinkingStreamed = false;
-        this.blocks.clear();
       }
       if (event.type === 'content_block_start') {
         const block = jsonObject.parse(event.content_block);
         if (block.type === 'tool_use') {
-          const tool = this.tool(
-            z.string().parse(block.name),
-            jsonObject.parse(block.input),
-            z.string().parse(block.id),
-          );
-          this.blocks.set(z.number().parse(event.index), tool.id);
+          this.tool(z.string().parse(block.name), z.string().parse(block.id));
         }
       }
       if (event.type === 'content_block_delta') {
@@ -210,15 +199,6 @@ export class ClaudeStream {
             messageId: this.messageId,
             text: z.string().parse(delta.thinking),
           });
-        }
-        if (delta.type === 'input_json_delta') {
-          const toolId = this.blocks.get(z.number().parse(event.index));
-          if (toolId)
-            this.emit({
-              type: 'tool.input.delta',
-              toolId,
-              text: z.string().parse(delta.partial_json),
-            });
         }
       }
     }
@@ -241,11 +221,7 @@ export class ClaudeStream {
         )
           this.emit({ type: 'thinking.delta', messageId: this.messageId, text: value.thinking });
         if (value.type === 'tool_use')
-          this.tool(
-            z.string().parse(value.name),
-            jsonObject.parse(value.input),
-            z.string().parse(value.id),
-          );
+          this.tool(z.string().parse(value.name), z.string().parse(value.id));
       }
     }
     if (message.type === 'user') {
@@ -268,6 +244,18 @@ export class ClaudeStream {
       }
     }
     if (message.type === 'result') {
+      if (message.deferred_tool_use) {
+        const deferred = jsonObject.parse(message.deferred_tool_use);
+        const tool = this.tool(z.string().parse(deferred.name), z.string().parse(deferred.id));
+        tool.finished = true;
+        this.emit({
+          type: 'tool.result',
+          toolId: tool.id,
+          status: 'deferred',
+          output: '',
+          exitCode: null,
+        });
+      }
       // The turn is over. What comes next may be a whole message with no request streamed before it: the
       // answer of a local command such as /context or /usage.
       this.streamed = false;

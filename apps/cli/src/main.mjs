@@ -1,5 +1,6 @@
 import { appendFileSync } from 'node:fs';
-import { hostname } from 'node:os';
+import connections from '../../desktop/electron/connections.cjs';
+import { randomUUID } from 'node:crypto';
 import { basename, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { FORCED_UPGRADE_SINCE } from '@cc-desk-tunnel/protocol';
@@ -20,12 +21,14 @@ const HELP = `ccdt：在自己的终端里使用 CC Desk Tunnel 服务端上的�
 用法：
   ccdt                   接着当前目录这个项目最近的会话；没有就新建
   ccdt -r                从当前项目的会话里选一个打开（加 --all 从全部会话里选）
+  ccdt --allow-commands  授权当前目录的本次会话以当前用户身份执行命令
   ccdt new [标题]        在当前目录新建会话
   ccdt sessions [--all]  列出当前项目的会话；--all 列出全部
-  ccdt usage             订阅额度与调用统计
+  ccdt usage             个人订阅额度与终端周期调用统计
   ccdt config            查看和修改设置：在终端里用方向键逐项选择
   ccdt config 名称 [值]  查看或修改一项，供脚本使用；值写 default 恢复默认
   ccdt server            已登录的服务端：选一个作为默认连接的，或登录新的
+  ccdt auth login        打开服务器上官方 Claude Code 的普通登录终端
   ccdt login [wss 地址]  登录服务端；不写地址时从图形客户端保存的里选。--fingerprint 证书指纹，
                          --token-stdin 从标准输入读凭据，--no-save 不保存，
                          --no-verify 不连接验证、只保存（图形客户端交给 ccdt 已在用的凭据时用）
@@ -329,7 +332,7 @@ async function upgrade(config, values) {
           url: server.url,
           fingerprint: server.fingerprint,
           token,
-          deviceName: hostname(),
+          deviceName: connections.deviceName(config.device()),
           service: current,
           force,
         },
@@ -547,8 +550,7 @@ function usage(summary) {
     const reset = window.resetsAt ? `，${when(window.resetsAt)} 重置` : '';
     return `${(names[window.name] ?? window.name).padEnd(8)} 已用 ${used}${reset} · ${window.requests} 次请求 · 约 $${window.costUsd.toFixed(2)}`;
   });
-  if (!lines.length)
-    return '没有订阅额度数据：使用 API Key 或第三方接口时没有额度，用量见图形客户端的统计页。';
+  if (!lines.length) return '暂无当前订阅的终端读数。原版终端的 /usage 和官方用量页提供完整明细。';
   return [
     ...lines,
     dim('金额是按 API 价格估算的等价消耗，不是订阅账单。完整的图表在图形客户端的统计页。'),
@@ -558,6 +560,21 @@ function usage(summary) {
 // Shows the session's terminal until it ends, taking it up again after the connection is lost. Closing the window
 // ends it too, as it would a local CLI.
 async function show(config, values, service, session, fresh) {
+  if (!session.projectAccess) {
+    if (
+      (await readLine('旧会话可能含用户名和绝对路径。输入 YES 同意继续使用旧上下文：')) !== 'YES'
+    ) {
+      await service.close();
+      return 1;
+    }
+    if (sameDirectory(session.projectPath, process.cwd()))
+      await service.request({
+        type: 'session.move',
+        sessionId: session.id,
+        projectPath: process.cwd(),
+      });
+    await service.request({ type: 'session.acceptHistory', sessionId: session.id });
+  }
   const shown = {};
   let closing = false;
   const close = async () => {
@@ -608,6 +625,10 @@ async function show(config, values, service, session, fresh) {
       let result;
       try {
         await service.channel();
+        if (values['allow-commands'] && sameDirectory(session.projectPath, process.cwd())) {
+          service.bridge.projects.commands(session.id, true);
+          values['allow-commands'] = false;
+        }
         result = await relay(service, session.id, shown);
       } catch (error) {
         // Nothing to show, such as a terminal the service would not open: the connection is let go, for ccdt to end.
@@ -649,6 +670,7 @@ export async function main(argv) {
       args: argv,
       allowPositionals: true,
       options: {
+        'allow-commands': { type: 'boolean' },
         resume: { type: 'boolean', short: 'r' },
         server: { type: 'string' },
         select: { type: 'boolean', short: 's' },
@@ -680,6 +702,15 @@ export async function main(argv) {
     if (command === 'config') return await configure(config, values, rest);
     if (command === 'logout') return await logout(config, values);
     if (command === 'server') return await chooseServer(config, values);
+    if (command === 'auth' && rest.length === 1 && rest[0] === 'login') {
+      service = await signIn(config, values);
+      try {
+        const result = await relay(service, randomUUID(), { login: true });
+        return result.how === 'exited' ? (result.code ?? 1) : 1;
+      } finally {
+        await service.close();
+      }
+    }
     if (command && !['new', 'open', 'sessions', 'usage'].includes(command))
       return (say(`没有这个命令：${command}\n\n${HELP}`), 2);
     service = await signIn(config, values);
@@ -699,7 +730,7 @@ export async function main(argv) {
       return 0;
     }
     if (command === 'usage') {
-      say(usage(await service.request({ type: 'usage.summary' })));
+      say(usage(await service.request({ type: 'usage.summary', profile: 'terminal' })));
       await service.close();
       return 0;
     }

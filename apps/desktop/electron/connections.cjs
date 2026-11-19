@@ -378,6 +378,7 @@ function adopt(base) {
 }
 
 module.exports = {
+  deviceName: (id) => `设备 ${id.slice(0, 8)}`,
   accounts,
   adopt: (base) => withRegistry(base, () => adopt(base)),
   autoLogin,

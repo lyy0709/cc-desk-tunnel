@@ -2,7 +2,7 @@
 
 Linux 上的客户端与 Windows、macOS 上的是同一套界面和同一条连接。它是实验性支持，只以一个系统为准：当前的 Ubuntu LTS，x64。维护者不在 Linux 桌面上日常使用它，构建、自动测试和安装后的启动检查都在 GitHub 的 Ubuntu 机器上完成。
 
-本机一侧与 macOS 相同：SSH 服务是应用自身的一个进程，脚本由你自己的 shell（zsh 或 bash）执行，文件传输用系统的 sftp-server。这些的说明、与 Windows 的差别和实现都在 [macOS 客户端](macos.md)，此处只写 Linux 上不同的地方。
+本机通过已认证的 WSS 接收项目工具请求，随包的文件工具执行读写，已授权的命令使用本机 shell。实现和 Windows 的差异见 [macOS 客户端](macos.md)。
 
 ## 安装
 
@@ -10,11 +10,11 @@ Linux 上的客户端与 Windows、macOS 上的是同一套界面和同一条连
 sudo apt install ./CC-Desk-Tunnel-<版本>-linux-amd64.deb
 ```
 
-安装包会带上 `openssh-client` 与 `openssh-sftp-server`，并推荐安装中文字体 `fonts-noto-cjk`（界面是中文的）。后者只是一个供 SFTP 使用的程序，不包含也不会启动 SSH 服务端，本机不会因此多出监听的端口。卸载用 `sudo apt remove cc-desk-tunnel`。
+安装包包含项目文件工具，并推荐安装中文字体 `fonts-noto-cjk`。卸载用 `sudo apt remove cc-desk-tunnel`。
 
 升级需要手动：到发布页下载新版本的安装包，用同一条命令再安装一次，设置会保留。两端版本要一致，不一致时登录页会提示去发布页下载。
 
-其他发行版没有安装包，可以[从源码运行](macos.md#从源码运行与打包)；需要系统里有 OpenSSH 的客户端和 sftp-server。
+其他发行版没有安装包，可以[从源码运行](macos.md#从源码运行与打包)。
 
 ## 与 macOS 的不同
 
@@ -35,7 +35,7 @@ npm run package:linux     # 在 artifacts/linux/ 生成 deb
 
 ## 已验证与未验证
 
-在 GitHub 的 Ubuntu 24.04 机器上自动验证的：本机 SSH 服务的全部测试（与 macOS 相同的一套）；经真实的服务端、连接桥和执行通道执行脚本、并发命令和传输文件；安装包的安装，以及安装后的程序在虚拟屏幕上启动并执行脚本。
+仓库的 Linux 测试覆盖项目绑定、文件工具、会话命令授权与撤销，以及安装包在虚拟屏幕上的离线启动。
 
 尚未验证，需要真机：在真实的桌面（GNOME、KDE，X11 与 Wayland）上的窗口、标题栏按钮、托盘、通知和输入法；密钥环；连接真实的服务端由 Claude 完成任务。
 

@@ -10,7 +10,7 @@ if [ "$here" != "$target" ]; then
   cp -R "$here" "$target"
 fi
 # A package a browser downloaded on a Mac carries the mark of the download, which the files unpacked from it take on;
-# it would have the system ask about, or refuse, the Node and the SSH library inside.
+# it would have the system ask about, or refuse, the bundled executables.
 if [ "$(uname -s)" = Darwin ]; then xattr -dr com.apple.quarantine "$target" 2>/dev/null || true; fi
 mkdir -p "$HOME/.local/bin"
 ln -sf "$target/bin/ccdt" "$HOME/.local/bin/ccdt"

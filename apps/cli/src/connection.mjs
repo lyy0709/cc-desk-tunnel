@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { hostname } from 'node:os';
+import connections from '../../desktop/electron/connections.cjs';
 import { WebSocket } from 'ws';
 import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
-// The desktop client's connection: the same certificate checks, execution channel and SSH server for Claude's
-// commands. It relays a local WebSocket to the service, as it does for the desktop page.
+// Use the same authenticated WSS bridge and local project executor as the desktop client.
 import { openProxyBridge } from '../../desktop/electron/proxy-bridge.mjs';
-import { components } from './runtime.mjs';
+import { realpath } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { directories } from './config.mjs';
+import { components, bundled } from './runtime.mjs';
 
 // The proxy for an address, as the desktop client gets it from the system, from the usual variables here. Only
 // HTTP CONNECT proxies are used; loopback and `no_proxy` addresses connect directly.
@@ -42,6 +45,21 @@ export class Service extends EventEmitter {
       { url, fingerprint, waits },
       {
         ...components(),
+        projects: {
+          database: join(
+            process.env.CCDT_CONFIG_DIR ?? directories().desktop,
+            'project-access.sqlite',
+          ),
+          helper: fileURLToPath(
+            new URL(
+              (bundled ? './' : '../../../.local/') +
+                (process.platform === 'win32' ? 'project-files.exe' : 'project-files'),
+              import.meta.url,
+            ),
+          ),
+          chooseRoot: async (path) => path === (await realpath(process.cwd())),
+          confirmFile: async () => false,
+        },
         environment: {},
         log,
         resolveProxy: async (target) => proxyFor(target),
@@ -69,7 +87,7 @@ export class Service extends EventEmitter {
             type: 'auth',
             protocolVersion: PROTOCOL_VERSION,
             token,
-            deviceName: hostname(),
+            deviceName: connections.deviceName(deviceId),
           }),
         );
         socket.send(JSON.stringify({ type: 'device', id: deviceId }));

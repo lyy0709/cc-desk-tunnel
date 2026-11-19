@@ -4,18 +4,20 @@
 
 它是独立的程序，不需要安装或打开图形客户端；两者装在同一台电脑上时，服务端把它们当作同一台设备。设计与取舍见[设计记录](research/standalone-cli.md)。
 
+默认提供项目文件工具。需要测试或构建时在该目录运行 `ccdt --allow-commands`，命令授权只对这次会话和设备连接有效。GUI 和终端通过同一个服务上的项目标识打开原生上下文。`ccdt login` 连接隧道服务器。打开项目后，原版 Claude Code 使用服务器用户已有的登录；需要登录时按终端提示在本机浏览器授权。如果页面给出回调码，粘贴回同一个终端。GUI 的 API 认证独立配置。
+
 ## 安装
 
 用一行命令安装，只为当前用户安装，不需要管理员权限：
 
 ```powershell
 # Windows，在 PowerShell 里运行：装到 %LOCALAPPDATA%\Programs\ccdt，并加入当前用户的 PATH
-irm https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.ps1 | iex
+irm https://raw.githubusercontent.com/lyy0709/cc-desk-tunnel/main/deploy/install-ccdt.ps1 | iex
 ```
 
 ```bash
 # macOS、Linux：装到 ~/.local/share/ccdt，命令为 ~/.local/bin/ccdt
-curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.sh | sh
+curl -fsSL https://raw.githubusercontent.com/lyy0709/cc-desk-tunnel/main/deploy/install-ccdt.sh | sh
 ```
 
 脚本从发布页下载这个系统的包，按发布页的 `SHA256SUMS` 校验后，运行包里的安装脚本。Windows 上运行命令的窗口装完就能用 `ccdt`；macOS、Linux 上 `~/.local/bin` 不在 PATH 里时，安装脚本把它写进 shell 的配置文件（zsh 为 `~/.zshrc`，bash 为 `~/.bashrc`，macOS 的 bash 为 `~/.bash_profile`，其他为 `~/.profile`），新开的终端窗口就能用。
@@ -23,18 +25,18 @@ curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deplo
 `ccdt` 要与服务端**同一版本**。脚本默认装最新的正式版；服务端是别的版本时，先指定版本再运行，例如：
 
 ```powershell
-$env:CCDT_VERSION = '0.3.9'; irm https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.ps1 | iex
+$env:CCDT_VERSION = '0.3.9'; irm https://raw.githubusercontent.com/lyy0709/cc-desk-tunnel/main/deploy/install-ccdt.ps1 | iex
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy/install-ccdt.sh | CCDT_VERSION=0.3.9 sh
+curl -fsSL https://raw.githubusercontent.com/lyy0709/cc-desk-tunnel/main/deploy/install-ccdt.sh | CCDT_VERSION=0.3.9 sh
 ```
 
 装错了版本也不要紧：连接时 `ccdt` 会提示版本不一致，并问你是否换成服务端的版本。设置 `CCDT_DOWNLOAD_ONLY=1` 时，脚本只把校验过的包解压到当前目录，不安装。
 
 ### 手动安装
 
-从[发布页](https://github.com/sun168567/cc-desk-tunnel/releases/latest)下载与服务端**相同版本**的包：
+从[发布页](https://github.com/lyy0709/cc-desk-tunnel/releases/latest)下载与服务端**相同版本**的包：
 
 | 系统 | 文件 |
 | --- | --- |
@@ -54,7 +56,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 ./install.sh
 ```
 
-装好后打开一个新的终端窗口。不安装也可以直接运行包里的 `ccdt.cmd`（Windows）或 `bin/ccdt`。包里自带运行所需的一切：Node.js，Windows 上还有与图形客户端安装包相同的 PowerShell 7 和 OpenSSH，所以 Windows 的包有一百多 MB。
+装好后打开一个新的终端窗口。不安装也可以直接运行包里的 `ccdt.cmd`（Windows）或 `bin/ccdt`。包里自带运行所需的一切：Node.js 和项目文件工具，Windows 上另附和桌面客户端相同的 PowerShell 7。
 
 **升级**：运行 `ccdt upgrade`，见下面的[升级](#升级)。0.3.8 及更早的 `ccdt` 没有这个命令：下载新版本的包，再运行一次安装脚本。
 
@@ -65,6 +67,8 @@ powershell -ExecutionPolicy Bypass -File install.ps1
 ```bash
 ccdt login
 ```
+
+连接后可运行 `ccdt auth login` 打开普通登录终端。它直接在服务器上运行原版 `claude auth login`，不创建项目或对话。已有的原生登录同样适用于新开的 ccdt 会话。
 
 用方向键在图形客户端保存的服务端里选一个（按它的连接名列出，已登录的会标出），地址和证书指纹取自它的设置，只需要输入服务凭据（与图形客户端填的相同，输入时不显示）。最后一项“输入其他地址…”用来登录图形客户端没有保存的服务端；也可以直接写上地址：`ccdt login wss://<服务器>:8787/ws --fingerprint <证书指纹>`。还没有登录过任何服务端时，直接运行 `ccdt` 也会先进入登录。
 
@@ -91,7 +95,7 @@ ccdt login
 | `ccdt -r` | 从这个项目的会话里选一个，方向键选择（像 `claude -r`）；加 `--all` 从全部会话里选 |
 | `ccdt new [标题]` | 新建会话 |
 | `ccdt sessions [--all]` | 列出这个项目的会话，或全部会话 |
-| `ccdt usage` | 订阅额度的已用比例、重置时间与调用统计 |
+| `ccdt usage` | 查看当前个人订阅的五小时、每周额度、重置时间和本服务记录的终端调用统计。按模型的完整额度可在原版终端用 `/usage` 查看 |
 | `ccdt config` | 查看和修改设置，方向键选择（见[设置](#设置)） |
 | `ccdt config 名称 [值]` | 查看或修改一项，供脚本使用 |
 | `ccdt upgrade [--yes] [--force]` | 升级服务端，再把 `ccdt` 换成与服务端相同的版本（见[升级](#升级)） |
@@ -111,11 +115,11 @@ ccdt login
 
 ## 设置
 
-`ccdt config` 列出全部设置和当前值，用方向键选中一项后回车修改：开关和选项从列表里选，时间和文字直接输入，写 `default` 恢复默认。在脚本里用 `ccdt config 名称 值`，例如 `ccdt config connection.ssh 30`；`ccdt config 名称` 显示这一项的说明和可选值，不在终端里运行 `ccdt config` 时列出全部名称。
+`ccdt config` 列出全部设置和当前值，用方向键选中一项后回车修改：开关和选项从列表里选，时间和文字直接输入，写 `default` 恢复默认。在脚本里用 `ccdt config 名称 值`，例如 `ccdt config connection.connect 30`；`ccdt config 名称` 显示这一项的说明和可选值，不在终端里运行 `ccdt config` 时列出全部名称。
 
 | 分组 | 设置 | 保存在 |
 | --- | --- | --- |
-| 本机 | 连接服务器、本机 SSH 服务启动、执行通道就绪的等待时间 | `ccdt` 自己的设置文件，只影响 `ccdt` |
+| 本机 | 连接服务器和等待服务应答的时间 | `ccdt` 自己的设置文件，只影响 `ccdt` |
 | 服务端 | 缓存过期前自动压缩（开关、空闲时间、上下文大小）、浏览器访问的开关 | 服务端，与图形客户端相同 |
 | Claude Code | 云端 Claude Code 的常用设置，与图形客户端“CLI 设置”的各项相同 | 云端 CLI 的用户设置文件 |
 
@@ -156,6 +160,8 @@ ccdt login
 - **提示版本不一致**：在终端里选“升级”，或运行 `ccdt upgrade`；0.3.8 及更早的 `ccdt` 要下载同一版本的包，再运行一次安装脚本。
 
 ## 已验证与未验证
+
+以下实机记录来自旧版本。新版项目 MCP 的离线测试覆盖 WSS 上的文件操作、图片返回和按会话撤销命令权限。
 
 - Windows：在一套真实部署上验证过登录、新建与选择会话、与图形客户端交替接续、断网 55 秒后接回、关窗口即结束、请求身份与调用统计；打包、安装脚本与安装后的启动在 GitHub 的 Windows 机器上检查。
 - Linux（x64）：在一台没有图形界面、经 SSH 登录的 Ubuntu 上，用 GitHub 打出的包验证过安装、登录（系统密钥服务用不了时凭据存进设置文件）、新建与选择会话、Claude 的命令经执行通道在这台电脑上运行、终端状态与每一轮的导入、服务端断开 50 秒后接回、关窗口即结束。arm64 的包在 GitHub 的 arm64 机器上打包、安装并启动过。

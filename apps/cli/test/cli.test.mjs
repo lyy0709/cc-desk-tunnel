@@ -476,7 +476,7 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
     cli: { autoCompactEnabled: null, autoCompactWindow: 250_000, fallbackModel: ['sonnet'] },
     web: { enabled: true, url: 'https://work.example.com/desk/' },
   };
-  const list = entries({ waits: { ssh: 20 }, ...remote });
+  const list = entries({ waits: { connect: 20 }, ...remote });
   const named = (name) => list.find((entry) => entry.name === name);
   // The groups in the desktop client's order, each item once, and what is not here yet said so.
   assert.deepEqual(
@@ -484,7 +484,7 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
     ['本机', '服务端', 'Claude Code'],
   );
   assert.equal(new Set(list.map((entry) => entry.name)).size, list.length);
-  assert.equal(shown(named('connection.ssh')), '20 秒');
+  assert.equal(shown(named('connection.connect')), '20 秒');
   assert.equal(shown(named('connection.ready')), '45 秒（默认）');
   assert.equal(shown(named('compaction.enabled')), '关闭');
   assert.equal(shown(named('compaction.minTokens')), '100K tokens');
@@ -503,10 +503,10 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
   assert.equal(parse(named('cli.autoCompactEnabled'), '关闭'), false);
   assert.equal(parse(named('cli.autoCompactEnabled'), 'default'), null);
   assert.equal(parse(named('compaction.afterMinutes'), '45'), 45);
-  assert.equal(parse(named('connection.ssh'), '30'), 30);
+  assert.equal(parse(named('connection.connect'), '30'), 30);
   assert.deepEqual(parse(named('cli.fallbackModel'), 'sonnet， haiku'), ['sonnet', 'haiku']);
   assert.throws(() => parse(named('compaction.enabled'), 'default'), /on 或 off/);
-  assert.throws(() => parse(named('connection.ssh'), '3'), /5–600/);
+  assert.throws(() => parse(named('connection.connect'), '3'), /5–600/);
   assert.throws(() => parse(named('compaction.afterMinutes'), '42'), /可选/);
   assert.throws(() => parse(named('cli.instructions'), 'x'), /\/memory/);
   // ccdt keeps its waits; the rest goes to the service as the desktop client sends it.
@@ -529,7 +529,7 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
     entries({})
       .filter((entry) => entry.kind !== 'pending')
       .map((entry) => entry.name),
-    ['connection.connect', 'connection.ssh', 'connection.ready'],
+    ['connection.connect', 'connection.ready'],
   );
 });
 

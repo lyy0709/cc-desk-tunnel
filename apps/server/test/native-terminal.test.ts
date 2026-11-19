@@ -7,10 +7,8 @@ import {
   terminalArguments,
   terminalEnvironment,
 } from '../src/native-terminal.ts';
-import { completeOnboarding } from '../src/native-onboarding.ts';
 import { nativeContext } from '../src/claude.ts';
 import { SessionStore } from '../src/store.ts';
-import { NativeLogin, parseAccountStatus } from '../src/native-account.ts';
 import { loginExpiryWarnings } from '../src/login-expiry.ts';
 import type { TerminalSpawner } from '../src/native-terminal.ts';
 import type { Session, TerminalActivity } from '@cc-desk-tunnel/protocol';
@@ -159,11 +157,10 @@ test('a terminal that keeps running shows its current screen to a client that at
   await f.terminal.close();
 });
 
-test('a terminal launches the official CLI directly with remote guidance and no shell, MCP or bypass', () => {
+test('a terminal launches the official CLI directly with the selected model, effort and permission mode', () => {
   const own = {
     resume: true,
     settingsPath: '/t.json',
-    execution: { platform: 'win32' as const, shells: ['pwsh' as const] },
   };
   const args = terminalArguments(
     { executable: '/native/claude', model: 'provider', settingsPath: '/private/provider.json' },
@@ -174,12 +171,9 @@ test('a terminal launches the official CLI directly with remote guidance and no 
       model: null,
       effort: 'high',
     } as Session,
-    { configPath: '/private/ssh.conf' },
     own,
   );
-  assert.ok(args.includes('--append-system-prompt'));
-  assert.ok(args.some((arg) => arg.includes('D:\\\\项目')));
-  assert.ok(args.some((arg) => arg.includes('ssh device-pwsh')));
+  assert.ok(!args.includes('--append-system-prompt'));
   assert.ok(args.includes('provider'));
   assert.ok(args.includes('high'));
   assert.ok(
@@ -189,7 +183,6 @@ test('a terminal launches the official CLI directly with remote guidance and no 
     const launched = terminalArguments(
       { executable: 'claude' },
       { id: 's', projectPath: 'D:\\test', permissionMode } as Session,
-      { configPath: '/ssh' },
       own,
     );
     return launched[launched.indexOf('--permission-mode') + 1];
@@ -205,20 +198,13 @@ test('a terminal resumes its session or creates it under the session ID, with it
     permissionMode: 'auto',
   } as Session;
   const options = { executable: 'claude', settingsPath: '/private/provider.json' };
-  const execution = { platform: 'win32' as const, shells: ['pwsh' as const] };
-  const resumed = terminalArguments(
-    options,
-    session,
-    { configPath: '/ssh' },
-    { resume: true, settingsPath: '/t.json', execution },
-  );
+  const resumed = terminalArguments(options, session, { resume: true, settingsPath: '/t.json' });
   assert.deepEqual(resumed.slice(0, 2), ['--resume', session.id]);
   assert.deepEqual(resumed.slice(-2), ['--settings', '/t.json']);
   assert.ok(!resumed.includes('/private/provider.json'));
-  const created = terminalArguments(options, session, undefined, {
+  const created = terminalArguments(options, session, {
     resume: false,
     settingsPath: '/t.json',
-    execution,
   });
   assert.deepEqual(created.slice(0, 2), ['--session-id', session.id]);
 });
@@ -231,13 +217,7 @@ test('a terminal never passes for an SDK process, whatever the service inherited
   assert.deepEqual(Object.keys(env).sort(), ['LANG', 'TERM']);
 });
 
-test("a terminal's CLI finds the session's ssh before the service's", () => {
-  const ssh = { configPath: '/data/session-ssh/s/config', bin: '/data/session-ssh/s/bin' };
-  const env = terminalEnvironment({ executable: 'claude' }, { PATH: '/usr/bin' }, ssh);
-  assert.equal(
-    env.PATH,
-    `/data/session-ssh/s/bin${process.platform === 'win32' ? ';' : ':'}/usr/bin`,
-  );
+test('terminal commands inherit the ordinary PATH', () => {
   assert.equal(
     terminalEnvironment({ executable: 'claude' }, { PATH: '/usr/bin' }).PATH,
     '/usr/bin',
@@ -259,130 +239,6 @@ test('terminal provider environment stays inside the child process and does not 
   assert.equal(env.TERM, 'xterm-256color');
   assert.equal(env.INVALID, undefined);
   assert.equal(inherited.TEST_PROVIDER, 'old-value');
-});
-
-test('a signed-in account skips the first-run wizard; a signed-out one keeps it', (t) => {
-  const directory = mkdtempSync(join(tmpdir(), 'cc-desk-tunnel-onboarding-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const statePath = join(directory, '.claude.json');
-  writeFileSync(
-    statePath,
-    JSON.stringify({ userID: 'kept', oauthAccount: { emailAddress: 'user@example.invalid' } }),
-  );
-  assert.equal(completeOnboarding(directory), false);
-  assert.equal(JSON.parse(readFileSync(statePath, 'utf8')).hasCompletedOnboarding, undefined);
-
-  writeFileSync(
-    join(directory, '.credentials.json'),
-    JSON.stringify({ claudeAiOauth: { accessToken: 'placeholder' } }),
-  );
-  assert.equal(completeOnboarding(directory), true);
-  assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')), {
-    userID: 'kept',
-    oauthAccount: { emailAddress: 'user@example.invalid' },
-    hasCompletedOnboarding: true,
-  });
-  assert.equal(completeOnboarding(directory), false);
-});
-
-test('a setup token skips onboarding without stored browser credentials', (t) => {
-  const directory = mkdtempSync(join(tmpdir(), 'cc-desk-tunnel-onboarding-token-'));
-  t.after(() => rmSync(directory, { recursive: true, force: true }));
-  const statePath = join(directory, '.claude.json');
-  writeFileSync(statePath, JSON.stringify({ userID: 'kept' }));
-  writeFileSync(
-    join(directory, 'settings.json'),
-    JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'placeholder' } }),
-  );
-  assert.equal(completeOnboarding(directory), true);
-  assert.deepEqual(JSON.parse(readFileSync(statePath, 'utf8')), {
-    userID: 'kept',
-    hasCompletedOnboarding: true,
-  });
-  assert.equal(completeOnboarding(directory), false);
-});
-
-test('official sign-in: the link is read from the command output, the pasted code is typed back, exit decides the result', async () => {
-  let data!: (text: string) => void, exit!: (event: { exitCode: number; signal?: number }) => void;
-  const written: string[] = [];
-  let launched: string[] = [];
-  const spawn: TerminalSpawner = (_file, args) => {
-    launched = args;
-    return {
-      pid: 1,
-      onData: (listener) => {
-        data = listener;
-        return { dispose() {} };
-      },
-      onExit: (listener) => {
-        exit = listener;
-        return { dispose() {} };
-      },
-      write: (text: string) => {
-        written.push(text);
-      },
-      resize() {},
-      pause() {},
-      resume() {},
-      kill() {},
-    };
-  };
-  let result: boolean | undefined;
-  const replies: string[] = [];
-  const login = new NativeLogin(
-    'claude',
-    (succeeded) => {
-      result = succeeded;
-    },
-    (text) => {
-      replies.push(text);
-    },
-    { spawn },
-  );
-  assert.deepEqual(launched, ['auth', 'login']);
-  data(
-    "Opening browser to sign in…\r\nIf the browser didn't open, visit: \x1b]8;;https://claude.com/cai/oauth/authorize?code=true&sta",
-  );
-  data('te=abc\x07https://claude.com/cai/oauth/authorize?code=true&sta');
-  data('te=abc\x1b]8;;\x07\r\nPaste code here if prompted > ');
-  assert.equal(await login.url, 'https://claude.com/cai/oauth/authorize?code=true&state=abc');
-  login.submit('wrong');
-  data(
-    'wrong\r\nInvalid code. Please make sure the full code was copied.\r\nPaste code here if prompted > ',
-  );
-  await delay(500);
-  assert.deepEqual(replies, ['Invalid code. Please make sure the full code was copied.']);
-  login.submit('code#state');
-  assert.deepEqual(written, ['wrong\r', 'code#state\r']);
-  exit({ exitCode: 0 });
-  assert.equal(result, true);
-
-  assert.deepEqual(
-    parseAccountStatus(
-      '{"loggedIn":true,"authMethod":"claude.ai","email":"user@example.invalid","orgName":"Org","orgId":"x","subscriptionType":"pro"}',
-    ),
-    {
-      loggedIn: true,
-      authMethod: 'claude.ai',
-      email: 'user@example.invalid',
-      organization: 'Org',
-      subscriptionType: 'pro',
-    },
-  );
-  assert.deepEqual(parseAccountStatus('{"loggedIn":false,"authMethod":"none"}'), {
-    loggedIn: false,
-    authMethod: 'none',
-  });
-  // CLI 2.1.318 and later say when a stored claude.ai sign-in ends.
-  assert.equal(
-    parseAccountStatus('{"loggedIn":true,"loginExpiresAt":"2026-12-01T00:00:00.000Z"}')
-      .loginExpiresAt,
-    '2026-12-01T00:00:00.000Z',
-  );
-  assert.equal(
-    parseAccountStatus('{"loggedIn":true,"loginExpiresAt":null}').loginExpiresAt,
-    undefined,
-  );
 });
 
 test('a sign-in about to end is told in the conversation once a day, from ten days before', () => {

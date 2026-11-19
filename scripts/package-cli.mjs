@@ -1,3 +1,5 @@
+import { buildProjectFiles } from './build-project-files.mjs';
+import { stageClientLicenses } from './package-desktop.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { builtinModules } from 'node:module';
@@ -16,13 +18,9 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build as viteBuild } from 'vite';
 import { packageName } from '../apps/cli/src/runtime.mjs';
-import { copyDependency, posixService } from './package-desktop.mjs';
 
 // The ccdt package of the system this runs on, a folder `ccdt` in a .zip (Windows) or .tar.gz (macOS, Linux): the
-// Node it runs with, ccdt with what it imports bundled into ccdt.mjs, and what its SSH service for Claude's commands
-// needs. On Windows that is the OpenSSH and PowerShell the desktop installer bundles, prepared by
-// `npm run prepare:windows:package`; on macOS and Linux the service's own modules and the SSH library they load.
-// It is started at the end as a check.
+// pinned Node, project-files helper and bundled client. Windows also carries PowerShell.
 const root = fileURLToPath(new URL('..', import.meta.url));
 const version = JSON.parse(readFileSync(join(root, 'apps/desktop/package.json'), 'utf8')).version;
 const NODE = '24.22.2';
@@ -54,10 +52,8 @@ const tar = windows ? join(process.env.SystemRoot ?? 'C:\\Windows', 'System32', 
 const output = join(root, 'artifacts/cli');
 const archive = join(output, packageName(version, system));
 const vendor = join(root, 'apps/desktop/vendor');
-if (windows)
-  for (const file of ['openssh/sshd.exe', 'openssh/ssh-keygen.exe', 'pwsh/pwsh.exe'])
-    if (!existsSync(join(vendor, file)))
-      throw new Error(`Missing bundled component: ${file}. Run npm run prepare:windows:package.`);
+if (windows && !existsSync(join(vendor, 'pwsh/pwsh.exe')))
+  throw new Error('Missing bundled PowerShell. Run npm run prepare:windows:package.');
 
 // Node of the pinned release, checked against the hash above; kept in .tools for the next build.
 async function runtime(directory) {
@@ -73,8 +69,10 @@ async function runtime(directory) {
   if (createHash('sha256').update(readFileSync(cached)).digest('hex') !== sha256)
     throw new Error(`Checksum mismatch for ${name}`);
   const extracted = mkdtempSync(join(tmpdir(), 'ccdt-node-'));
-  const inside = `${name.replace(/\.(zip|tar\.gz)$/, '')}/${windows ? 'node.exe' : 'bin/node'}`;
-  execFileSync(tar, ['-xf', cached, '-C', extracted, inside]);
+  const folder = name.replace(/\.(zip|tar\.gz)$/, '');
+  const inside = `${folder}/${windows ? 'node.exe' : 'bin/node'}`;
+  execFileSync(tar, ['-xf', cached, '-C', extracted, inside, `${folder}/LICENSE`]);
+  cpSync(join(extracted, folder, 'LICENSE'), join(directory, 'LICENSE-Node'));
   cpSync(join(extracted, inside), join(directory, windows ? 'node.exe' : 'node'));
   rmSync(extracted, { recursive: true, force: true });
 }
@@ -95,6 +93,7 @@ await viteBuild({
   ssr: { noExternal: true },
   build: {
     ssr: true,
+    license: { fileName: 'THIRD-PARTY-ccdt.md' },
     target: 'node24',
     outDir: stage,
     emptyOutDir: false,
@@ -105,30 +104,23 @@ await viteBuild({
         ...builtinModules.map((name) => `node:${name}`),
         'bufferutil',
         'utf-8-validate',
-        ...(windows ? [] : posixService.dependencies),
       ],
       output: { format: 'es', entryFileNames: 'ccdt.mjs', codeSplitting: false },
     },
   },
 });
-// What the bundle loads by path beside itself: the scripts of the Windows SSH service, or the modules of the
-// POSIX one's own process with the library they import.
-const electron = join(root, 'apps/desktop/electron');
-for (const file of windows ? ['prepare-ssh.ps1', 'component-host.ps1'] : posixService.files)
-  cpSync(join(electron, file), join(stage, file));
 if (windows) {
-  for (const name of ['openssh', 'pwsh'])
-    cpSync(join(vendor, name), join(stage, 'vendor', name), {
-      recursive: true,
-      filter: (path) => !path.endsWith('runtime.json'),
-    });
+  cpSync(join(root, 'apps/desktop/electron/component-host.ps1'), join(stage, 'component-host.ps1'));
+  cpSync(join(vendor, 'pwsh'), join(stage, 'vendor/pwsh'), {
+    recursive: true,
+    filter: (path) => !path.endsWith('runtime.json'),
+  });
   writeFileSync(
     join(stage, 'ccdt.cmd'),
     '@echo off\r\n"%~dp0node.exe" "%~dp0ccdt.mjs" %*\r\nexit /b %errorlevel%\r\n',
   );
   cpSync(join(root, 'apps/cli/install/install.ps1'), join(stage, 'install.ps1'));
 } else {
-  for (const name of posixService.dependencies) copyDependency(root, stage, name);
   mkdirSync(join(stage, 'bin'));
   writeFileSync(
     join(stage, 'bin', 'ccdt'),
@@ -138,6 +130,8 @@ if (windows) {
   cpSync(join(root, 'apps/cli/install/install.sh'), join(stage, 'install.sh'));
   chmodSync(join(stage, 'install.sh'), 0o755);
 }
+buildProjectFiles(stage);
+stageClientLicenses(root, stage);
 await runtime(stage);
 cpSync(join(root, 'apps/cli/install/README.txt'), join(stage, 'README.txt'));
 

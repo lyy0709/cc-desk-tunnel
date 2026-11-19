@@ -3,22 +3,16 @@ import type { DeviceShell, NativeSettings } from '@cc-desk-tunnel/protocol';
 // Settings described once for every client that shows them: the desktop and browser pages, and ccdt in a terminal.
 // Nothing here draws; each client shows the same choices with the same words in its own way.
 
-// How many seconds each step of connecting may take. The defaults suit most computers; a domain account whose
-// domain controller is out of reach, or slow security software, can need more.
-export type ConnectionWaits = { connect: number; ssh: number; ready: number };
-export const connectionWaits: ConnectionWaits = { connect: 15, ssh: 10, ready: 45 };
+// Time limits for the outbound connection and the authenticated service response.
+export type ConnectionWaits = { connect: number; ready: number };
+export const connectionWaits: ConnectionWaits = { connect: 15, ready: 45 };
 export const waitRange = { min: 5, max: 600 };
 export const waitFields: { step: keyof ConnectionWaits; title: string; detail: string }[] = [
   { step: 'connect', title: '连接服务器', detail: '与服务端建立网络连接' },
   {
-    step: 'ssh',
-    title: '本机 SSH 服务启动',
-    detail: '域账号连不上域控制器、或安全软件扫描较慢时，启动会久一些',
-  },
-  {
     step: 'ready',
-    title: '执行通道就绪',
-    detail: '从连上服务端到隧道接通的总时间；至少比上一项多 35 秒',
+    title: '等待服务应答',
+    detail: '等待服务端完成连接认证并返回会话列表',
   },
 ];
 
@@ -166,7 +160,7 @@ export const cliSettingGroups = (
         key: 'autoContinueAtUsageLimit',
         kind: 'toggle',
         title: '额度用尽后自动继续',
-        detail: '订阅额度触顶时等待重置并自动接着做，适合长任务',
+        detail: '模型服务额度触顶时等待重置并自动接着做，适合长任务',
       },
       {
         key: 'switchModelsOnFlag',

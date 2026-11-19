@@ -19,9 +19,9 @@ export function QuotaSummary({
   const unavailable = metrics?.rateLimits?.available === false;
   return (
     <div className="sidebar-quota">
-      <button type="button" className="quota-summary" aria-label="查看订阅用量" onClick={onOpen}>
+      <button type="button" className="quota-summary" aria-label="查看用量" onClick={onOpen}>
         <span className="quota-summary-heading">
-          额度已用
+          模型服务额度已用
           <ChevronRight aria-hidden="true" />
         </span>
         <span className="quota-summary-values">
@@ -33,7 +33,7 @@ export function QuotaSummary({
                 </span>
               ))
             : unavailable
-              ? '未提供订阅额度'
+              ? '未提供模型服务额度'
               : emptyMessage}
         </span>
         {!connected && figures.length > 0 && (

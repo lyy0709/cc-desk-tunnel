@@ -1,5 +1,13 @@
 import { randomUUID } from 'node:crypto';
-import { closeSync, openSync, readFileSync, readSync, statSync, writeFileSync } from 'node:fs';
+import {
+  closeSync,
+  fstatSync,
+  openSync,
+  readFileSync,
+  readSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import type { SessionMessage } from '@anthropic-ai/claude-agent-sdk';
 import type {
   EventPayload,
@@ -285,9 +293,7 @@ const HOOKED = [
   'Notification',
   'Stop',
 ];
-// Its status line command also keeps the last of what the CLI hands it at `statusPath`, which carries the quota its
-// replies were answered with (see `statusLineQuota`). A status line of the user's own, from these settings or the user
-// settings these take the place of, is still run on the same input and shows as before.
+// Copy only context and the documented subscription display fields. The user's own status line receives the full input.
 // The CLI compacts a conversation left idle by itself while its terminal is open (CLI 2.1.299 and later): at nine
 // tenths of the hour its prompt cache lasts, when the context holds CLAUDE_CODE_IDLE_COMPACT_MIN_TOKENS or more, never
 // under 100,000. `idle`, the service's own setting, decides whether it does and from what size; the service compacts a
@@ -313,7 +319,9 @@ export function terminalSettings(
     const own = [settings.statusLine, userStatusLine(ownSettingsPath)].find(
       (line) => line?.type === 'command' && typeof line.command === 'string',
     );
-    const keep = `s=$(cat); printf '%s\\n' "$s" > ${quote(`${statusPath}.new`)} && mv -f ${quote(`${statusPath}.new`)} ${quote(statusPath)}`;
+    const filter =
+      '{model,context_window,rate_limits: ((.rate_limits // {}) | with_entries(select(.key == "five_hour" or .key == "seven_day") | .value |= {used_percentage,resets_at}))}';
+    const keep = `s=$(cat); printf '%s' "$s" | jq -c ${quote(filter)} > ${quote(`${statusPath}.new`)} && mv -f ${quote(`${statusPath}.new`)} ${quote(statusPath)}`;
     statusLine = own
       ? { ...own, command: `${keep}; printf '%s' "$s" | {\n${own.command}\n}` }
       : { type: 'command', command: keep };
@@ -334,6 +342,41 @@ function userStatusLine(path: string) {
     return JSON.parse(readFileSync(path, 'utf8')).statusLine;
   } catch {
     return undefined;
+  }
+}
+
+export function subscriptionSnapshot(path: string) {
+  let file: number;
+  try {
+    file = openSync(path, 'r');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+  try {
+    const measuredAt = fstatSync(file).mtime.toISOString();
+    const { rate_limits } = JSON.parse(readFileSync(file, 'utf8'));
+    const windows = ['five_hour', 'seven_day'].flatMap((name) => {
+      const window = rate_limits?.[name];
+      if (
+        typeof window?.used_percentage !== 'number' ||
+        !Number.isFinite(window.used_percentage) ||
+        window.used_percentage < 0 ||
+        window.used_percentage > 100
+      )
+        return [];
+      const reset = typeof window.resets_at === 'number' ? new Date(window.resets_at * 1000) : null;
+      return [
+        {
+          name,
+          utilization: window.used_percentage,
+          resetsAt: reset && Number.isFinite(reset.getTime()) ? reset.toISOString() : null,
+        },
+      ];
+    });
+    return windows.length ? { measuredAt, windows } : null;
+  } finally {
+    closeSync(file);
   }
 }
 

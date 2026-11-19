@@ -1,15 +1,5 @@
 import { useEffect, useState } from 'react';
-import {
-  UserRound,
-  RefreshCw,
-  LogIn,
-  LogOut,
-  ExternalLink,
-  Copy,
-  Check,
-  ListOrdered,
-  KeyRound,
-} from 'lucide-react';
+import { UserRound, RefreshCw, ListOrdered } from 'lucide-react';
 import type {
   AccountState,
   NativeCapabilities,
@@ -21,18 +11,6 @@ import type { ProxyClient } from './client.ts';
 import { IconButton, Page, Row, Switch } from './ui.tsx';
 import { useQuota } from './quota.ts';
 import { setPrefs, usePrefs } from './prefs.ts';
-import { copyText } from './copy.tsx';
-
-// What the date a stored claude.ai sign-in ends means for the user. Renewing the access token does not move it; the
-// CLI starts warning ten days before it.
-function loginExpiry(expiresAt: string, now = Date.now()) {
-  const days = Math.ceil((Date.parse(expiresAt) - now) / 86_400_000);
-  if (days <= 0)
-    return <span className="error-text">可能已经到期；请求开始失败时，退出登录后重新登录</span>;
-  if (days <= 10) return <span className="error-text">约 {days} 天后到期，到期后需要重新登录</span>;
-  return `约 ${days} 天后到期，实际可能早几天`;
-}
-
 export default function AccountPanel({
   client,
   account: state,
@@ -42,6 +20,7 @@ export default function AccountPanel({
   disabled,
   error,
   refresh,
+  openTerminal,
   usageOnly = false,
   quotaUnavailable,
 }: {
@@ -52,62 +31,94 @@ export default function AccountPanel({
   refreshing: boolean;
   disabled: boolean;
   error: string | null;
-  refresh: () => void;
+  refresh: (sdkQuota: boolean) => void;
+  openTerminal?: () => void;
   usageOnly?: boolean;
   quotaUnavailable?: string;
 }) {
   const account = capabilities?.account;
-  const limits = useQuota(metrics?.rateLimits);
   const { quotaReads } = usePrefs();
-  const [working, setWorking] = useState(false);
-  const [failure, setFailure] = useState<string | null>(null);
-  const [code, setCode] = useState('');
-  const [token, setToken] = useState('');
-  const [tokenOpen, setTokenOpen] = useState(false);
-  const [confirmLogout, setConfirmLogout] = useState(false);
-  const [copied, setCopied] = useState(false);
-  const signedOut = state?.loggedIn === false;
-  const usesToken = state?.authMethod === 'oauth_token';
-  const [summary, setSummary] = useState<UsageSummary | null>(null);
+  const [profile, setProfile] = useState<'terminal' | 'sdk'>('terminal');
+  const personal = profile === 'terminal';
+  const identity = personal ? state?.terminal : state;
+  const readKey = JSON.stringify([
+    profile,
+    identity?.loggedIn,
+    identity?.email,
+    identity?.organization,
+  ]);
+  const [reading, setReading] = useState<{ key: string; summary: UsageSummary } | null>(null);
+  const [readError, setReadError] = useState<string | null>(null);
+  const [revision, refreshReading] = useState(0);
+  const summary = reading?.key === readKey ? reading.summary : null;
+  const limits = useQuota(
+    personal
+      ? summary && { available: true, windows: summary.windows, measuredAt: summary.measuredAt }
+      : metrics?.rateLimits,
+  );
+  const runningTerminal = client.state.sessions.some(
+    (session) => session.activeRun?.surface === 'terminal',
+  );
+  const sdkMeasured = personal ? undefined : metrics?.rateLimits?.measuredAt;
   const [log, setLog] = useState<string | null>(null);
   useEffect(() => {
     let current = true;
-    void client.fetch({ type: 'usage.summary' }).then(
-      (result) => {
-        if (current) setSummary(result);
-      },
-      () => {},
-    );
+    let pending = false;
+    const read = async () => {
+      if (pending) return;
+      pending = true;
+      try {
+        const result = await client.fetch({
+          type: 'usage.summary',
+          ...(personal && { profile: 'terminal' as const }),
+        });
+        if (current) {
+          setReading({ key: readKey, summary: result });
+          setReadError(null);
+        }
+      } catch (cause) {
+        if (current) {
+          setReading(null);
+          setReadError(cause instanceof Error ? cause.message : '读取额度失败。');
+        }
+      } finally {
+        pending = false;
+      }
+    };
+    void read();
+    const timer =
+      personal && quotaReads && runningTerminal
+        ? window.setInterval(() => void read(), 60000)
+        : undefined;
     return () => {
       current = false;
+      window.clearInterval(timer);
     };
-  }, [client, metrics?.rateLimits?.measuredAt, log]);
+  }, [client, personal, readKey, quotaReads, runningTerminal, sdkMeasured, revision, log]);
   if (log && !usageOnly)
-    return <UsagePanel client={client} summary={summary} initial={log} back={() => setLog(null)} />;
-  async function act(command: Parameters<ProxyClient['request']>[0]) {
-    setFailure(null);
-    setWorking(true);
-    try {
-      await client.request(command);
-      return true;
-    } catch (error) {
-      setFailure(error instanceof Error ? error.message : '操作失败。');
-      return false;
-    } finally {
-      setWorking(false);
-    }
-  }
+    return (
+      <UsagePanel
+        client={client}
+        summary={summary}
+        profile={profile}
+        initial={log}
+        back={() => setLog(null)}
+      />
+    );
   return (
     <Page
       title={usageOnly ? '订阅用量' : '账号与额度'}
       label={usageOnly ? '订阅用量' : '账号信息'}
-      intro={!usageOnly && '云端 Claude Code 登录的账号，与官方读取的订阅额度。'}
+      intro={!usageOnly && '服务器为此应用配置的模型服务与用量。'}
       actions={
         <IconButton
           title={usageOnly ? '刷新订阅用量' : '刷新账号信息'}
           className={usageOnly ? 'quota-page-refresh' : undefined}
           disabled={disabled}
-          onClick={refresh}
+          onClick={() => {
+            refreshReading((n) => n + 1);
+            refresh(!personal);
+          }}
         >
           <RefreshCw className={refreshing ? 'spinning' : ''} />
         </IconButton>
@@ -126,250 +137,33 @@ export default function AccountPanel({
             </div>
             <div>
               <h2>
-                {signedOut
-                  ? '尚未登录'
-                  : usesToken
-                    ? 'Setup token 已配置'
-                    : (state?.email ?? account?.email ?? 'Claude Code')}
+                {state
+                  ? state.loggedIn
+                    ? 'GUI 模型服务已登录'
+                    : 'GUI 模型服务尚未登录'
+                  : 'GUI 认证状态未读取'}
               </h2>
-              <p>
-                {signedOut
-                  ? '云端 Claude Code 还没有登录账号'
-                  : usesToken
-                    ? '令牌是否有效，以实际请求结果为准'
-                    : (state?.subscriptionType ?? account?.subscriptionType ?? '账号信息尚未读取')}
-              </p>
+              <p>在服务器配置自己的 Console API key 或受支持的云提供方。</p>
             </div>
-            {signedOut && !state.login && !tokenOpen && (
-              <div className="account-login-actions">
-                <button
-                  type="button"
-                  className="button primary"
-                  disabled={working}
-                  onClick={() => {
-                    void act({ type: 'account.login' });
-                  }}
-                >
-                  <LogIn />
-                  {working ? '获取链接…' : '普通登录'}
-                </button>
-                <button
-                  type="button"
-                  className="button secondary"
-                  disabled={working}
-                  onClick={() => setTokenOpen(true)}
-                >
-                  <KeyRound />
-                  Setup token 登录
-                </button>
-              </div>
-            )}
-            {state?.loggedIn && !confirmLogout && (
-              <button
-                type="button"
-                className="button secondary"
-                disabled={working}
-                onClick={() => setConfirmLogout(true)}
-              >
-                <LogOut />
-                退出登录
-              </button>
-            )}
           </div>
-          {(failure ?? state?.notice) && (
-            <p className="error-text" role="alert">
-              {failure ?? state?.notice}
-            </p>
-          )}
-          {signedOut && !state.login && !tokenOpen && (
-            <p className="muted">
-              Setup token 可能不提供账号资料、完整订阅额度和到期信息；失效后需要重新生成或更换。
-            </p>
-          )}
-          {state?.loggedIn && confirmLogout && (
-            <div className="account-confirm" role="group" aria-label="确认退出登录">
-              <p>
-                {usesToken
-                  ? '退出会移除服务端保存的 setup token，并清除原生登录凭据；会话记录保留。这不会撤销令牌在其他地方的使用。'
-                  : '退出后云端的登录凭据会被官方 CLI 清除，会话记录保留；再次使用需要重新登录。'}
-              </p>
-              <button
-                type="button"
-                className="button secondary"
-                disabled={working}
-                onClick={() => setConfirmLogout(false)}
-              >
-                取消
-              </button>
-              <button
-                type="button"
-                className="button danger"
-                disabled={working}
-                onClick={() => {
-                  void act({ type: 'account.logout' }).then(() => setConfirmLogout(false));
-                }}
-              >
-                <LogOut />
-                退出登录
-              </button>
-            </div>
-          )}
-          {signedOut && tokenOpen && !state.login && (
-            <form
-              className="account-login setup-token-login"
-              aria-label="使用 setup token"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void act({ type: 'account.token', token: token.trim() }).then((saved) => {
-                  if (saved) {
-                    setToken('');
-                    setTokenOpen(false);
-                  }
-                });
-              }}
-            >
-              <p>还没有令牌？由服务端运行官方 setup-token，完成浏览器授权后自动保存并使用。</p>
-              <button
-                type="button"
-                className="button secondary"
-                disabled={working}
-                onClick={() => {
-                  void act({ type: 'account.login', method: 'setup-token' }).then((started) => {
-                    if (started) {
-                      setToken('');
-                      setTokenOpen(false);
-                    }
-                  });
-                }}
-              >
-                <ExternalLink />
-                {working ? '获取链接…' : '生成 setup token'}
-              </button>
-              <p>已有令牌？直接粘贴到下面保存。</p>
-              <input
-                type="password"
-                aria-label="Setup token"
-                value={token}
-                onChange={(event) => setToken(event.target.value)}
-                autoComplete="new-password"
-                spellCheck={false}
-                maxLength={8192}
-                required
-              />
-              <p className="muted">
-                令牌只保存在服务端。账号资料和完整订阅额度可能无法读取；令牌到期或撤销后，需要退出并重新配置。
-              </p>
-              <div className="account-login-actions">
-                <button
-                  type="button"
-                  className="button secondary"
-                  disabled={working}
-                  onClick={() => {
-                    setToken('');
-                    setTokenOpen(false);
-                    setFailure(null);
-                  }}
-                >
-                  取消
-                </button>
-                <button className="button primary" disabled={working || !token.trim()}>
-                  <Check />
-                  {working ? '保存中…' : '保存并使用'}
-                </button>
-              </div>
-            </form>
-          )}
-          {signedOut && state.login && (
-            <form
-              className="account-login"
-              aria-label="登录 Claude 账号"
-              onSubmit={(event) => {
-                event.preventDefault();
-                void act({ type: 'account.code', code: code.trim() }).then(() => setCode(''));
-              }}
-            >
-              {state.login.method === 'setup-token' && (
-                <p>正在通过服务端生成 setup token；完成授权后自动保存，并显示一次供你复制。</p>
-              )}
-              <p>
-                <strong>1</strong>在浏览器打开官方授权页并登录。
-              </p>
-              <div className="account-login-actions">
-                <button
-                  type="button"
-                  className="button primary"
-                  onClick={() => {
-                    if (window.desktop)
-                      void window.desktop
-                        .openExternal(state.login!.url)
-                        .catch(() => setFailure('无法打开浏览器，请复制链接。'));
-                    else window.open(state.login!.url, '_blank', 'noopener');
-                  }}
-                >
-                  <ExternalLink />
-                  打开授权页
-                </button>
-                <button
-                  type="button"
-                  className="button secondary"
-                  onClick={() => {
-                    void copyText(state.login!.url).then(
-                      () => {
-                        setCopied(true);
-                        setTimeout(() => setCopied(false), 2000);
-                      },
-                      () => setFailure('复制失败，请重试。'),
-                    );
-                  }}
-                >
-                  {copied ? <Check /> : <Copy />}
-                  {copied ? '已复制' : '复制链接'}
-                </button>
-              </div>
-              <p>
-                <strong>2</strong>把授权页最后显示的代码粘贴到这里。
-              </p>
-              <input
-                aria-label="授权码"
-                value={code}
-                onChange={(event) => setCode(event.target.value)}
-                spellCheck={false}
-                autoComplete="off"
-                required
-              />
-              <div className="account-login-actions">
-                <button
-                  type="button"
-                  className="button secondary"
-                  disabled={working}
-                  onClick={() => {
-                    void act({ type: 'account.cancel' });
-                  }}
-                >
-                  取消
-                </button>
-                <button className="button primary" disabled={working || !code.trim()}>
-                  <Check />
-                  完成登录
-                </button>
-              </div>
-            </form>
-          )}
-          <Row title="登录方式">
-            <span className="setting-value">
-              {signedOut
-                ? '未登录'
-                : usesToken
-                  ? 'Setup token'
-                  : state?.authMethod === 'claude.ai'
-                    ? '浏览器授权'
-                    : (state?.authMethod ?? '未读取')}
-            </span>
+          <Row title="认证来源">
+            <span className="setting-value">{state?.authMethod ?? '未读取'}</span>
           </Row>
-          <Row title="组织">
-            <span className="setting-value">
-              {usesToken ? '令牌未提供' : (account?.organization ?? '未提供')}
-            </span>
+          <Row
+            title="ccdt 原生终端"
+            detail={
+              state?.terminal?.loggedIn
+                ? (state.terminal.email ?? state.terminal.authMethod ?? '已登录')
+                : state?.terminal
+                  ? '尚未登录。按原生终端提示在浏览器授权，若出现回调码，粘贴到同一终端。'
+                  : '可在 ccdt 原生终端查看账号。'
+            }
+          >
+            {openTerminal && (
+              <button type="button" className="button secondary" onClick={openTerminal}>
+                {state?.terminal?.loggedIn ? '重新登录（ccdt）' : '普通登录（ccdt）'}
+              </button>
+            )}
           </Row>
           <Row title="模型服务">
             <span className="setting-value">
@@ -378,25 +172,11 @@ export default function AccountPanel({
                 : (account?.apiProvider ?? '未读取')}
             </span>
           </Row>
-          <Row title="认证来源">
-            <span className="setting-value">
-              {usesToken
-                ? 'Setup token'
-                : (account?.tokenSource ?? account?.apiKeySource ?? '未提供')}
-            </span>
-          </Row>
-          {state?.loggedIn && state.loginExpiresAt && (
-            <Row title="登录有效期" detail={loginExpiry(state.loginExpiresAt)}>
-              <span className="setting-value">
-                {new Date(state.loginExpiresAt).toLocaleDateString('zh-CN')}
-              </span>
-            </Row>
-          )}
         </div>
       )}
       {!usageOnly && (
         <div className="page-heading account-section-title">
-          <h2>订阅用量</h2>
+          <h2>{personal ? '订阅用量' : '模型服务用量'}</h2>
           <button type="button" className="button secondary" onClick={() => setLog('today')}>
             <ListOrdered />
             调用日志
@@ -404,6 +184,14 @@ export default function AccountPanel({
         </div>
       )}
       <div className={`card account-card${usageOnly ? ' quota-card' : ''}`}>
+        <div className="segmented" role="group" aria-label="额度来源">
+          <button type="button" aria-pressed={personal} onClick={() => setProfile('terminal')}>
+            个人订阅
+          </button>
+          <button type="button" aria-pressed={!personal} onClick={() => setProfile('sdk')}>
+            模型服务
+          </button>
+        </div>
         {limits ? (
           <div className="quota-list">
             {limits.windows.map((window, index) => (
@@ -461,18 +249,38 @@ export default function AccountPanel({
           </div>
         ) : (
           <p className="muted">
-            {metrics?.errors?.usage ??
+            {readError ??
+              (personal ? '暂无可归属到当前订阅的终端读数。' : metrics?.errors?.usage) ??
               quotaUnavailable ??
               (usageOnly
                 ? metrics?.rateLimits
-                  ? '当前账号未提供订阅额度'
+                  ? '当前账号未提供模型服务额度'
                   : '等待读取原生额度'
                 : '尚无额度数据')}
           </p>
         )}
+        {personal && (
+          <a
+            href="https://claude.ai/settings/usage"
+            target="_blank"
+            rel="noreferrer"
+            onClick={(event) => {
+              if (window.desktop) {
+                event.preventDefault();
+                void window.desktop.openExternal('https://claude.ai/settings/usage');
+              }
+            }}
+          >
+            完整订阅用量（含按模型额度）
+          </a>
+        )}
         <Row
           title="运行中每分钟读取一次额度"
-          detail="让服务端在有任务运行时每分钟向官方读取一次 5 小时与每周额度，各会话、各设备共用这一次读取；关闭后只记录回复里自带的额度，上方的刷新仍会读取"
+          detail={
+            personal
+              ? '此页打开且原版终端运行时，每分钟更新它已报告的五小时和每周额度。手动刷新也会读取最新报告。'
+              : 'SDK 运行时每分钟最多读取一次模型服务额度。手动刷新会重新读取。'
+          }
         >
           <Switch
             label="运行中每分钟读取一次额度"

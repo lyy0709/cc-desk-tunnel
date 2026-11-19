@@ -1,15 +1,17 @@
+import { projectTools, projectPrompt } from './project-tools.ts';
 import { randomUUID, createHash, timingSafeEqual } from 'node:crypto';
 import {
   createReadStream,
   mkdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   unwatchFile,
   watchFile,
 } from 'node:fs';
 import { createServer } from 'node:http';
-import { totalmem } from 'node:os';
+import { totalmem, homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { IncomingMessage, RequestListener } from 'node:http';
@@ -24,6 +26,10 @@ import {
 } from '@anthropic-ai/claude-agent-sdk';
 import {
   authSchema,
+  APPROVAL_PAGE_CHARS,
+  projectCommands,
+  projectReply,
+  type ProjectOperation,
   commandSchema,
   continues,
   deviceIdentitySchema,
@@ -36,15 +42,11 @@ import {
   platformOf,
   PROTOCOL_VERSION,
   runWorking,
-  TUNNEL_CLOSE,
-  tunnelAttachSchema,
-  tunnelCredentialsSchema,
   terminalControlSchema,
   webActivitySchema,
   webAuthSchema,
 } from '@cc-desk-tunnel/protocol';
 import type {
-  AccountState,
   Command,
   Device,
   EventPayload,
@@ -54,7 +56,6 @@ import type {
   ServerMessage,
   Session,
   TerminalControl,
-  TunnelCredentials,
 } from '@cc-desk-tunnel/protocol';
 import {
   runClaude,
@@ -64,20 +65,20 @@ import {
   quotas,
   readNativeStatus,
 } from './claude.ts';
-import type { ClaudeOptions, Unanswered } from './claude.ts';
+import type { ApprovalPreview, ClaudeOptions, Unanswered } from './claude.ts';
 import { ClientReleases } from './client-release.ts';
 import { DomainError } from './errors.ts';
 import { HistoryDelivery } from './history-delivery.ts';
-import type { NativeLogin } from './native-account.ts';
 import { IdleCompactions } from './idle-compaction.ts';
 import { NativeInput } from './native-input.ts';
-import { loginOf, statusLineQuota } from './native-controls.ts';
-import { completeOnboarding } from './native-onboarding.ts';
+import { loginOf } from './native-controls.ts';
+import { accountStatus } from './native-account.ts';
 import { readNativeSettings, updateNativeSettings } from './native-settings.ts';
 import { readInstructions, writeInstructions } from './native-instructions.ts';
 import type { NativeTerminal } from './native-terminal.ts';
 import {
   statusLineContext,
+  subscriptionSnapshot,
   terminalActivity,
   terminalHooks,
   terminalRecord,
@@ -88,8 +89,6 @@ import { inOrder } from './question.ts';
 import { simulate } from './simulation.ts';
 import { SessionStore } from './store.ts';
 import { Throttle } from './throttle.ts';
-import { Door, Tunnel, sessionSsh, sessionSshPath } from './tunnel.ts';
-import type { TunnelOptions } from './tunnel.ts';
 import { ServiceUpdates, serviceVersion } from './updates.ts';
 import type { UpdateOptions } from './updates.ts';
 import { UsageLog, createUsageReceiver, telemetryEnvironment } from './usage.ts';
@@ -108,8 +107,8 @@ type Peer = {
   // The computer it is from: the name it signed in with, and the identity that follows in a frame of its own.
   name: string;
   device?: Device;
-  tunnel?: Tunnel;
-  registering: boolean;
+  files?: boolean;
+  commandGrants: Map<string, string>;
   // The client said it was closing the connection: nothing is kept for it to come back to.
   left: boolean;
   // This client wants the account quota kept current while runs go on.
@@ -160,6 +159,7 @@ export type Run = {
     string,
     {
       toolName: string;
+      preview: ApprovalPreview;
       decide: (
         allowed: boolean,
         answers?: Record<string, string>,
@@ -180,6 +180,7 @@ export type Run = {
   scheduled?: 'scheduled' | 'manual';
   controls: {
     refresh?: (asked?: boolean) => Promise<void>;
+    refreshProject?: () => Promise<void>;
     stopTask?: (taskId: string) => Promise<void>;
     backgroundTask?: (toolId: string) => Promise<boolean>;
   };
@@ -187,6 +188,8 @@ export type Run = {
   stats: ReturnType<typeof inOrder>;
 };
 type Terminal = {
+  openedAt: number;
+  subscriptionAtOpen: Promise<string | null>;
   id: string;
   sessionId: string;
   // The connection showing it. The terminal outlives a lost connection by `graceMs`.
@@ -202,9 +205,8 @@ type Terminal = {
     last?: string;
     settingsPath: string;
     hooksPath: string;
-    // What its CLI last showed in the status line, and the quota last heard from it.
+    // Context-window figures reported by the interactive CLI.
     statusPath: string;
-    quota?: string;
     offset: number;
     heard: Promise<void>;
     activity?: TerminalActivity;
@@ -227,11 +229,8 @@ const INTERRUPTS = new Set(['\x1b', '\x03', '\x1b[27u', '\x1b[99;5u']);
 type Seat = {
   device: string;
   peers: Set<Peer>;
-  door?: Door;
-  opening?: Promise<void>;
   away?: NodeJS.Timeout;
 };
-type Login = { process: NativeLogin; owner: Peer; url?: string };
 type CommandOf<T extends Command['type']> = Extract<Command, { type: T }>;
 export type ServerOptions = {
   token: string;
@@ -239,7 +238,6 @@ export type ServerOptions = {
   stepMs?: number;
   allowedOrigins?: string[];
   claude?: ClaudeOptions;
-  tunnel?: TunnelOptions;
   tls?: { cert: Buffer; key: Buffer };
   reverseProxy?: boolean;
   host?: string;
@@ -269,14 +267,80 @@ const CONTINUE =
 export function createProxyServer(options: ServerOptions) {
   if (options.token.length < 24)
     throw new Error('PROXY_TOKEN must contain at least 24 characters.');
-  if (options.claude && (!options.tunnel || (!options.tls && !options.reverseProxy)))
-    throw new Error(
-      'Native mode requires TLS or explicit reverse proxy mode, and the execution channel.',
-    );
+  if (options.claude && !options.tls && !options.reverseProxy)
+    throw new Error('Native mode requires TLS or explicit reverse proxy mode.');
   const store = new SessionStore(options.dataDir);
   const usage = new UsageLog(store.database);
   const usageReceiver = options.claude ? createUsageReceiver(usage) : undefined;
   const peers = new Set<Peer>();
+  const pendingFiles = new Map<
+    string,
+    { peer: Peer; sessionId: string; settle: (ok: boolean, text: string) => void }
+  >();
+  const projectViews = new Set<() => void>();
+  async function openTools(session: Session, preferred: string) {
+    const directory = join(store.directory, 'project-sockets');
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const projectPeer = () => {
+      const candidates = [...(seats.get(session.device?.id ?? '')?.peers ?? [])].filter(
+        (p) => p.files && p.socket.readyState === WebSocket.OPEN,
+      );
+      return candidates.find((p) => p.id === preferred) ?? candidates.at(-1);
+    };
+    const endpoint = await projectTools(
+      directory,
+      (operation: ProjectOperation, signal: AbortSignal) => {
+        const peer = projectPeer();
+        if (!peer || signal.aborted) throw new Error('项目设备未连接。');
+        const requestId = randomUUID();
+        return new Promise<string>((resolve, reject) => {
+          const stop = () => {
+            send(peer, { type: 'project.cancel', requestId });
+            settle(false, '执行中断，结果未知。');
+          };
+          const timer = setTimeout(stop, 150000);
+          const settle = (ok: boolean, text: string) => {
+            clearTimeout(timer);
+            signal.removeEventListener('abort', stop);
+            pendingFiles.delete(requestId);
+            if (ok) resolve(text);
+            else reject(new Error(text));
+          };
+          pendingFiles.set(requestId, { peer, sessionId: session.id, settle });
+          signal.addEventListener('abort', stop, { once: true });
+          const shell =
+            operation.op === 'command'
+              ? store.execution(session.device?.id, platformOf(session.device)).shell
+              : undefined;
+          send(peer, {
+            type: 'project.call',
+            requestId,
+            sessionId: session.id,
+            project: session.projectPath,
+            operation:
+              operation.op === 'command'
+                ? { ...operation, shell: operation.shell ?? shell }
+                : operation,
+          });
+        });
+      },
+    );
+    const sync = () =>
+      endpoint.setCommands(projectPeer()?.commandGrants.get(session.id) === session.projectPath);
+    projectViews.add(sync);
+    sync();
+    return {
+      config: endpoint.config,
+      close() {
+        projectViews.delete(sync);
+        endpoint.close();
+      },
+    };
+  }
+  function checkHistory(session: Session) {
+    if (options.claude && !session.projectAccess)
+      throw new DomainError('history_consent', '旧会话可能包含绝对路径和用户名，请先确认续聊。');
+  }
   quotas.wanted = () => [...peers].some((peer) => peer.quotaWanted);
   // One run or one terminal per session, each a CLI process of its own in the session's directory. What reads
   // or changes the state the CLI keeps for all of them — a status read or session change (`mutations`), an
@@ -284,20 +348,37 @@ export function createProxyServer(options: ServerOptions) {
   const runs = new Map<string, Run>();
   const mutations = new Map<string, 'status' | 'session'>();
   const terminals = new Map<string, Terminal>();
+  let statusPending: ReturnType<typeof accountStatus> | undefined;
+  function personalAccount() {
+    statusPending ??= accountStatus(options.claude!.executable, 'terminal').finally(() => {
+      statusPending = undefined;
+    });
+    return statusPending;
+  }
+  async function captureSubscription(terminal: Terminal, scope: string | null) {
+    if (!scope) return;
+    const snapshot = subscriptionSnapshot(terminal.continued.statusPath);
+    if (!snapshot) return;
+    const at = Date.parse(snapshot.measuredAt);
+    const callScope = usage.terminalScopeAt(terminal.sessionId, terminal.openedAt, at);
+    if (callScope && callScope !== 'terminal' && callScope !== scope) return;
+    if ((await terminal.subscriptionAtOpen) !== scope && callScope !== scope) return;
+    usage.observe(snapshot, at, scope);
+  }
+  // A login PTY belongs only to its live connection and has no conversation, transcript or screen replay.
+  let login: { owner: Peer; sessionId: string; id: string; process: NativeTerminal } | undefined;
   const seats = new Map<string, Seat>();
   const compactions = new IdleCompactions(store.directory, compactIdle, (sessionId) =>
     quotas.blockedUntil(loginOf(store.lastAccount(sessionId) ?? {}), store.lastQuota(sessionId)),
   );
   armCompactions();
   const graceMs = options.graceMs ?? (options.claude ? 300_000 : 0);
-  let login: Login | undefined;
   // Each run or terminal is a CLI process that keeps some 250 MB; more of them than the memory holds would
   // take the machine down, and every one of them with it.
   const capacity =
     options.maxRuns ?? Math.max(1, Math.floor((totalmem() - 300 * 2 ** 20) / (300 * 2 ** 20)));
   // Background work that close() waits for.
   const tasks = new Set<Promise<unknown>>();
-  const tunnelTasks = new Set<Promise<unknown>>();
   let closing = false;
   const adapter = options.claude ? 'claude-code' : 'simulation';
   const origins = options.allowedOrigins ?? [
@@ -438,7 +519,7 @@ export function createProxyServer(options: ServerOptions) {
   });
 
   function send(peer: Peer, message: ServerMessage) {
-    // History benefits from compression; small live events and control replies do not need it.
+    // History and usage series can span many records.
     if (peer.socket.readyState === WebSocket.OPEN)
       peer.socket.send(JSON.stringify(message), {
         compress: [
@@ -446,6 +527,7 @@ export function createProxyServer(options: ServerOptions) {
           'session.history.part',
           'session.outline',
           'session.read',
+          'usage.page',
         ].includes(message.type),
       });
   }
@@ -482,7 +564,7 @@ export function createProxyServer(options: ServerOptions) {
     const place = session.device ?? device!;
     const seat = seats.get(place.id);
     if (place.id === device?.id) {
-      if (options.claude && !(peer.tunnel?.ssh && seat?.door?.ssh))
+      if (options.claude && !peer.files)
         throw new DomainError(
           'execution_offline',
           '本机的执行通道尚未就绪，请稍候；客户端正在建立或重新建立连接。',
@@ -492,7 +574,7 @@ export function createProxyServer(options: ServerOptions) {
         'device_offline',
         `设备“${place.name}”不在线。它连上服务后才能在这里操作它的会话；也可以把会话接到本机或分叉到本机。`,
       );
-    else if (options.claude && !seat.door?.ready)
+    else if (options.claude && ![...seat.peers].some((p) => p.files))
       throw new DomainError(
         'execution_offline',
         `设备“${place.name}”的执行通道尚未就绪，请稍候再试。`,
@@ -518,7 +600,7 @@ export function createProxyServer(options: ServerOptions) {
           return [
             {
               ...device,
-              ready: !options.tunnel || !!seat.door?.ready,
+              ready: !options.claude || [...seat.peers].some((p) => p.files),
               shells,
               ...(shell ? { shell } : {}),
             },
@@ -528,6 +610,7 @@ export function createProxyServer(options: ServerOptions) {
     };
   }
   function announce() {
+    for (const sync of projectViews) sync();
     const message = devices();
     const text = JSON.stringify(message);
     if (closing || text === presence) return;
@@ -535,7 +618,7 @@ export function createProxyServer(options: ServerOptions) {
     broadcast(message);
   }
   function room() {
-    if (options.claude && runs.size + terminals.size >= capacity)
+    if (options.claude && runs.size + terminals.size + Number(!!login) >= capacity)
       throw new DomainError(
         'capacity',
         `服务端同时最多进行 ${capacity} 个运行或终端（按服务器内存估算，可用 PROXY_MAX_RUNS 调整）。请等其他任务结束后再试。`,
@@ -551,7 +634,7 @@ export function createProxyServer(options: ServerOptions) {
 
   // Stores an event and sends it to the session's subscribers; quota readings also drive the usage periods.
   function record(sessionId: string, runId: string, payload: EventPayload, createdAt?: string) {
-    if (payload.type === 'native.metrics' && payload.rateLimits?.available)
+    if (payload.type === 'native.metrics' && !payload.profile && payload.rateLimits?.available)
       usage.observe(payload.rateLimits);
     const event = store.append(sessionId, runId, payload, createdAt);
     broadcast({ type: 'session.event', event }, sessionId);
@@ -578,7 +661,13 @@ export function createProxyServer(options: ServerOptions) {
     if (closing || !options.claude) return;
     try {
       const { session } = store.get(sessionId);
-      if (session.activeRun || terminals.has(sessionId) || !session.device) return;
+      if (
+        !session.projectAccess ||
+        session.activeRun ||
+        terminals.has(sessionId) ||
+        !session.device
+      )
+        return;
       submit(undefined, { type: 'session.compact', requestId: randomUUID(), sessionId }, session);
       const run = runs.get(sessionId);
       if (run) {
@@ -626,7 +715,6 @@ export function createProxyServer(options: ServerOptions) {
         type: 'session.updated',
         session: store.renameNative(run.sessionId, payload.title),
       });
-    if (payload.type === 'native.compact') store.compacted(run.sessionId);
     if (payload.type === 'run.status' || payload.type === 'native.permission')
       updated(run.sessionId);
   }
@@ -701,26 +789,13 @@ export function createProxyServer(options: ServerOptions) {
     return store.get(sessionId).session.nativeRoot ?? sessionId;
   }
   async function native(run: Run) {
+    let tools: Awaited<ReturnType<typeof openTools>> | undefined;
     try {
       const { session } = store.get(run.sessionId);
-      // The session's `ssh` is there whether or not its computer is (see `sessionSsh`): a compaction, which runs no
-      // command, reads the same prompt cache while it is away.
-      const door = seats.get(run.device)?.door?.ssh;
-      const ssh =
-        run.device === serverDevice.id
-          ? undefined
-          : door
-            ? sessionSsh(store.directory, run.sessionId, door)
-            : {
-                configPath: join(sessionSshPath(store.directory, run.sessionId), 'config'),
-                bin: join(sessionSshPath(store.directory, run.sessionId), 'bin'),
-              };
-      const said = store.promptValues(run.sessionId);
+      if (run.device !== serverDevice.id) tools = await openTools(session, run.connectionId);
       const status = await runClaude(options.claude!, {
         sessionId: run.sessionId,
         nativeRoot: session.nativeRoot ?? session.id,
-        projectPath: said.projectPath,
-        execution: said.execution,
         permissionMode: session.permissionMode,
         model: session.model,
         effort: session.effort,
@@ -738,9 +813,9 @@ export function createProxyServer(options: ServerOptions) {
         dataDir: store.directory,
         resume: store.hasNativeContext(run.sessionId),
         signal: run.controller.signal,
-        ssh,
+        projectTools: tools?.config,
         emit: (event) => emit(run, event),
-        approve: (toolId, waiting, toolName, signal) => {
+        approve: (toolId, waiting, toolName, signal, preview) => {
           if (signal.aborted) return Promise.resolve({ allowed: false });
           const approvalId = randomUUID();
           if (waiting === 'question') run.questions.add(approvalId);
@@ -758,6 +833,7 @@ export function createProxyServer(options: ServerOptions) {
               );
             run.approvals.set(approvalId, {
               toolName,
+              preview,
               decide: (allowed, answers, unanswered, executionMode, cancelled) => {
                 signal.removeEventListener('abort', abort);
                 run.questions.delete(approvalId);
@@ -790,126 +866,9 @@ export function createProxyServer(options: ServerOptions) {
         message: '原生进程适配失败；请检查服务配置和 CLI 版本。',
       });
       finish(run, run.controller.signal.aborted ? 'cancelled' : 'failed', run.cancelReason);
+    } finally {
+      tools?.close();
     }
-  }
-
-  async function publishAccount(target?: Peer, notice?: string) {
-    const { accountStatus } = await import('./native-account.ts');
-    const state: AccountState = {
-      ...(await accountStatus(options.claude!.executable)),
-      login: login?.url ? { url: login.url, method: login.process.method } : null,
-      notice,
-    };
-    if (target) send(target, { type: 'account.state', ...state });
-    else broadcast({ type: 'account.state', ...state });
-  }
-  function resetQuotas() {
-    quotas.clear();
-    // End the old account's current readings without removing its historical usage records.
-    for (const session of store.list()) {
-      if (!store.lastQuota(session.id)) continue;
-      const previous = store.lastMetrics(session.id);
-      record(session.id, randomUUID(), {
-        type: 'native.metrics',
-        context: previous?.context ?? null,
-        usage: previous?.usage ?? null,
-        rateLimits: { available: false, windows: [], measuredAt: new Date().toISOString() },
-      });
-    }
-  }
-  async function account(peer: Peer, command: CommandOf<`account.${string}` & Command['type']>) {
-    if (!options.claude) throw new DomainError('native_unavailable', '离线模拟没有原生账号。');
-    if (command.type === 'account.status') {
-      await publishAccount(peer);
-      return;
-    }
-    if (command.type === 'account.code') {
-      if (!login?.url) throw new DomainError('login_inactive', '登录流程已结束，请重新获取链接。');
-      login.process.submit(command.code);
-      return;
-    }
-    if (command.type === 'account.cancel') {
-      login?.process.cancel();
-      return;
-    }
-    if (terminals.size || runs.size || mutations.size)
-      throw new DomainError('native_busy', '请先结束原生运行或终端，再管理账号。');
-    const { NativeLogin, accountLogout, configureSetupToken } = await import('./native-account.ts');
-    if (command.type === 'account.token') {
-      if (login) throw new DomainError('login_active', '请先取消正在进行的浏览器登录。');
-      try {
-        configureSetupToken(command.token);
-      } catch (error) {
-        throw new DomainError(
-          'token_save_failed',
-          `无法保存 setup token：${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      resetQuotas();
-      await publishAccount();
-      return;
-    }
-    if (command.type === 'account.logout') {
-      login?.process.cancel();
-      try {
-        await accountLogout(options.claude.executable);
-      } catch (error) {
-        throw new DomainError(
-          'logout_failed',
-          `退出登录失败：${error instanceof Error ? error.message : String(error)}`,
-        );
-      }
-      resetQuotas();
-      await publishAccount();
-      return;
-    }
-    if (!login) {
-      const current: Login = {
-        owner: peer,
-        process: new NativeLogin(
-          options.claude.executable,
-          (succeeded, token) => {
-            if (login === current) login = undefined;
-            if (closing) return;
-            let notice = succeeded || current.process.cancelled ? undefined : current.process.error;
-            if (succeeded && token && !current.process.cancelled) {
-              try {
-                configureSetupToken(token);
-              } catch (error) {
-                succeeded = false;
-                notice = `令牌已生成但无法保存：${error instanceof Error ? error.message : String(error)}`;
-              }
-              send(current.owner, {
-                type: 'account.token.created',
-                token,
-                saved: succeeded,
-                error: notice,
-              });
-            }
-            if (succeeded) {
-              resetQuotas();
-              completeOnboarding();
-            }
-            track(publishAccount(undefined, notice).catch(() => {}));
-          },
-          (text) => {
-            if (closing || login !== current) return;
-            track(publishAccount(undefined, text).catch(() => {}));
-          },
-          { method: command.type === 'account.login' ? command.method : undefined },
-        ),
-      };
-      login = current;
-      try {
-        current.url = await current.process.url;
-      } catch (error) {
-        throw new DomainError(
-          'login_failed',
-          error instanceof Error ? error.message : String(error),
-        );
-      }
-    }
-    await publishAccount();
   }
 
   // Starts the CLI without a prompt to read its account, model and quota state.
@@ -919,13 +878,17 @@ export function createProxyServer(options: ServerOptions) {
     const active =
       runs.get(command.sessionId) ?? [...runs.values()].find((run) => run.controls.refresh);
     if (active?.controls.refresh && !mutations.size) {
-      await active.controls.refresh(command.quota);
+      await Promise.all([
+        active.controls.refresh(command.quota),
+        active.sessionId === command.sessionId ? active.controls.refreshProject?.() : undefined,
+      ]);
       return;
     }
     // A terminal's session is read by a CLI of its own that does not take it up (its figures stay as they were).
     if (runs.size || mutations.size)
       throw new DomainError('native_busy', '运行结束后再刷新原生状态。');
-    const resume = !terminals.has(command.sessionId);
+    const resume =
+      !!store.get(command.sessionId).session.projectAccess && !terminals.has(command.sessionId);
     const last = resume ? null : store.lastMetrics(command.sessionId);
     mutations.set(command.sessionId, 'status');
     const controller = new AbortController();
@@ -972,22 +935,25 @@ export function createProxyServer(options: ServerOptions) {
     if (terminals.has(command.sessionId) || runs.has(command.sessionId) || mutations.size)
       throw new DomainError('native_busy', '请先结束这个会话的运行或会话管理，再打开终端。');
     const device = target(peer, session);
-    const ssh = seats.get(device)?.door?.ssh;
-    if (!ssh && device !== serverDevice.id)
-      throw new DomainError('execution_offline', '本机的执行通道尚未就绪。');
+    checkHistory(session);
     room();
     const id = randomUUID();
-    const directory = join(store.directory, 'terminals');
+    const directory = join(store.directory, 'terminals', id);
     const current: Terminal = {
+      openedAt: Date.now(),
+      subscriptionAtOpen: personalAccount().then(
+        (result) => result.scope,
+        () => null,
+      ),
       id,
       sessionId: command.sessionId,
       owner: peer,
       device,
       continued: {
         known: new Set(),
-        settingsPath: join(directory, `${id}.json`),
-        hooksPath: join(directory, `${id}.hooks`),
-        statusPath: join(directory, `${id}.status`),
+        settingsPath: join(directory, 'settings.json'),
+        hooksPath: join(directory, 'events', 'hooks'),
+        statusPath: join(directory, 'events', 'status'),
         offset: 0,
         heard: Promise.resolve(),
         activity: 'idle',
@@ -997,6 +963,7 @@ export function createProxyServer(options: ServerOptions) {
         transcript: new TerminalTranscript((payload, at) => terminalEvent(current, payload, at)),
       },
     };
+    let tools: Awaited<ReturnType<typeof openTools>> | undefined;
     terminals.set(current.sessionId, current);
     try {
       const { NativeTerminal, terminalArguments, terminalEnvironment } =
@@ -1013,7 +980,7 @@ export function createProxyServer(options: ServerOptions) {
         await deleteSession(session.id, { dir: cwd }).catch(() => {});
       current.continued.known = new Set(messages.map((message) => message.uuid));
       current.continued.last = messages.at(-1)?.uuid;
-      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      mkdirSync(join(directory, 'events'), { recursive: true, mode: 0o700 });
       terminalSettings(
         current.continued.settingsPath,
         current.continued.hooksPath,
@@ -1024,20 +991,35 @@ export function createProxyServer(options: ServerOptions) {
       );
       if (closing || peer.socket.readyState !== WebSocket.OPEN)
         throw new Error('Connection closed');
-      completeOnboarding();
-      const reach = ssh ? sessionSsh(store.directory, session.id, ssh) : undefined;
+      if (device !== serverDevice.id) tools = await openTools(session, peer.id);
+      const args = terminalArguments(options.claude, session, {
+        resume,
+        settingsPath: current.continued.settingsPath,
+      });
+      if (tools)
+        args.push(
+          '--tools',
+          'AskUserQuestion,EnterPlanMode,ExitPlanMode',
+          '--setting-sources',
+          'user',
+          '--strict-mcp-config',
+          '--mcp-config',
+          JSON.stringify({ mcpServers: { project: tools.config } }),
+          '--append-system-prompt',
+          projectPrompt,
+        );
       current.process = new NativeTerminal(
         options.claude.executable,
-        terminalArguments(options.claude, session, reach, {
-          resume,
-          settingsPath: current.continued.settingsPath,
-          execution: store.execution(session.device?.id, platformOf(session.device)),
-        }),
+        args,
         {
           cwd,
           cols: command.cols,
           rows: command.rows,
-          env: terminalEnvironment(options.claude, process.env, reach),
+          env: {
+            ...terminalEnvironment(options.claude, process.env),
+            CCDT_RUNTIME_SESSION: session.id,
+            ...(tools && { CCDT_PROJECT_SOCKET: tools.config.args[1] }),
+          },
           status: (activity) => void heardTerminal(current, false, activity),
           screen: {
             detached: () => {
@@ -1062,13 +1044,17 @@ export function createProxyServer(options: ServerOptions) {
             bytes,
           }),
         async (exitCode) => {
+          tools?.close();
           if (terminals.get(current.sessionId) !== current) return;
           clearTimeout(current.idle);
-          const { hooksPath, settingsPath, statusPath } = current.continued;
-          unwatchFile(hooksPath);
-          unwatchFile(statusPath);
+          unwatchFile(current.continued.hooksPath);
           if (current.continued.record) unwatchFile(current.continued.record);
           await heardTerminal(current, true);
+          try {
+            await captureSubscription(current, (await personalAccount()).scope);
+          } catch {
+            console.warn('Unable to retain the closing terminal’s subscription reading.');
+          }
           // A terminal that said nothing leaves no native session: its record, with nothing in it, would keep the
           // session's ID from a chat run or the next terminal, which the CLI refuses it to as one in use.
           if (current.continued.empty)
@@ -1082,9 +1068,7 @@ export function createProxyServer(options: ServerOptions) {
                 await getSessionInfo(current.sessionId, { dir: cwd }).catch(() => undefined),
               ),
             );
-          rmSync(settingsPath, { force: true });
-          rmSync(hooksPath, { force: true });
-          rmSync(statusPath, { force: true });
+          rmSync(directory, { recursive: true, force: true });
           store.append(current.sessionId, current.id, {
             type: 'run.status',
             status: 'completed',
@@ -1113,15 +1097,11 @@ export function createProxyServer(options: ServerOptions) {
       });
       updated(command.sessionId);
       watchFile(current.continued.hooksPath, { interval: 500 }, () => void heardTerminal(current));
-      watchFile(current.continued.statusPath, { interval: 1000 }, () => terminalQuota(current));
       send(peer, { type: 'terminal.opened', sessionId: command.sessionId, terminalId: current.id });
     } catch {
+      tools?.close();
       await current.process?.close();
-      if (!current.process) {
-        rmSync(current.continued.settingsPath, { force: true });
-        rmSync(current.continued.hooksPath, { force: true });
-        rmSync(current.continued.statusPath, { force: true });
-      }
+      if (!current.process) rmSync(directory, { recursive: true, force: true });
       if (terminals.get(current.sessionId) === current) terminals.delete(current.sessionId);
       throw new DomainError('terminal_failed', '终端启动失败，请检查 Linux PTY 组件与 CLI。');
     }
@@ -1196,6 +1176,20 @@ export function createProxyServer(options: ServerOptions) {
   // its first hook is a turn's. Reads go one at a time, with those of the hooks.
   function followRecord(terminal: Terminal, path: string) {
     const { continued } = terminal;
+    const projects = join(process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'), 'projects');
+    try {
+      const project = nativeDirectory(store.directory, nativeRoot(terminal.sessionId)).replaceAll(
+        '/',
+        '-',
+      );
+      const record = terminal.sessionId + '.jsonl';
+      if (!path.endsWith('/projects/' + project + '/' + record)) return;
+      const canonical = join(realpathSync(projects), project, record);
+      path = realpathSync(canonical);
+      if (path !== canonical) return;
+    } catch {
+      return;
+    }
     continued.record = path;
     try {
       continued.recordOffset = statSync(path).size;
@@ -1249,40 +1243,12 @@ export function createProxyServer(options: ServerOptions) {
     const last = store.lastMetrics(terminal.sessionId);
     record(terminal.sessionId, terminal.id, {
       type: 'native.metrics',
+      profile: 'terminal',
       context: terminalContext(terminal) ?? last?.context ?? null,
       usage: last?.usage ?? null,
       rateLimits: null,
       cacheTtl: ttl,
     });
-  }
-  // The quota a terminal's CLI showed in its status line, its replies' as a chat run's stream would carry it: it goes
-  // to the account's quota, and every connection is told, as the quota is the account's, not the session's.
-  function terminalQuota(terminal: Terminal) {
-    const { continued } = terminal;
-    let windows;
-    let context;
-    try {
-      const status: unknown = JSON.parse(readFileSync(continued.statusPath, 'utf8'));
-      windows = statusLineQuota(status);
-      context = statusLineContext(status, readNativeSettings().autoCompactWindow);
-    } catch {
-      return;
-    }
-    const heard = JSON.stringify(windows);
-    if (!windows.length || heard === continued.quota) return;
-    continued.quota = heard;
-    const last = store.lastMetrics(terminal.sessionId);
-    const rateLimits = quotas.observeTerminal(windows);
-    // Nothing the status line showed still holds: the quota the clients have is left as it is.
-    if (!rateLimits?.available) return;
-    usage.observe(rateLimits);
-    const event = store.append(terminal.sessionId, terminal.id, {
-      type: 'native.metrics',
-      context: context ?? last?.context ?? null,
-      usage: last?.usage ?? null,
-      rateLimits,
-    });
-    broadcast({ type: 'session.event', event });
   }
   // A turn the user interrupts runs no hook and leaves nothing in the CLI's record (CLI 2.1.293). A key that
   // interrupts it, typed while the CLI works, with no hook after it in a while, is taken for the end of the turn:
@@ -1361,10 +1327,6 @@ export function createProxyServer(options: ServerOptions) {
       }
       if (command.type === 'session.delete') {
         store.delete(command.sessionId);
-        rmSync(sessionSshPath(store.directory, command.sessionId), {
-          recursive: true,
-          force: true,
-        });
         broadcast({ type: 'session.deleted', sessionId: command.sessionId });
         for (const other of peers) other.subscriptions.delete(command.sessionId);
       } else {
@@ -1484,7 +1446,16 @@ export function createProxyServer(options: ServerOptions) {
         attachments.some((file) => file.deviceId !== peer.device!.id))
     )
       throw new DomainError('attachment_device', '只能向本机执行的会话添加这台电脑上的文件。');
-    const prompt = messageText(text, attachments);
+    checkHistory(session);
+    if (
+      options.claude &&
+      attachments.some((f) => !f.path.startsWith('attachment:') && !f.path.startsWith('project:/'))
+    )
+      throw new DomainError('attachment_binding', '请从已绑定项目或附件选择器重新添加文件。');
+    const prompt = messageText(
+      text,
+      attachments.map((f) => ({ ...f, path: f.path.replace(/^project:\//, '') })),
+    );
     if (session.activeRun) {
       if (scheduled) throw new DomainError('run_active', '当前会话正在运行。');
       const active = runs.get(command.sessionId);
@@ -1502,12 +1473,7 @@ export function createProxyServer(options: ServerOptions) {
         ...(attachments.length ? { attachments } : {}),
         ...(priority ? { priority } : {}),
       });
-      active.input.submit(
-        command.requestId,
-        store.notice(command.sessionId) + prompt,
-        undefined,
-        priority,
-      );
+      active.input.submit(command.requestId, prompt, undefined, priority);
       // A message sent while Claude waits on its question is the user's answer in the chat instead.
       for (const approvalId of [...active.questions])
         answerApproval(active, approvalId, false, undefined, 'replied_in_chat', peer?.id);
@@ -1545,14 +1511,7 @@ export function createProxyServer(options: ServerOptions) {
       ...(priority ? { priority } : {}),
     });
     emit(run, { type: 'run.status', status: 'running', connectionId: run.connectionId });
-    // What Claude's system prompt no longer has right is told to it with this message; the transcript shows the
-    // user's own text.
-    run.input?.submit(
-      command.requestId,
-      store.notice(command.sessionId) + prompt,
-      scheduled,
-      priority,
-    );
+    run.input?.submit(command.requestId, prompt, scheduled, priority);
     track(
       options.claude
         ? native(run)
@@ -1609,7 +1568,7 @@ export function createProxyServer(options: ServerOptions) {
       cancel(
         run,
         options.claude
-          ? '用户停止；已发出的 SSH 命令可能继续执行，副作用未撤销，不能自动重试。'
+          ? '用户停止；已发出的本机命令可能继续执行，副作用未撤销，不能自动重试。'
           : '用户停止',
       );
       return;
@@ -1680,6 +1639,21 @@ export function createProxyServer(options: ServerOptions) {
       );
       return undefined;
     }
+    if (options.claude) {
+      const project =
+        command.type === 'project.move'
+          ? command.to
+          : 'projectPath' in command
+            ? command.projectPath
+            : undefined;
+      if (
+        project !== undefined &&
+        !/^project:[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+          project,
+        )
+      )
+        throw new DomainError('project_binding', '请从项目所在电脑选择并绑定目录。');
+    }
     switch (command.type) {
       case 'server.session.create': {
         const session = store.createOnServer(command.requestId, command.title, serverDevice);
@@ -1689,14 +1663,44 @@ export function createProxyServer(options: ServerOptions) {
         announce();
         return session.id;
       }
-      case 'account.status':
-      case 'account.login':
-      case 'account.token':
-      case 'account.code':
-      case 'account.cancel':
-      case 'account.logout':
-        await account(peer, command);
-        return undefined;
+      case 'account.login': {
+        if (!options.claude) throw new DomainError('native_unavailable', '离线模拟没有原生登录。');
+        const { NativeTerminal, terminalEnvironment } = await import('./native-terminal.ts');
+        if (login) throw new DomainError('native_busy', '已有普通登录正在进行。');
+        if (closing || peer.socket.readyState !== WebSocket.OPEN)
+          throw new Error('Connection closed');
+        room();
+        const id = randomUUID();
+        const identity = { sessionId: command.sessionId, terminalId: id };
+        const process = new NativeTerminal(
+          options.claude.executable,
+          ['auth', 'login'],
+          {
+            cwd: store.directory,
+            cols: command.cols,
+            rows: command.rows,
+            env: { ...terminalEnvironment(options.claude), CCDT_ACCOUNT_PROFILE: 'terminal' },
+          },
+          (data, bytes) => send(peer, { type: 'terminal.data', ...identity, data, bytes }),
+          (exitCode) => {
+            if (login?.id === id) login = undefined;
+            send(peer, { type: 'terminal.closed', ...identity, exitCode });
+          },
+        );
+        login = { owner: peer, sessionId: command.sessionId, id, process };
+        send(peer, { type: 'terminal.opened', ...identity });
+        return;
+      }
+      case 'account.status': {
+        if (!options.claude)
+          throw new DomainError('native_unavailable', '离线模拟没有原生账号状态。');
+        const [sdk, terminal] = await Promise.all([
+          accountStatus(options.claude.executable, 'sdk'),
+          personalAccount(),
+        ]);
+        send(peer, { type: 'account.state', ...sdk.account, terminal: terminal.account });
+        return;
+      }
       case 'settings.get':
       case 'settings.update': {
         if (!options.claude) throw new DomainError('native_unavailable', '离线模拟没有原生设置。');
@@ -1747,9 +1751,22 @@ export function createProxyServer(options: ServerOptions) {
         }
         return undefined;
       }
-      case 'usage.summary':
-        send(peer, { type: 'usage.summary', requestId: command.requestId, ...usage.summary() });
+      case 'usage.summary': {
+        const scope =
+          command.profile === 'terminal'
+            ? options.claude
+              ? (await personalAccount()).scope
+              : null
+            : 'sdk';
+        if (scope && command.profile === 'terminal')
+          await Promise.all([...terminals.values()].map((t) => captureSubscription(t, scope)));
+        send(peer, {
+          type: 'usage.summary',
+          requestId: command.requestId,
+          ...usage.summary(Date.now(), scope),
+        });
         return undefined;
+      }
       case 'quota.watch':
         peer.quotaWanted = command.active;
         return undefined;
@@ -1780,11 +1797,13 @@ export function createProxyServer(options: ServerOptions) {
         return undefined;
       }
       case 'usage.query': {
+        const scope =
+          command.profile === 'terminal' && options.claude ? (await personalAccount()).scope : null;
         const titles = new Map(store.list().map((session) => [session.id, session.title]));
         send(peer, {
           type: 'usage.page',
           requestId: command.requestId,
-          ...usage.query(command, (sessionId) => titles.get(sessionId) ?? null),
+          ...usage.query(command, (sessionId) => titles.get(sessionId) ?? null, Date.now(), scope),
         });
         return undefined;
       }
@@ -1830,6 +1849,34 @@ export function createProxyServer(options: ServerOptions) {
       case 'session.status':
         await readStatus(peer, command);
         return command.sessionId;
+      case 'approval.inspect': {
+        const run = runs.get(session.id);
+        const preview = run?.id === command.runId && run.approvals.get(command.approvalId)?.preview;
+        if (!peer.subscriptions.has(session.id) || !preview)
+          throw new DomainError('approval_inactive', '此审批已结束或当前连接未订阅该会话。');
+        const end = Math.min(preview.input.length, command.offset + APPROVAL_PAGE_CHARS);
+        send(peer, {
+          type: 'approval.detail',
+          requestId: command.requestId,
+          input: preview.input.slice(command.offset, end),
+          ...(end < preview.input.length && { next: end }),
+          ...(command.offset === 0 && { title: preview.title, description: preview.description }),
+        });
+        return session.id;
+      }
+      case 'session.acceptHistory':
+        if (
+          options.claude &&
+          session.device?.id !== serverDevice.id &&
+          !session.projectPath.startsWith('project:')
+        )
+          throw new DomainError(
+            'project_binding',
+            '请先在项目所在电脑上重新选择目录，再继续旧会话。',
+          );
+        store.acceptHistory(session.id);
+        updated(session.id);
+        return session.id;
       case 'terminal.close':
         await closeTerminal(peer, command);
         return command.sessionId;
@@ -2065,96 +2112,14 @@ export function createProxyServer(options: ServerOptions) {
       historyId: store.historyId,
     });
     send(peer, devices());
-    // Every connection that asks has an execution channel of its own, to the computer it comes from.
-    if (auth.data.tunnel && options.tunnel) {
-      peer.tunnel = new Tunnel(
-        options.tunnel,
-        store.directory,
-        peer.id,
-        (channelId) => {
-          if (peer.socket.readyState !== WebSocket.OPEN) return false;
-          send(peer, { type: 'tunnel.open', connectionId: peer.id, channelId });
-          return true;
-        },
-        () => peer.socket.close(4003, 'Tunnel closed'),
-      );
-      track(
-        peer.tunnel
-          .start()
-          .then((offer) => send(peer, offer))
-          .catch(() => {
-            send(peer, {
-              type: 'connection.error',
-              code: 'tunnel_failed',
-              message:
-                '服务端没能准备好执行通道。\n请查看服务日志；数据目录不可写或服务器资源耗尽时会出现这种情况。',
-            });
-            peer.socket.close(4003, 'Tunnel failed');
-          }),
-        tunnelTasks,
-      );
-    }
     return true;
-  }
-  // A connection whose first frame attaches it to a device's tunnel carries one SSH connection and nothing
-  // else: it is no peer, receives no message and sends none. Only a wrong secret for a live tunnel counts
-  // against the address; a channel arriving after its tunnel ended is an ordinary race of disconnecting.
-  function attachChannel(peer: Peer, value: unknown) {
-    const attach = tunnelAttachSchema.safeParse(value);
-    const tunnel = attach.success
-      ? [...peers].find((owner) => owner.authenticated && owner.id === attach.data.connectionId)
-          ?.tunnel
-      : undefined;
-    if (!attach.success || !tunnel) {
-      peer.socket.close(TUNNEL_CLOSE.unknown, 'Unknown tunnel');
-      return false;
-    }
-    if (!tunnel.matches(attach.data.secret)) {
-      refuse(peer.address, 'tunnel secret');
-      peer.socket.close(TUNNEL_CLOSE.refused, 'Unauthorized');
-      return false;
-    }
-    peers.delete(peer);
-    peer.socket.removeAllListeners('message');
-    if (!tunnel.attach(attach.data.channelId, peer.socket)) {
-      peer.socket.close(TUNNEL_CLOSE.unknown, 'Unknown channel');
-      return false;
-    }
-    return true;
-  }
-  function registerTunnel(peer: Peer, credentials: TunnelCredentials) {
-    if (!peer.tunnel || peer.registering || credentials.connectionId !== peer.id) {
-      peer.socket.close(4002, 'Inactive tunnel registration');
-      return;
-    }
-    peer.registering = true;
-    track(
-      peer.tunnel
-        .accept(credentials, peer.device?.platform)
-        .then(() => {
-          if (peer.device) store.equip(peer.device.id, peer.tunnel!.shells);
-        })
-        .then(() => adopt(peer))
-        .then(() => {
-          send(peer, { type: 'tunnel.ready', connectionId: peer.id });
-        })
-        .catch(() => {
-          send(peer, {
-            type: 'connection.error',
-            code: 'ssh_failed',
-            message:
-              platformOf(peer.device) === 'win32'
-                ? '服务端经隧道连不上本机的 SSH 服务。\n隧道已经建立，但探测命令没有得到应答：常见于安全软件拦截了内置的 sshd.exe 或 PowerShell，请检查保护记录后重新连接。'
-                : '服务端经隧道连不上本机的 SSH 服务。\n隧道已经建立，但探测命令没有得到应答：请重新连接；反复出现时在“设置 → 关于与更新”里打开连接日志查看原因。',
-          });
-          peer.socket.close(4003, 'SSH probe failed');
-        }),
-      tunnelTasks,
-    );
   }
   // Keystrokes, resizes and flow-control acknowledgments carry no request ID and get no response.
   function controlTerminal(peer: Peer, control: TerminalControl) {
-    const current = terminals.get(control.sessionId);
+    const current =
+      login?.sessionId === control.sessionId && login.id === control.terminalId
+        ? login
+        : terminals.get(control.sessionId);
     if (!current || current.owner !== peer || current.id !== control.terminalId) {
       send(peer, {
         type: 'connection.error',
@@ -2166,7 +2131,7 @@ export function createProxyServer(options: ServerOptions) {
     try {
       if (control.type === 'terminal.input') {
         current.process?.write(control.data);
-        interruptingTerminal(current, control.data);
+        if ('continued' in current) interruptingTerminal(current, control.data);
       } else if (control.type === 'terminal.resize')
         current.process?.resize(control.cols, control.rows);
       else current.process?.acknowledge(control.bytes);
@@ -2223,25 +2188,11 @@ export function createProxyServer(options: ServerOptions) {
     if (!seat) {
       seat = { device, peers: new Set() };
       seats.set(device, seat);
-      if (options.tunnel) {
-        seat.door = new Door(options.tunnel, store.directory, device);
-        seat.opening = seat.door.start();
-        seat.opening.catch(() => {});
-      }
     }
     clearTimeout(seat.away);
     seat.away = undefined;
     seat.peers.add(peer);
     return seat;
-  }
-  // The device's commands go through this connection's tunnel from now on: the newest that is ready.
-  async function adopt(peer: Peer) {
-    if (!peer.device || !peer.tunnel?.ssh) return;
-    const seat = seats.get(peer.device.id);
-    if (!seat?.door) return;
-    await seat.opening;
-    if (peers.has(peer) && seat.peers.has(peer)) seat.door.use(peer.tunnel);
-    announce();
   }
   // Nothing more is kept for a computer: its runs end and its door closes.
   function vacate(seat: Seat, reason: string) {
@@ -2254,10 +2205,9 @@ export function createProxyServer(options: ServerOptions) {
         const task = terminal.process?.close();
         if (task) track(task);
       }
-    if (seat.door) track(seat.door.close(), tunnelTasks);
     announce();
   }
-  // What belongs to the connection itself ends with it: its terminal, a sign-in it began, its tunnel. The runs
+  // What belongs to the connection itself ends with it: its terminal, a sign-in it began. The runs
   // of its computer go on. If no other connection of that computer is here they are given `graceMs` for one
   // to come back, unless the client said it was leaving; nothing is replayed for a later connection either way.
   function release(peer: Peer) {
@@ -2268,7 +2218,7 @@ export function createProxyServer(options: ServerOptions) {
       read.delivery.cancel();
     }
     peer.reads = {};
-    if (login?.owner === peer) login.process.cancel();
+    if (login?.owner === peer) track(login.process.close());
     for (const terminal of terminals.values())
       if (terminal.owner !== peer) continue;
       // A client that said it is leaving closed its window: the terminal ends, as a local CLI's would.
@@ -2279,8 +2229,6 @@ export function createProxyServer(options: ServerOptions) {
       }
     const seat = peer.device && seats.get(peer.device.id);
     if (seat?.peers.delete(peer)) {
-      if (seat.door?.uses(peer.tunnel))
-        seat.door.use([...seat.peers].findLast((other) => other.tunnel?.ssh)?.tunnel);
       if (!seat.peers.size) {
         const waiting =
           [...runs.values()].some((run) => run.device === seat.device) ||
@@ -2300,7 +2248,6 @@ export function createProxyServer(options: ServerOptions) {
           );
       }
     }
-    if (peer.tunnel) track(peer.tunnel.close(), tunnelTasks);
     announce();
   }
 
@@ -2321,8 +2268,8 @@ export function createProxyServer(options: ServerOptions) {
         origin: context?.origin,
         proxied: context?.proxied,
         name: '',
-        registering: false,
         left: false,
+        commandGrants: new Map(),
         subscriptions: new Set(),
         responses: new Map(),
       };
@@ -2375,9 +2322,7 @@ export function createProxyServer(options: ServerOptions) {
           // Only the first frame signs in. What a refused client sent after it is not another attempt.
           if (greeted) return;
           greeted = true;
-          const channel =
-            !peer.browser && (value as { type?: unknown } | null)?.type === 'tunnel.attach';
-          if (channel ? attachChannel(peer, value) : authenticate(peer, value)) {
+          if (authenticate(peer, value)) {
             clearTimeout(authTimer);
             signedIn = true;
             gate.leave(address);
@@ -2398,23 +2343,51 @@ export function createProxyServer(options: ServerOptions) {
             type === 'device' ||
             type === 'auth' ||
             type === 'web.auth' ||
+            type === 'project.commands' ||
             (typeof type === 'string' && type.startsWith('tunnel.'))
           ) {
             socket.close(4003, 'Browser execution frames are not allowed');
             return;
           }
         }
-        const credentials = tunnelCredentialsSchema.safeParse(value);
-        if (credentials.success) {
-          registerTunnel(peer, credentials.data);
+        const grant = projectCommands.safeParse(value);
+        if (grant.success) {
+          if (!peer.browser && peer.files && peer.device) {
+            const { sessionId, project, enabled } = grant.data;
+            if (enabled) {
+              try {
+                const { session } = store.get(sessionId);
+                if (session.device?.id !== peer.device.id || session.projectPath !== project)
+                  return;
+              } catch (error) {
+                if (error instanceof DomainError && error.code === 'not_found') return;
+                throw error;
+              }
+              peer.commandGrants.set(sessionId, project);
+            } else if (peer.commandGrants.get(sessionId) === project)
+              peer.commandGrants.delete(sessionId);
+            for (const sync of projectViews) sync();
+          }
+          return;
+        }
+        const fileResult = projectReply.safeParse(value);
+        if (fileResult.success) {
+          const reply = fileResult.data;
+          const waiting = pendingFiles.get(reply.requestId);
+          if (!peer.browser && waiting?.peer === peer && waiting.sessionId === reply.sessionId)
+            waiting.settle(!reply.error, reply.text);
           return;
         }
         const identity = deviceIdentitySchema.safeParse(value);
         if (identity.success) {
-          if (identity.data.id === serverDevice.id) {
+          if (
+            identity.data.id === serverDevice.id ||
+            (peer.device && peer.device.id !== identity.data.id)
+          ) {
             socket.close(4003, 'Reserved device');
             return;
           }
+          peer.files = identity.data.files;
           peer.device = {
             id: identity.data.id,
             name: peer.name,
@@ -2425,11 +2398,11 @@ export function createProxyServer(options: ServerOptions) {
             console.log(
               `Connection ${peer.id.slice(0, 8)} opened: device "${peer.name}" (${identity.data.id.slice(0, 8)}) from ${address}`,
             );
+          if (identity.data.shells) store.equip(peer.device.id, identity.data.shells);
           for (const session of store.named(peer.device))
             broadcast({ type: 'session.updated', session });
           enter(peer);
           announce();
-          track(adopt(peer), tunnelTasks);
           return;
         }
         if (leaveSchema.safeParse(value).success) {
@@ -2484,6 +2457,8 @@ export function createProxyServer(options: ServerOptions) {
         dispatch(peer, command.data);
       });
       socket.on('close', (code) => {
+        for (const call of pendingFiles.values())
+          if (call.peer === peer) call.settle(false, '设备连接中断，操作结果未知。');
         clearTimeout(authTimer);
         clearInterval(heartbeat);
         if (!signedIn) gate.leave(address);
@@ -2523,22 +2498,16 @@ export function createProxyServer(options: ServerOptions) {
       closing = true;
       web.close();
       updates?.stop();
-      login?.process.cancel();
-      const terminalCleanup = Promise.all(
-        [...terminals.values()].map((terminal) => terminal.process?.close()),
-      );
+      const terminalCleanup = Promise.all([
+        login?.process.close(),
+        ...[...terminals.values()].map((terminal) => terminal.process?.close()),
+      ]);
       for (const run of runs.values()) cancel(run, '服务停止，运行未重放。');
       for (const seat of seats.values()) clearTimeout(seat.away);
       compactions.clear();
-      const cleanup = [
-        ...[...peers].map((peer) => peer.tunnel?.close()),
-        ...[...seats.values()].map((seat) => seat.door?.close()),
-      ];
       for (const peer of peers) peer.socket.terminate();
       await Promise.all([...tasks]);
       await terminalCleanup;
-      await Promise.all([...tunnelTasks]);
-      await Promise.all(cleanup);
       await usageReceiver?.close();
       await new Promise<void>((resolve) => wss.close(() => resolve()));
       await new Promise<void>((resolve, reject) =>

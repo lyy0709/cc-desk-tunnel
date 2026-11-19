@@ -19,7 +19,6 @@ type UsageReading = Awaited<
 >;
 type Windows = NonNullable<Metrics['rateLimits']>['windows'];
 export type ObservedQuota = { windows: Windows; measuredAt: string };
-type UnifiedWindow = { utilization?: number; resetsAt?: number };
 
 // Who the CLI is signed in as. A reading seen under one login says nothing about another.
 export function loginOf(account: NativeCapabilities['account']) {
@@ -34,33 +33,31 @@ export function loginOf(account: NativeCapabilities['account']) {
   ]);
 }
 
-// The CLI's replies carry all known windows in `unifiedWindows` (an unpublished SDK field). Older events name
-// only one window through the public fields. Utilization is a fraction and resets are Unix seconds.
+// A public SDK rate-limit event describes the named window. Other windows are read through the SDK usage query.
 export function observedQuota(
   event: SDKRateLimitEvent,
   previous: ObservedQuota | null,
   now = Date.now(),
 ): ObservedQuota | null {
-  const info = event.rate_limit_info as SDKRateLimitEvent['rate_limit_info'] & {
-    unifiedWindows?: Record<string, UnifiedWindow | undefined>;
-  };
-  const named: [string, UnifiedWindow | undefined][] = info.unifiedWindows
-    ? Object.entries(info.unifiedWindows)
-    : info.rateLimitType && info.rateLimitType !== 'overage'
-      ? [[info.rateLimitType, info]]
-      : [];
-  const windows = named.flatMap(([name, window]) =>
-    window && Number.isFinite(window.utilization)
-      ? [
-          {
-            name,
-            utilization: Math.max(0, window.utilization! * 100),
-            resetsAt: window.resetsAt ? new Date(window.resetsAt * 1000).toISOString() : null,
-          },
-        ]
-      : [],
+  const { rateLimitType, utilization, resetsAt } = event.rate_limit_info;
+  if (
+    !rateLimitType ||
+    rateLimitType === 'overage' ||
+    utilization === undefined ||
+    !Number.isFinite(utilization)
+  )
+    return null;
+  return merged(
+    [
+      {
+        name: rateLimitType,
+        utilization: Math.max(0, utilization * 100),
+        resetsAt: resetsAt ? new Date(resetsAt * 1000).toISOString() : null,
+      },
+    ],
+    previous,
+    now,
   );
-  return merged(windows, previous, now);
 }
 
 // A window a reading leaves out keeps its last reading until it resets (see `unexpired`).
@@ -70,28 +67,6 @@ function merged(windows: Windows, previous: ObservedQuota | null, now: number) {
     (window) => !windows.some((row) => row.name === window.name),
   );
   return { windows: [...kept, ...windows], measuredAt: new Date(now).toISOString() };
-}
-
-// The quota the CLI hands its status line (`rate_limits`, CLI 2.1.293), from the same replies as `rate_limit_event`:
-// the session and weekly windows, in percent, with resets in Unix seconds; one without a reset could not be told from
-// one that has passed (see `unexpired`). A terminal has no message stream to carry the event, so this is how its
-// replies' quota is heard (see `terminalSettings`).
-export function statusLineQuota(status: unknown): Windows {
-  const limits = (status as { rate_limits?: Record<string, unknown> } | null)?.rate_limits;
-  return ['five_hour', 'seven_day'].flatMap((name) => {
-    const window = limits?.[name] as { used_percentage?: unknown; resets_at?: unknown } | undefined;
-    return typeof window?.used_percentage === 'number' &&
-      Number.isFinite(window.used_percentage) &&
-      typeof window.resets_at === 'number'
-      ? [
-          {
-            name,
-            utilization: Math.max(0, window.used_percentage),
-            resetsAt: new Date(window.resets_at * 1000).toISOString(),
-          },
-        ]
-      : [];
-  });
 }
 
 // The quota last seen in the message stream, kept by the login it came under (see `loginOf`). A project whose
@@ -107,22 +82,13 @@ export class ObservedQuotas {
     return windows.length ? { ...held.reading, windows } : null;
   }
   observe(login: string, event: SDKRateLimitEvent, now = Date.now()) {
-    const reading = observedQuota(event, null, now);
-    if (reading) this.observeWindows(login, reading.windows, now);
-  }
-  observeWindows(login: string, windows: Windows, now = Date.now()) {
-    const reading = merged(windows, this.of(login), now);
-    if (reading) {
+    const reading = observedQuota(event, this.of(login), now);
+    const name = event.rate_limit_info.rateLimitType;
+    if (reading && name) {
       const times = new Map(this.readings.get(login)?.times);
-      for (const window of windows) times.set(window.name, now);
+      times.set(name, now);
       this.readings.set(login, { reading, times });
     }
-  }
-  // What was heard before the login was known becomes that login's, unless it has its own.
-  adopt(from: string, to: string) {
-    const reading = this.readings.get(from);
-    this.readings.delete(from);
-    if (reading && !this.readings.has(to)) this.readings.set(to, reading);
   }
 }
 
@@ -170,23 +136,15 @@ export class Quotas {
     string,
     { at: number; rateLimits: Metrics['rateLimits']; pending?: Promise<unknown> }
   >();
-  private login?: string;
   constructor(interval = 60_000) {
     this.interval = interval;
   }
-  // Setup tokens need not expose an account identity, so replacing one can keep the same login key.
   clear() {
     this.observed = new ObservedQuotas();
     this.limits.clear();
     this.reads.clear();
-    this.login = undefined;
-  }
-  identify(login: string) {
-    if (this.login === undefined) this.observed.adopt('', login);
-    this.login = login;
   }
   observe(login: string, event: SDKRateLimitEvent, now = Date.now()) {
-    this.identify(login);
     this.limits.set(login, event.rate_limit_info);
     this.observed.observe(login, event, now);
   }
@@ -217,18 +175,11 @@ export class Quotas {
       }
     return until;
   }
-  // The windows a terminal's status line showed (see `statusLineQuota`), and the quota as it now stands.
-  observeTerminal(windows: Windows, now = Date.now()) {
-    const login = this.login ?? '';
-    this.observed.observeWindows(login, windows, now);
-    return this.of(login, now);
-  }
   async through(
     login: string,
     query: Query,
     { asked = false, timeoutMs = 5000, now = Date.now() } = {},
   ): Promise<QuotaAnswer> {
-    this.identify(login);
     const held = this.reads.get(login);
     if (held?.pending) await held.pending;
     else if (asked || (this.wanted() && (!held || now - held.at >= this.interval))) {
@@ -363,7 +314,7 @@ function lifetimes(values: NonNullable<SDKResultMessage['modelUsage']>[string][]
   };
 }
 
-async function optionalStatus<T>(
+export async function optionalStatus<T>(
   read: () => Promise<T>,
   timeoutMs: number,
 ): Promise<{ value: T | null; error?: string }> {

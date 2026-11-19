@@ -87,7 +87,7 @@ export const sections: {
     name: '连接',
     group: '本机',
     icon: Cable,
-    words: '记住凭据 自动登录 多开 多个连接 登录过的服务 备注名 窗口 服务端 等待 超时 SSH 执行通道',
+    words: '记住凭据 自动登录 多开 多个连接 登录过的服务 备注名 窗口 服务端 等待 超时 WSS 项目工具',
   },
   {
     id: 'notifications',

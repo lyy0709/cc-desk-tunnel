@@ -12,8 +12,6 @@ import {
   snapshotSchema,
   sessionSchema,
 } from '@cc-desk-tunnel/protocol';
-import { deviceTerms, systemShell } from './device-terms.ts';
-import type { Execution } from './device-terms.ts';
 import { DomainError } from './errors.ts';
 import type {
   Device,
@@ -456,6 +454,7 @@ export class SessionStore {
       projectPath,
       device,
       nativeRoot: this.rootFor(device, projectPath),
+      projectAccess: 1,
       permissionMode: 'auto',
       model: null,
       effort: null,
@@ -896,8 +895,11 @@ export class SessionStore {
     this.save(session);
     return session;
   }
-  // Points the session at a project directory on a computer, which may be another one than it was on. What
-  // Claude knows of either changes with the next message: `notice`.
+  acceptHistory(sessionId: string) {
+    const { session } = this.get(sessionId);
+    session.projectAccess = 1;
+    this.save(session);
+  }
   move(sessionId: string, projectPath: string, device: Device) {
     const { session } = this.get(sessionId);
     if (session.activeRun) throw new DomainError('run_active', '请先结束当前运行再更换项目。');
@@ -945,10 +947,6 @@ export class SessionStore {
     const { session } = this.get(sessionId);
     if (session.device) return session;
     session.device = device;
-    if (session.prompt) {
-      session.prompt.device ??= device.id;
-      if (session.prompt.told) session.prompt.told.device ??= device.id;
-    }
     this.save(session);
     return session;
   }
@@ -963,16 +961,17 @@ export class SessionStore {
       }
     return changed;
   }
-  // How Claude's commands run on a computer: the shells its SSH service last said it has, and the one of them the
-  // user prefers, if any. A computer not heard from since has the one its system always has.
-  execution(deviceId: string | undefined, platform: DevicePlatform): Execution {
+  // The shells reported by the device and the user's preferred shell for an authorized MCP command.
+  execution(deviceId: string | undefined, platform: DevicePlatform) {
     const row = deviceId
       ? this.database
           .prepare('SELECT shells, preferred FROM device_shells WHERE device_id = ?')
           .get(deviceId)
       : undefined;
     const said: DeviceShell[] = row ? JSON.parse(String(row.shells)) : [];
-    const shells = said.length ? said : [systemShell(platform)];
+    const shells: DeviceShell[] = said.length
+      ? said
+      : [platform === 'win32' ? 'pwsh' : platform === 'darwin' ? 'zsh' : 'bash'];
     const shell = row?.preferred as DeviceShell | null | undefined;
     return { platform, shells, ...(shell && shells.includes(shell) ? { shell } : {}) };
   }
@@ -989,93 +988,6 @@ export class SessionStore {
         "INSERT INTO device_shells VALUES (?, '[]', ?) ON CONFLICT(device_id) DO UPDATE SET preferred = excluded.preferred",
       )
       .run(deviceId, shell);
-  }
-  // A prompt from before shells were named in it names, from its first run on, those its computer has then.
-  private nameShells(session: Session) {
-    const said = session.prompt;
-    if (!said || said.shells) return;
-    const { shells, shell } = this.execution(said.device, said.platform ?? 'win32');
-    said.shells = shells;
-    if (shell) said.shell = shell;
-    this.save(session);
-  }
-  // The text that tells Claude what its system prompt no longer has right, to go in front of the user's next
-  // message: a project directory or a computer other than the one it knows, from the prompt or from an earlier
-  // notice, or other shells, or another one the user prefers. It is given out once.
-  notice(sessionId: string) {
-    const { session } = this.get(sessionId);
-    const said = session.prompt;
-    if (!said || said.compacted) return '';
-    this.nameShells(session);
-    const known = said.told ?? said;
-    const device = session.device?.id;
-    const platform = platformOf(session.device);
-    const execution = this.execution(device, platform);
-    // A notice from before shells were named in one is told again.
-    const sameShells = !!known.shells && known.shells.join() === execution.shells.join();
-    const samePreference = sameShells && known.shell === execution.shell;
-    if (known.projectPath === session.projectPath && known.device === device && samePreference)
-      return '';
-    said.told = {
-      projectPath: session.projectPath,
-      device,
-      platform,
-      shells: execution.shells,
-      ...(execution.shell ? { shell: execution.shell } : {}),
-    };
-    this.save(session);
-    const terms = deviceTerms(execution, session.projectPath);
-    // The prompt's account of scripts and command lines holds for one system, its shells and the one preferred.
-    const scripts =
-      (known.platform ?? 'win32') === platform && samePreference
-        ? ''
-        : ` This replaces what was said of scripts and command lines: ${terms.script} ${terms.command}`;
-    const paths = `The project directory is now ${JSON.stringify(session.projectPath)} (it was ${JSON.stringify(known.projectPath)}).`;
-    if (known.device !== device)
-      return `[CC Desk Tunnel: the user now continues this session from another of their computers, ${JSON.stringify(session.device!.name)}. From now on the device is that computer: ${terms.name}. ${paths} What the earlier computer had, its files, paths and running processes, is not on this one unless you find it there.${scripts}]\n\n`;
-    if (known.projectPath !== session.projectPath)
-      return `[CC Desk Tunnel: the user moved this session to another project on the device. ${paths} From now on use the new directory as the project directory, in place of the one given earlier.${scripts}]\n\n`;
-    const change = !sameShells
-      ? 'the shells the device runs scripts in changed.'
-      : execution.shell
-        ? `the user now prefers ${execution.shell === 'bash' ? 'Git Bash' : 'PowerShell'} for scripts on the device.`
-        : 'the user no longer prefers a shell for scripts on the device.';
-    return `[CC Desk Tunnel: ${change}${scripts}]\n\n`;
-  }
-  // What the system prompt of a run says. A prompt that changes costs the whole conversation's prompt cache,
-  // so it stays what it first was — through moves and other shells, which `notice` tells Claude of — until a
-  // compaction, which rewrites everything after the prompt anyway; the run after that says what is current.
-  promptValues(sessionId: string): { projectPath: string; execution: Execution } {
-    const { session } = this.get(sessionId);
-    const said = session.prompt;
-    if (said && !said.compacted) {
-      this.nameShells(session);
-      return {
-        projectPath: said.projectPath,
-        execution: {
-          platform: said.platform ?? 'win32',
-          shells: said.shells!,
-          ...(said.shell ? { shell: said.shell } : {}),
-        },
-      };
-    }
-    const platform = platformOf(session.device);
-    const execution = this.execution(session.device?.id, platform);
-    session.prompt = {
-      projectPath: session.projectPath,
-      device: session.device?.id,
-      platform,
-      shells: execution.shells,
-      ...(execution.shell ? { shell: execution.shell } : {}),
-    };
-    this.save(session);
-    return { projectPath: session.projectPath, execution };
-  }
-  compacted(sessionId: string) {
-    const { session } = this.get(sessionId);
-    if (!session.prompt || session.prompt.compacted) return;
-    session.prompt.compacted = true;
-    this.save(session);
   }
   rename(sessionId: string, title: string) {
     const { session } = this.get(sessionId);

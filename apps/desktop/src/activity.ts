@@ -34,6 +34,7 @@ const outcomes: Partial<Record<Tool['state'], string>> = {
   cancelled: '已取消',
   failed: '失败',
   unknown: '结果未知',
+  deferred: '已延后',
 };
 
 function fields(input: string): Record<string, unknown> {
@@ -81,7 +82,7 @@ export function describe(tool: Tool, active: boolean) {
     command,
     description,
     verb: outcomes[tool.state] ?? words[category][running ? 0 : 1],
-    subject,
+    subject: subject || (tool.privateInput ? tool.name : ''),
     added,
     removed,
     running,
@@ -109,8 +110,14 @@ export function summarize(work: Work, active: boolean, latest: boolean) {
   else if (!tools.length) label = active && latest ? '正在思考' : '思考';
   else {
     const counts = new Map<Category, number>();
-    for (const tool of tools) counts.set(categoryOf(tool), (counts.get(categoryOf(tool)) ?? 0) + 1);
-    label = [...counts].map(([category, count]) => words[category][3](count)).join('，');
+    let deferred = 0;
+    for (const tool of tools) {
+      if (tool.state === 'deferred') deferred++;
+      else counts.set(categoryOf(tool), (counts.get(categoryOf(tool)) ?? 0) + 1);
+    }
+    const done = [...counts].map(([category, count]) => words[category][3](count));
+    if (deferred) done.push(`${deferred} 项工具调用已延后`);
+    label = done.join('，');
     const failed = tools.filter((tool) => ['failed', 'unknown'].includes(tool.state)).length;
     if (failed) label += `，${failed} 项未成功`;
   }

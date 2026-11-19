@@ -10,6 +10,7 @@ import type { SDKMessage, SDKResultMessage } from '@anthropic-ai/claude-agent-sd
 import type { EventPayload } from '@cc-desk-tunnel/protocol';
 import { messageText } from '@cc-desk-tunnel/protocol';
 import { NativeInput } from '../src/native-input.ts';
+import { runtimeEnvironment } from '../src/native-account.ts';
 
 test(
   'native runs declare only scheduled tasks, while user additions and compact keep their original inputs',
@@ -30,7 +31,7 @@ test(
     }[] = [];
     (globalThis as any).__ccdtInputFixture = captured;
     const stub = `
-    export async function getSessionInfo() { return undefined; }
+    export async function getSessionInfo() { return globalThis.__ccdtSavedSession; }
     export function query({prompt, options}) {
       if (globalThis.__ccdtNativeDriver) return globalThis.__ccdtNativeDriver({prompt, options});
       const captured = {env: options.env, messages: []};
@@ -62,11 +63,12 @@ test(
       hooks.deregister();
       delete (globalThis as any).__ccdtInputFixture;
       delete (globalThis as any).__ccdtNativeDriver;
+      delete (globalThis as any).__ccdtSavedSession;
       if (original === undefined) delete process.env.CLAUDE_CONFIG_DIR;
       else process.env.CLAUDE_CONFIG_DIR = original;
       rmSync(directory, { recursive: true, force: true });
     });
-    const { runClaude } = await import('../src/claude.ts');
+    const { runClaude, readNativeStatus } = await import('../src/claude.ts');
     for (const [scheduled, priority] of [
       [undefined, undefined],
       [undefined, 'next'],
@@ -83,8 +85,6 @@ test(
         {
           sessionId,
           nativeRoot: sessionId,
-          projectPath: '/fixture',
-          execution: { platform: 'linux', shells: ['bash'], shell: 'bash' },
           permissionMode: 'auto',
           input,
           scheduled,
@@ -101,6 +101,7 @@ test(
       assert.equal(outcome, 'completed');
       const current = captured.at(-1)!;
       assert.equal(current.env.CLAUDE_CODE_HOST_SCHEDULED_RUN, scheduled ? '1' : undefined);
+      assert.equal(current.env.CLAUDE_CODE_DISABLE_DEFERRED_TOOL_RESUME, undefined);
       assert.deepEqual(
         current.messages[0].origin,
         scheduled
@@ -118,6 +119,35 @@ test(
       assert.equal(current.messages[0].isSynthetic, undefined);
       assert.equal(current.messages[0].client_composed, undefined);
     }
+    await t.test(
+      'status reads suppress deferred tools only when reopening a saved session',
+      async () => {
+        const sessionId = randomUUID();
+        for (const [saved, resume] of [
+          [false, true],
+          [true, false],
+          [true, true],
+        ]) {
+          (globalThis as any).__ccdtSavedSession = saved && { sessionId };
+          const driver = controlledQuery();
+          await readNativeStatus(
+            { executable: '/does-not-exist/claude' },
+            directory,
+            sessionId,
+            sessionId,
+            new AbortController().signal,
+            { resume },
+          );
+          assert.equal(driver.options.resume, saved && resume ? sessionId : undefined);
+          assert.equal(
+            runtimeEnvironment(runtimeEnvironment(driver.options.env))
+              .CLAUDE_CODE_DISABLE_DEFERRED_TOOL_RESUME,
+            saved && resume ? '1' : undefined,
+          );
+        }
+        delete (globalThis as any).__ccdtSavedSession;
+      },
+    );
     for (const lateReply of [false, true])
       await t.test(
         lateReply
@@ -136,8 +166,6 @@ test(
             {
               sessionId,
               nativeRoot: sessionId,
-              projectPath: '/fixture',
-              execution: { platform: 'linux', shells: ['bash'], shell: 'bash' },
               permissionMode: 'auto',
               input,
               dataDir: directory,
@@ -226,8 +254,6 @@ test(
           {
             sessionId,
             nativeRoot: sessionId,
-            projectPath: '/fixture',
-            execution: { platform: 'linux', shells: ['bash'], shell: 'bash' },
             permissionMode: 'auto',
             input,
             dataDir: directory,
@@ -281,15 +307,18 @@ test(
           {
             sessionId,
             nativeRoot: sessionId,
-            projectPath: '/fixture',
-            execution: { platform: 'linux', shells: ['bash'], shell: 'bash' },
             permissionMode: 'plan',
             input,
             dataDir: directory,
             resume: false,
             signal: new AbortController().signal,
             emit: (event) => events.push(event),
-            approve: (_tool, _waiting, _name, signal) => {
+            approve: (_tool, _waiting, _name, signal, preview) => {
+              assert.deepEqual(preview, {
+                input: JSON.stringify({ plan: 'fixture' }, null, 2),
+                title: '读取计划',
+                description: '原生说明',
+              });
               receivedSignal = signal;
               return new Promise((resolve) => {
                 answer = resolve;
@@ -305,7 +334,12 @@ test(
         const pending = driver.options.canUseTool(
           'ExitPlanMode',
           { plan: 'fixture' },
-          { toolUseID: 'plan', signal: permission.signal },
+          {
+            toolUseID: 'plan',
+            signal: permission.signal,
+            title: '读取计划',
+            description: '原生说明',
+          },
         );
         permission.abort();
         assert.equal(receivedSignal?.aborted, true);

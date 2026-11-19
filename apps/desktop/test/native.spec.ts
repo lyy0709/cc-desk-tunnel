@@ -70,10 +70,10 @@ async function expandActivity(page: Page) {
       await page.locator(`${selector}:not([open]) > summary`).first().click();
 }
 
-test('official subscription: account metrics, Windows execution, running input, native compact, stop and resume', async () => {
+test('configured provider: account metrics, Windows execution, running input, native compact, stop and resume', async () => {
   test.skip(
     !process.env.NATIVE_TEST_CONFIG,
-    'Explicit opt-in: official subscription and real Windows SSH execution.',
+    'Explicit opt-in: a configured provider and a bound Windows test project.',
   );
   test.setTimeout(360000);
   mkdirSync(project, { recursive: true });
@@ -114,13 +114,23 @@ test('official subscription: account metrics, Windows execution, running input, 
     await settled(page);
     const marker = `PRO-STREAM-${Date.now()}`;
     await rename(page, marker);
+    await app.evaluate(({ dialog }, folder) => {
+      const original = dialog.showMessageBox.bind(dialog);
+      dialog.showMessageBox = (...args: any[]) => {
+        const options = args.at(-1);
+        if (
+          options.message === '允许本会话运行本机命令？' &&
+          options.detail?.startsWith(folder + '\n')
+        )
+          return Promise.resolve({ response: 1, checkboxChecked: false });
+        return (original as (...args: any[]) => ReturnType<typeof original>)(...args);
+      };
+    }, project);
+    await page.getByRole('button', { name: '本会话命令权限' }).click();
 
     await page.getByRole('button', { name: '设置与账号', exact: true }).click();
     await page.getByRole('menuitem', { name: /^账号/ }).click();
-    const account = page.getByRole('region', { name: '账号信息' });
-    await expect(account.locator('.account-identity')).toContainText(/pro/i);
-    await expect(account.locator('.quota-row')).not.toHaveCount(0);
-    await expect(account.locator('.quota-row').first()).toContainText('重置');
+    await expect(page.locator('.account-identity')).toContainText('GUI 模型服务已登录');
     await page.screenshot({ path: resolve('.local/screenshots/subscription-account.png') });
     await page.getByRole('button', { name: '会话', exact: true }).click();
 
@@ -140,7 +150,7 @@ test('official subscription: account metrics, Windows execution, running input, 
     await permission(page, '手动审批');
     await send(
       page,
-      '仅调用一次 Bash，通过 SSH 在 Windows PowerShell 执行 Start-Sleep -Seconds 5，然后回复完成。不要读写任何文件。',
+      '仅调用一次项目 MCP 的 command 工具，用 Windows PowerShell 执行 Start-Sleep -Seconds 5，然后回复完成。不要读写任何文件。',
     );
     await expect(page.getByRole('button', { name: '允许', exact: true }).first()).toBeVisible({
       timeout: 45000,
@@ -153,8 +163,9 @@ test('official subscription: account metrics, Windows execution, running input, 
     await expect(page.locator('.message.user').last()).toContainText('原生已接收');
     await expect(page.locator('.message.assistant').last()).toContainText(`${marker}-MID`);
     await expandActivity(page);
-    await expect(page.locator('.tool-input').filter({ hasText: 'ssh' })).not.toHaveCount(0);
-    await expect(page.locator('.tool-heading').filter({ hasText: 'mcp__' })).toHaveCount(0);
+    await expect(
+      page.locator('.tool-heading').filter({ hasText: 'mcp__project__command' }).first(),
+    ).toBeVisible();
     await page.screenshot({ path: resolve('.local/screenshots/subscription-intervention.png') });
 
     await permission(page, '自动审批');
@@ -170,10 +181,10 @@ test('official subscription: account metrics, Windows execution, running input, 
 
     await permission(page, '手动审批');
     const file = `${marker}-denied.txt`;
-    await send(page, `仅通过一次 Bash / SSH 在 Windows 项目创建 ${file}。用户拒绝后不得重试。`);
+    await send(page, `仅调用一次项目 MCP 的 create 工具创建 ${file}。用户拒绝后不得重试。`);
     expect(await drive(page, '拒绝')).toBeGreaterThan(0);
     expect(existsSync(join(project, file))).toBe(false);
-    await send(page, `通过 Bash / SSH 在 Windows 项目创建 ${marker}-stop.txt。`);
+    await send(page, `调用项目 MCP 的 create 工具创建 ${marker}-stop.txt。`);
     await expect(page.getByRole('button', { name: '允许', exact: true }).first()).toBeVisible({
       timeout: 45000,
     });

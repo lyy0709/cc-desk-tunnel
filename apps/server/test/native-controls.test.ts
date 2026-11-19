@@ -8,7 +8,6 @@ import {
   observedQuota,
   ObservedQuotas,
   Quotas,
-  statusLineQuota,
   unexpired,
   resultUsage,
 } from '../src/native-controls.ts';
@@ -336,7 +335,7 @@ test('what the replies carry stands in where the quota is not read or does not a
   const now = Date.now();
   const later = Math.floor(now / 1000) + 3600;
   const event = (utilization: number, resetsAt = later) =>
-    rateLimitEvent({ status: 'allowed', unifiedWindows: { five_hour: { utilization, resetsAt } } });
+    rateLimitEvent({ status: 'allowed', rateLimitType: 'five_hour', utilization, resetsAt });
   // Not read: only what the replies carried, or nothing.
   const passive = new Quotas();
   passive.wanted = () => false;
@@ -579,7 +578,7 @@ test('context refresh leaves observation timestamps and per-model public windows
   );
 });
 
-test('normal replies carry full quota windows before the public warning fields are present', () => {
+test('undocumented fields do not create an SDK quota without a named public window', () => {
   assert.deepEqual(
     observedQuota(
       rateLimitEvent({
@@ -593,7 +592,7 @@ test('normal replies carry full quota windows before the public warning fields a
       null,
       0,
     ),
-    observedQuota(weekly, observedQuota(daily, null, 0), 0),
+    null,
   );
 });
 
@@ -790,51 +789,7 @@ test('observations expire and changing an account clears both windows and reject
   quotas.clear();
   assert.equal(quotas.of('a', 0), null);
   assert.equal(quotas.blockedUntil('a', null, 0), null);
-  quotas.observeTerminal(
-    [{ name: 'five_hour', utilization: 9, resetsAt: new Date(10000).toISOString() }],
-    0,
-  );
-  quotas.identify('b');
+  quotas.observe('b', daily, 0);
   assert.equal(quotas.of('a', 0), null);
-  assert.equal(quotas.of('b', 0)?.windows[0].utilization, 9);
-});
-
-test("a terminal's status line carries the session and weekly windows of its replies", () => {
-  assert.deepEqual(
-    statusLineQuota({
-      rate_limits: {
-        five_hour: { used_percentage: 23.5, resets_at: 1793325600 },
-        seven_day: { used_percentage: 41 },
-        spend_limit: { used_percentage: 90, resets_at: 1793325600 },
-      },
-    }),
-    [{ name: 'five_hour', utilization: 23.5, resetsAt: new Date(1793325600 * 1000).toISOString() }],
-  );
-  assert.deepEqual(statusLineQuota({ model: {} }), []);
-  assert.deepEqual(statusLineQuota(null), []);
-});
-
-test('what a terminal shows goes to the login last seen, or to the first one seen after it', async () => {
-  const now = Date.now();
-  const later = new Date(now + 3600_000).toISOString();
-  const window = (utilization: number) => [{ name: 'five_hour', utilization, resetsAt: later }];
-  // Heard before any run or read: it becomes the first login's.
-  const early = new Quotas();
-  assert.deepEqual(early.observeTerminal(window(5), now)?.windows, window(5));
-  early.identify('a');
-  assert.deepEqual(early.of('a', now)?.windows, window(5));
-  // Heard after: the login seen last, whose replies' windows it brings up to date.
-  const known = new Quotas();
-  known.observe(
-    'a',
-    rateLimitEvent({
-      status: 'allowed',
-      rateLimitType: 'five_hour',
-      utilization: 0.02,
-      resetsAt: Date.parse(later) / 1000,
-    }),
-    now - 1000,
-  );
-  known.observeTerminal(window(9), now);
-  assert.deepEqual(known.of('a', now)?.windows, window(9));
+  assert.equal(quotas.of('b', 0)?.windows[0].utilization, 2);
 });

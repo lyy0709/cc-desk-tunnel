@@ -2,9 +2,15 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { UsageLog, createUsageReceiver, telemetryEnvironment } from '../src/usage.ts';
+import { terminalEnvironment } from '../src/native-terminal.ts';
+import { subscriptionScope } from '../src/native-account.ts';
 
 const hour = 3600_000;
 const base = Date.parse('2026-10-06T00:00:00.000Z');
+const recordedRange = {
+  from: new Date(base - 48 * hour).toISOString(),
+  to: new Date(base + 48 * hour).toISOString(),
+};
 function record(at: number, values: Record<string, string | number>, name = 'api_request') {
   return {
     timeUnixNano: `${at}000000`,
@@ -61,7 +67,7 @@ test('collector keeps model requests only, once each, without account identity',
     database.prepare('PRAGMA table_info(api_requests)').all() as { name: string }[]
   ).map((column) => column.name);
   assert.ok(!columns.some((name) => /email|user|account|prompt(?!_id$)/.test(name)));
-  const page = log.query({ limit: 1, bucketMinutes: 60, offsetMinutes: 0 }, () => '标题');
+  const page = log.query({ limit: 1, range: recordedRange }, () => '标题');
   assert.equal(page.rows.length, 1);
   assert.equal(page.hasMore, true);
   assert.deepEqual(
@@ -86,15 +92,12 @@ test('collector keeps model requests only, once each, without account identity',
   assert.equal(page.totals.costUsd, 1);
   assert.equal(page.totals.outputPerSecond, 100);
   assert.equal(
-    log.query(
-      { limit: 1, beforeId: page.rows[0].id, bucketMinutes: 60, offsetMinutes: 0 },
-      () => null,
-    ).hasMore,
+    log.query({ limit: 1, beforeId: page.rows[0].id, range: recordedRange }, () => null).hasMore,
     false,
   );
 });
 
-test('filters, buckets in the viewer time zone, and retention limits', () => {
+test('filters, sparse UTC slices, and retention limits', () => {
   const log = new UsageLog(new DatabaseSync(':memory:'), 35, 3);
   log.ingest(
     batch(
@@ -107,51 +110,88 @@ test('filters, buckets in the viewer time zone, and retention limits', () => {
   const range = {
     from: new Date(base - 3 * hour).toISOString(),
     to: new Date(base + 3 * hour).toISOString(),
-    limit: 100,
-    offsetMinutes: 480,
   };
-  const daily = log.query({ ...range, bucketMinutes: 1440 }, () => null);
-  // 22:00, 01:00 and 02:00 UTC are all the same calendar day at UTC+8.
+  const page = log.query({ range, limit: 100 }, () => null);
   assert.deepEqual(
-    daily.series.map((item) => [item.at, item.requests]),
-    [['2026-10-05T16:00:00.000Z', 3]],
+    page.series.map((item) => [item.at, item.requests]),
+    [
+      ['2026-10-05T22:00:00.000Z', 1],
+      ['2026-10-06T01:00:00.000Z', 1],
+      ['2026-10-06T02:00:00.000Z', 1],
+    ],
   );
-  assert.deepEqual(daily.models, ['claude-haiku-4-5', 'claude-opus-5-5']);
-  const haiku = log.query({ ...range, bucketMinutes: 60, model: 'claude-haiku-4-5' }, () => null);
+  assert.deepEqual(page.models, ['claude-haiku-4-5', 'claude-opus-5-5']);
+  const haiku = log.query({ range, limit: 100, model: 'claude-haiku-4-5' }, () => null);
   assert.equal(haiku.totals.requests, 1);
   assert.equal(haiku.totals.outputPerSecond, null);
-  assert.deepEqual(haiku.models, daily.models);
+  assert.deepEqual(haiku.models, page.models);
   // The breakdown by model covers the range whatever the filter; each bucket splits its tokens by kind.
-  assert.deepEqual(daily.byModel.map((item) => [item.model, item.requests]).sort(), [
+  assert.deepEqual(page.byModel.map((item) => [item.model, item.requests]).sort(), [
     ['claude-haiku-4-5', 1],
     ['claude-opus-5-5', 2],
   ]);
-  assert.deepEqual(haiku.byModel, daily.byModel);
-  const [day] = daily.series;
+  assert.deepEqual(haiku.byModel, page.byModel);
+  const [day] = page.series;
   assert.equal(
     day.inputTokens + day.outputTokens + day.cacheReadTokens + day.cacheCreationTokens,
     day.tokens,
   );
   assert.ok(day.cacheReadTokens > 0);
   // Pages are counted from the newest record.
-  const first = log.query({ ...range, bucketMinutes: 60, limit: 2 }, () => null);
-  const second = log.query({ ...range, bucketMinutes: 60, limit: 2, offset: 2 }, () => null);
+  const first = log.query({ range, limit: 2 }, () => null);
+  const second = log.query({ range, limit: 2, offset: 2 }, () => null);
   assert.equal(first.hasMore, true);
   assert.equal(second.hasMore, false);
   assert.deepEqual(
     [...first.rows, ...second.rows].map((row) => row.id),
-    daily.rows.map((row) => row.id),
+    page.rows.map((row) => row.id),
   );
   assert.equal(second.totals.requests, 3);
   log.prune(base + 3 * hour);
-  assert.equal(
-    log.query({ limit: 100, bucketMinutes: 60, offsetMinutes: 0 }, () => null).totals.requests,
-    3,
-  );
+  assert.equal(log.query({ limit: 100, range: recordedRange }, () => null).totals.requests, 3);
   log.prune(base + 40 * 24 * hour);
-  assert.equal(
-    log.query({ limit: 100, bucketMinutes: 60, offsetMinutes: 0 }, () => null).totals.requests,
-    0,
+  assert.equal(log.query({ limit: 100, range: recordedRange }, () => null).totals.requests, 0);
+});
+
+test('the proxy clock sets the range and keeps the same UTC bounds across a DST change and pagination', (t) => {
+  const originalZone = process.env.TZ;
+  process.env.TZ = 'America/New_York';
+  t.after(() => {
+    if (originalZone === undefined) delete process.env.TZ;
+    else process.env.TZ = originalZone;
+  });
+  const log = new UsageLog(new DatabaseSync(':memory:'));
+  const now = Date.parse('2026-11-01T12:00:00Z');
+  const query = (range: Parameters<UsageLog['query']>[0]['range'], clock = now) =>
+    log.query({ range, limit: 50 }, () => null, clock);
+  log.ingest(
+    batch(
+      request(Date.parse('2026-11-01T03:59:59Z'), 'previous'),
+      request(Date.parse('2026-11-01T04:00:00Z'), 'midnight'),
+      request(now, 'after-snapshot'),
+    ),
+  );
+  const today = query('today');
+  assert.equal(today.timeZone, 'America/New_York');
+  assert.equal(today.from, '2026-11-01T04:00:00.000Z');
+  assert.equal(today.to, '2026-11-01T12:00:00.000Z');
+  assert.equal(today.totals.requests, 1);
+  assert.deepEqual(query({ from: today.from, to: today.to }, now + hour), today);
+  assert.equal(query({ from: today.from }, now + hour).totals.requests, 2);
+  for (const [preset, days] of [
+    ['24h', 1],
+    ['7d', 7],
+    ['30d', 30],
+  ] as const)
+    assert.equal(Date.parse(query(preset).from), now - days * 24 * hour);
+  assert.deepEqual(query({ serverFrom: '2026-11-01T00:00', serverTo: '2026-11-01T07:00' }), today);
+  assert.throws(
+    () => query({ serverFrom: '2026-03-08T02:30', serverTo: '2026-03-08T05:00' }),
+    /不存在/,
+  );
+  assert.throws(
+    () => query({ serverFrom: '2026-11-01T07:00', serverTo: '2026-11-01T00:00' }),
+    /结束时间/,
   );
 });
 
@@ -255,7 +295,9 @@ test('a period survives jitter and repeated readings, and a cut-short one is res
   const resetsAt = Date.now() + 2 * 24 * hour;
   old.exec("DELETE FROM migrations WHERE name = 'usage-window-start'");
   old
-    .prepare('INSERT INTO usage_windows VALUES (?, ?, ?, ?, ?)')
+    .prepare(
+      'INSERT INTO usage_windows(name,started_at,resets_at,utilization,observed_at) VALUES (?, ?, ?, ?, ?)',
+    )
     .run('seven_day', Date.now() - 60_000, resetsAt, 51, Date.now() - 1000);
   const records = old.prepare('SELECT * FROM api_requests ORDER BY id').all();
   const restored = new UsageLog(old).summary().windows[0];
@@ -280,13 +322,9 @@ test('period recovery preserves an early reset recorded in the original quota ev
   db.exec(
     "DELETE FROM migrations WHERE name = 'usage-window-start'; CREATE TABLE events (data TEXT NOT NULL)",
   );
-  db.prepare('INSERT INTO usage_windows VALUES (?, ?, ?, ?, ?)').run(
-    'seven_day',
-    now - 60000,
-    end,
-    20,
-    now,
-  );
+  db.prepare(
+    'INSERT INTO usage_windows(name,started_at,resets_at,utilization,observed_at) VALUES (?, ?, ?, ?, ?)',
+  ).run('seven_day', now - 60000, end, 20, now);
   const insert = db.prepare('INSERT INTO events VALUES (?)');
   for (const [at, utilization] of [
     [now - 3 * hour, 60],
@@ -316,7 +354,55 @@ test('period recovery preserves an early reset recorded in the original quota ev
   assert.deepEqual(db.prepare('SELECT * FROM events').all(), events);
 });
 
-test('loopback receiver accepts OTLP JSON log exports', async () => {
+test('upgrading discards unattributable quota readings and retains historical calls and session context', () => {
+  const db = new DatabaseSync(':memory:');
+  const now = Date.now();
+  const log = new UsageLog(db);
+  log.ingest(batch(request(now - 1000, 'legacy')));
+  log.observe(
+    {
+      windows: [
+        { name: 'five_hour', utilization: 100, resetsAt: new Date(now + hour).toISOString() },
+      ],
+    },
+    now,
+  );
+  db.exec(`ALTER TABLE api_requests DROP COLUMN profile;
+    CREATE TABLE events(data TEXT);
+    CREATE TABLE history_meta(key TEXT PRIMARY KEY, value TEXT);
+    INSERT INTO history_meta VALUES ('id','legacy-cache')`);
+  const payload = {
+    type: 'native.metrics',
+    context: { usedTokens: 42 },
+    usage: { costUsd: 1 },
+    rateLimits: { available: true, windows: [] },
+  };
+  db.prepare('INSERT INTO events VALUES (?)').run(JSON.stringify({ payload }));
+  const updated = new UsageLog(db);
+  assert.deepEqual(updated.summary(now).windows, []);
+  assert.deepEqual(JSON.parse(String(db.prepare('SELECT data FROM events').get()!.data)).payload, {
+    ...payload,
+    rateLimits: null,
+  });
+  assert.notEqual(db.prepare('SELECT value FROM history_meta').get()!.value, 'legacy-cache');
+  const range = {
+    from: new Date(now - hour).toISOString(),
+    to: new Date(now + hour).toISOString(),
+  };
+  assert.equal(updated.query({ range, limit: 10 }, () => null).totals.requests, 1);
+  assert.equal(updated.query({ range, limit: 10, profile: 'sdk' }, () => null).totals.requests, 0);
+  updated.observe(
+    {
+      windows: [
+        { name: 'five_hour', utilization: 1, resetsAt: new Date(now + hour).toISOString() },
+      ],
+    },
+    now,
+  );
+  assert.equal(new UsageLog(db).summary(now).windows[0].utilization, 1);
+});
+
+test('loopback receiver counts only SDK calls towards the SDK window and retains both surfaces in the log', async () => {
   const log = new UsageLog(new DatabaseSync(':memory:'));
   const receiver = createUsageReceiver(log);
   const endpoint = await receiver.listen();
@@ -335,9 +421,62 @@ test('loopback receiver accepts OTLP JSON log exports', async () => {
     );
     assert.equal((await post('not json')).status, 400);
     assert.equal((await post('{}', '/other')).status, 404);
-    const page = log.query({ limit: 10, bucketMinutes: 60, offsetMinutes: 0 }, () => null);
+    const page = log.query({ limit: 10, range: recordedRange }, () => null);
     assert.equal(page.rows.length, 1);
     assert.equal(page.rows[0].inputTokens, 12);
+    const terminal = terminalEnvironment(
+      { executable: 'fixture', environment: telemetryEnvironment(endpoint) },
+      {},
+    );
+    const response = await fetch(terminal.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT, {
+      method: 'POST',
+      body: JSON.stringify(batch(request(base, 'terminal', { 'organization.id': 'org-A' }))),
+    });
+    assert.equal(response.status, 200);
+    log.observe(
+      {
+        windows: [
+          { name: 'five_hour', utilization: 3, resetsAt: new Date(base + hour).toISOString() },
+        ],
+      },
+      base,
+    );
+    assert.equal(log.summary(base).windows[0].requests, 1);
+    const filter = { limit: 10, range: recordedRange };
+    assert.equal(log.query(filter, () => null).totals.requests, 2);
+    const sdk = log.query({ ...filter, profile: 'sdk' }, () => null);
+    assert.equal(sdk.totals.requests, 1);
+    assert.equal(sdk.byModel[0].requests, 1);
+    const owner = subscriptionScope('user@example.invalid', 'org-A')!;
+    const other = subscriptionScope('user@example.invalid', 'org-B')!;
+    log.observe(
+      {
+        windows: [
+          { name: 'five_hour', utilization: 100, resetsAt: new Date(base + hour).toISOString() },
+        ],
+      },
+      base,
+      owner,
+    );
+    assert.deepEqual(
+      log.summary(base, owner).windows.map((w) => [w.utilization, w.requests]),
+      [[100, 1]],
+    );
+    assert.deepEqual(
+      log.summary(base).windows.map((w) => [w.utilization, w.requests]),
+      [[3, 1]],
+    );
+    assert.deepEqual(log.summary(base, other).windows, []);
+    assert.deepEqual(log.summary(base, null).windows, []);
+    assert.deepEqual(log.summary(base + hour, owner).windows, []);
+    assert.equal(
+      log.query({ ...filter, profile: 'terminal' }, () => null, base, owner).totals.requests,
+      1,
+    );
+    assert.equal(
+      log.query({ ...filter, profile: 'terminal' }, () => null, base, other).totals.requests,
+      0,
+    );
   } finally {
     await receiver.close();
   }

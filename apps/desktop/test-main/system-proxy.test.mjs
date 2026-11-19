@@ -146,7 +146,7 @@ test(
 
     await send(new X509Certificate(cert).fingerprint256);
     while (!messages.length) await new Promise((resolve) => setTimeout(resolve, 20));
-    assert.deepEqual(JSON.parse(messages[0]), { type: 'auth', token: 'secret', tunnel: true });
+    assert.deepEqual(JSON.parse(messages[0]), { type: 'auth', token: 'secret' });
     assert.deepEqual(asked, [`https://${target}`]);
     assert.deepEqual(requests, [`CONNECT ${target} HTTP/1.1`]);
 

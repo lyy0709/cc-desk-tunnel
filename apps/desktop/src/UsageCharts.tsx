@@ -1,7 +1,51 @@
 import { useState } from 'react';
-import type { UsagePage } from '@cc-desk-tunnel/protocol';
+import { USAGE_SLICE_MINUTES, type UsagePage } from '@cc-desk-tunnel/protocol';
 
 type Bucket = UsagePage['series'][number];
+const emptyBucket = {
+  requests: 0,
+  tokens: 0,
+  inputTokens: 0,
+  outputTokens: 0,
+  cacheReadTokens: 0,
+  cacheCreationTokens: 0,
+  costUsd: 0,
+};
+const bucketFields = Object.keys(emptyBucket) as (keyof typeof emptyBucket)[];
+
+// A repeated hour has two distinct starts. A local calendar day can contain 23, 24 or 25 hours.
+export function usageBars(page: UsagePage, minutes: number) {
+  const slice = USAGE_SLICE_MINUTES * 60_000;
+  const group = (at: number) => {
+    const date = new Date(at);
+    if (minutes === 1440) return date.toDateString();
+    const offset = date.getTimezoneOffset();
+    return `${Math.floor((at / 60_000 - offset) / minutes)}:${offset}`;
+  };
+  const from = Date.parse(page.from),
+    to = Date.parse(page.to);
+  const bars: Bucket[] = [];
+  if (from >= to) return bars;
+  let at = Math.floor(from / slice) * slice;
+  const first = group(at);
+  while (group(at - slice) === first) at -= slice;
+  const values = new Map(page.series.map((point) => [Date.parse(point.at), point]));
+  let previous: string | undefined;
+  for (; at < to; at += slice) {
+    const key = group(at);
+    if (key !== previous) {
+      if (bars.length === 400) break;
+      bars.push({ at: new Date(at).toISOString(), ...emptyBucket });
+      previous = key;
+    }
+    const point = values.get(at);
+    if (point) {
+      const bar = bars[bars.length - 1];
+      for (const field of bucketFields) bar[field] += point[field];
+    }
+  }
+  return bars;
+}
 type Kinds = Pick<
   Bucket,
   'inputTokens' | 'outputTokens' | 'cacheReadTokens' | 'cacheCreationTokens'

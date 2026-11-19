@@ -570,22 +570,6 @@ for (const type of [
   });
 }
 
-test('a generated setup token is transient and never restored by account status', (t) => {
-  const { client, socket } = fixture(t);
-  const created = { type: 'account.token.created', token: 'generated-fixture', saved: true };
-  const account = { type: 'account.state', loggedIn: true, authMethod: 'oauth_token', login: null };
-  socket.message(created);
-  assert.equal(client.state.setupToken.token, created.token);
-  socket.message(account);
-  assert.equal(Object.hasOwn(client.state.account, 'token'), false);
-  client.update({ setupToken: null });
-  socket.message(account);
-  assert.equal(client.state.setupToken, null);
-  socket.message(created);
-  socket.close();
-  assert.equal(client.state.setupToken, null);
-});
-
 test('the connected computers are what the service last said, and unknown while the connection is down', (t) => {
   const { client, socket } = fixture(t);
   const desk = { id: randomUUID(), name: '台式机', ready: true };
@@ -874,6 +858,20 @@ test('conversation folds a finished turn into question, activity and answer', ()
     ['assistant', 'work'],
   );
   assert.equal(summarize(turn.steps[1], true, true).label, '正在编辑文件');
+  const [deferred] = conversation([
+    ...events,
+    event(4, {
+      type: 'tool.result',
+      toolId: 't2',
+      status: 'deferred',
+      output: '',
+      exitCode: null,
+    }),
+  ]);
+  assert.equal(
+    summarize(deferred.steps[1], false, false).label,
+    '读取了 1 个文件，1 项工具调用已延后',
+  );
   assert.deepEqual(
     (({ verb, subject, added, removed }) => ({ verb, subject, added, removed }))(
       describe(turn.steps[1].items[1], true),
@@ -923,28 +921,14 @@ test('command summaries show the actual first line and preserve the full command
     assert.equal(describe({ ...tool, input }, true).command, null);
 });
 
-test('SSH heredoc input decodes newlines and quotes without changing shell content', () => {
-  // Same shape as a native command forwarded to the local shell; the address is a documentation fixture.
-  const input = String.raw`{
-    "command": "ssh device-zsh <<'SH'\nfor u in ubuntu lighthouse admin; do\n  echo \"--- trying $u\"\n  ssh -p 18022 -o BatchMode=yes -o ConnectTimeout=10 \"$u@203.0.113.10\" 'hostname; whoami' 2>&1 | head -5\ndone\necho \"--- ssh agent identities (fingerprints only) ---\"\nssh-add -l 2>&1 | head -5\nSH",
-    "description": "Try other default users on the server"
-  }`;
-  const parsed = describe({ name: 'Bash', input, state: 'completed' }, false);
-  assert.equal(
-    parsed.command,
-    [
-      "ssh device-zsh <<'SH'",
-      'for u in ubuntu lighthouse admin; do',
-      '  echo "--- trying $u"',
-      '  ssh -p 18022 -o BatchMode=yes -o ConnectTimeout=10 "$u@203.0.113.10" \'hostname; whoami\' 2>&1 | head -5',
-      'done',
-      'echo "--- ssh agent identities (fingerprints only) ---"',
-      'ssh-add -l 2>&1 | head -5',
-      'SH',
-    ].join('\n'),
+test('multiline command input preserves quoting and line breaks', () => {
+  const command = ["cat <<'TEXT'", 'one "quoted" line', 'TEXT'].join('\n');
+  const parsed = describe(
+    { name: 'Bash', input: JSON.stringify({ command }), state: 'running' },
+    true,
   );
-  assert.equal(parsed.subject, "ssh device-zsh <<'SH'");
-  assert.equal(parsed.description, 'Try other default users on the server');
+  assert.equal(parsed.command, command);
+  assert.equal(parsed.subject, "cat <<'TEXT'");
 });
 
 test('scheduled tasks: the file round-trips, bad tasks are named, and rules find their next time', () => {

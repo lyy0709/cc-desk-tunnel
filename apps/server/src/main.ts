@@ -16,9 +16,9 @@ clearServiceVariables(process.env);
 // interactive CLI in a terminal tells of a newer one and tries to install it over the pinned copy; every CLI the service
 // starts inherits this.
 if (native) process.env.DISABLE_AUTOUPDATER = '1';
-// What a process that did not get to close left of its connections, the doors of their devices and its terminals.
+// Earlier releases stored ephemeral device keys and per-session SSH wrappers in these directories.
 if (native)
-  for (const name of ['connections', 'devices', 'terminals'])
+  for (const name of ['connections', 'devices', 'session-ssh'])
     rmSync(join(options.dataDir, name), { recursive: true, force: true });
 const server = createProxyServer(options);
 console.log(`Proxy ${native ? 'native' : 'simulation'} service: ${await server.listen(port)}`);

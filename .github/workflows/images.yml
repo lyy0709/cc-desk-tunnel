@@ -1,6 +1,6 @@
 # The server image of a release, for amd64 and arm64: each is built on its own architecture, deployed the ways
 # deploy/test.sh and deploy/test-image.sh go through, and only then pushed; the two become one tag,
-# ghcr.io/sun168567/cc-desk-tunnel:X.Y.Z. The package workflow runs this for a release. By hand, an empty tag only
+# ghcr.io/lyy0709/cc-desk-tunnel:X.Y.Z. The package workflow runs this for a release. By hand, an empty tag only
 # builds and tests, and a tag verify-NAME publishes a test image apart from the released ones.
 name: images
 on:
@@ -33,6 +33,7 @@ jobs:
           REQUESTED: ${{ inputs.tag }}
         run: |
           version="$(node -p "require('./apps/desktop/package.json').version")"
+          slug="$(node -p "new URL(require('./apps/desktop/package.json').repository).pathname.slice(1)")"
           tag="${REQUESTED#v}"
           if [[ "$REQUESTED" == verify-* ]]; then
             tag="$REQUESTED"
@@ -41,7 +42,11 @@ jobs:
             echo "The tag $REQUESTED is not this commit's version $version." >&2
             exit 1
           fi
-          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          if [[ -n "$tag" && "${slug,,}" != "${GITHUB_REPOSITORY,,}" ]]; then
+            echo "The image repository must match the distribution's download source." >&2
+            exit 1
+          fi
+          echo "image=ghcr.io/${slug,,}" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
   build:
     needs: prepare

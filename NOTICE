@@ -4,22 +4,23 @@ Copyright 2026 The CC Desk Tunnel authors
 This product is an independent work. It is not affiliated with, endorsed by or
 sponsored by Anthropic. "Claude" and "Claude Code" are trademarks of Anthropic.
 
-The source in this repository is licensed under the Apache License, Version 2.0
-(see LICENSE). It drives, but does not contain or modify, the following
-software, which stays under its own terms:
+The project's own source is licensed under the Apache License, Version 2.0
+(see LICENSE). The server image installs the following components from their
+official distributions, each under its own terms:
 
 - Claude Code and the Claude Agent SDK (Anthropic). Installed from the official
   npm packages at build or deployment time and used under Anthropic's terms.
+- Anthropic TypeScript SDK, Apache License 2.0.
+- Model Context Protocol TypeScript SDK, MIT License.
 
-The Windows installer and the server image redistribute these unmodified
-third-party components, each under its own license:
+Client distributions also include the applicable licenses for the components
+they ship:
 
-- Win32-OpenSSH (https://github.com/PowerShell/Win32-OpenSSH), BSD-style
-  licenses of OpenSSH and its Windows port.
 - PowerShell (https://github.com/PowerShell/PowerShell), MIT License.
 - Node.js (https://nodejs.org), MIT License and the licenses of its bundled
   dependencies.
 - Electron (https://www.electronjs.org), MIT License, with Chromium and its
   dependencies under their respective licenses.
+- Go standard library (https://go.dev), BSD 3-Clause License.
 
 npm dependencies are listed in package-lock.json and keep their own licenses.

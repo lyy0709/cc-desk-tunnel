@@ -12,6 +12,21 @@ export function sessionRuntime(
 ) {
   const run = session?.activeRun;
   const current = run ? events.filter((event) => event.runId === run.id) : [];
+  const project = current.findLast((event) => event.payload.type === 'native.project_mcp')?.payload;
+  const projectMcp = project?.type === 'native.project_mcp' ? project.status : undefined;
+  const projectLabel =
+    projectMcp &&
+    {
+      connected: '已连接',
+      pending: '连接中',
+      failed: '连接失败',
+      'needs-auth': '需要认证',
+      disabled: '已禁用',
+      missing: '原生进程未列出项目工具',
+      not_applied: '原生进程未加载配置',
+      policy: '已收到托管策略，请刷新确认状态',
+      unknown: '原生进程报告了未知状态',
+    }[projectMcp];
   const initialized = current.findLast((event) => event.payload.type === 'native.session')?.payload;
   const nativeSession = initialized?.type === 'native.session' ? initialized : null;
   const reported = current.findLast(
@@ -56,6 +71,8 @@ export function sessionRuntime(
                   : '未选择会话';
   return {
     nativeSession,
+    projectMcp,
+    projectLabel,
     task: connected ? task : `最后已知：${task}`,
     modeLabel: run
       ? mode

@@ -1,36 +1,12 @@
 import { test, expect, _electron } from '@playwright/test';
 import { readFileSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { connectionArgs } from './helpers.ts';
 
 test.use({ trace: 'off' });
 
-function componentProcesses(
-  resources: string,
-): Promise<{ ProcessId: number; Name: string; CommandLine: string }[]> {
-  const script = `$root = '${resources.replaceAll("'", "''")}'; ConvertTo-Json -Compress -InputObject @(
-    Get-CimInstance Win32_Process -Filter "Name = 'pwsh.exe' OR Name = 'sshd.exe'" |
-    Where-Object { $_.CommandLine -and $_.CommandLine.Contains($root) } |
-    Select-Object ProcessId,Name,CommandLine
-  )`;
-  return new Promise((accept, reject) => {
-    execFile(
-      'pwsh.exe',
-      [
-        '-NoLogo',
-        '-NoProfile',
-        '-NonInteractive',
-        '-EncodedCommand',
-        Buffer.from(script, 'utf16le').toString('base64'),
-      ],
-      { windowsHide: true, encoding: 'utf8', timeout: 10000 },
-      (error, stdout) => (error ? reject(error) : accept(JSON.parse(stdout))),
-    );
-  });
-}
-
-test('packaged exe runs without development dependencies and reclaims bundled remote components on close', async () => {
+test('packaged exe runs without development dependencies and operates on a project with its bundled helper and PowerShell', async () => {
   test.skip(
     !process.env.WINDOWS_PACKAGE_EXE || process.platform !== 'win32',
     'Explicit opt-in: built Windows package.',
@@ -104,6 +80,40 @@ test('packaged exe runs without development dependencies and reclaims bundled re
     expect(
       await application.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().length),
     ).toBe(1);
+    expect(existsSync(join(resources, 'vendor', 'openssh'))).toBe(false);
+    for (const name of ['LICENSE', 'NOTICE'])
+      expect(readFileSync(join(resources, 'licenses', name))).toEqual(readFileSync(name));
+    const helper = join(resources, 'project-files.exe');
+    const readFileTool = (input: object) =>
+      JSON.parse(
+        execFileSync(helper, [project], {
+          input: JSON.stringify(input),
+          encoding: 'utf8',
+          windowsHide: true,
+        }),
+      );
+    const identity = readFileTool({ op: 'bind' }).text;
+    expect(typeof identity).toBe('string');
+    expect(readFileTool({ op: 'read', identity, path: 'example.txt' }).text).toBe('first line\n');
+    expect(
+      execFileSync(
+        join(resources, 'vendor', 'pwsh', 'pwsh.exe'),
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-File',
+          join(resources, 'app.asar.unpacked', 'electron', 'component-host.ps1'),
+          '-OwnerProcessId',
+          String(process.pid),
+        ],
+        {
+          cwd: project,
+          input: '[Console]::Write((Get-Content -Raw -LiteralPath example.txt))',
+          encoding: 'utf8',
+          windowsHide: true,
+        },
+      ),
+    ).toBe('first line\n');
     if (process.env.NATIVE_TEST_CONFIG) {
       const connection = JSON.parse(readFileSync(resolve(process.env.NATIVE_TEST_CONFIG), 'utf8'));
       await page.getByLabel('服务地址', { exact: true }).fill(connection.url);
@@ -111,32 +121,14 @@ test('packaged exe runs without development dependencies and reclaims bundled re
       await page.getByLabel('服务凭据', { exact: true }).fill(connection.token);
       await page.getByRole('button', { name: '连接', exact: true }).click();
       await expect(page.locator('.connection-status')).toContainText('已连接', { timeout: 45000 });
-      const components = await componentProcesses(resources);
-
-      expect(components.some((row) => row.Name === 'sshd.exe')).toBe(true);
-      expect(
-        components.some(
-          (row) => row.Name === 'pwsh.exe' && row.CommandLine.includes('vendor\\pwsh'),
-        ),
-      ).toBe(true);
-      const host = components.find(
-        (row) => row.Name === 'pwsh.exe' && row.CommandLine.includes('component-host.ps1'),
-      )!;
-      const runtime = host.CommandLine.match(
-        /-Runtime\s+"?([^"]*?cc-desk-tunnel-ssh-[^\s"]+)/,
-      )?.[1];
-      expect(runtime && existsSync(runtime)).toBeTruthy();
       await page.getByRole('button', { name: '设置与账号', exact: true }).click();
       await page.getByRole('menuitem', { name: /^账号/ }).click();
-      await expect(
-        page.getByRole('region', { name: '账号信息' }).locator('.account-identity'),
-      ).toContainText(/pro/i, { timeout: 25000 });
+      await expect(page.locator('.account-identity')).toContainText(
+        /GUI 模型服务(已登录|尚未登录)/,
+        { timeout: 25000 },
+      );
       await page.screenshot({ path: join(directory, 'packaged-account.png') });
       await application.close();
-      await expect
-        .poll(async () => (await componentProcesses(resources)).length, { timeout: 15000 })
-        .toBe(0);
-      expect(existsSync(runtime!)).toBe(false);
     } else {
       await page.screenshot({ path: join(directory, 'packaged-login.png') });
     }

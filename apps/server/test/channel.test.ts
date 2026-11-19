@@ -1,309 +1,521 @@
 import assert from 'node:assert/strict';
-import { once } from 'node:events';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import { connect } from 'node:net';
-import type { Socket } from 'node:net';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
 import { test } from 'node:test';
-import type { TestContext } from 'node:test';
+import { registerHooks } from 'node:module';
+import { once } from 'node:events';
+import { PassThrough } from 'node:stream';
+// @ts-expect-error The terminal client is shipped as ESM.
+import { Service } from '../../cli/src/connection.mjs';
+// @ts-expect-error The terminal client is shipped as ESM.
+import { relay } from '../../cli/src/terminal.mjs';
+import {
+  appendFileSync,
+  realpathSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  writeFileSync,
+  truncateSync,
+  rmSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { randomUUID, X509Certificate } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { WebSocket } from 'ws';
-import { PROTOCOL_VERSION, TUNNEL_CLOSE } from '@cc-desk-tunnel/protocol';
-import { createProxyServer } from '../src/server.ts';
+import { PROTOCOL_VERSION, type Session } from '@cc-desk-tunnel/protocol';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { ToolListChangedNotificationSchema } from '@modelcontextprotocol/sdk/types.js';
+import { crc32 } from 'node:zlib';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { defaultCertificate } from './fixtures/web-certificates.ts';
+import { runClaude } from '../src/claude.ts';
+import { NativeInput } from '../src/native-input.ts';
+import { projectPrompt } from '../src/project-tools.ts';
+// @ts-expect-error The native bridge is a bundled ESM module.
+import { openProxyBridge } from '../../desktop/electron/proxy-bridge.mjs';
+// @ts-expect-error Packaging helper used to exercise the same binary users receive.
+import { buildProjectFiles } from '../../../scripts/build-project-files.mjs';
 
-const token = 'channel-test-' + randomUUID();
-type Message = { type: string; [key: string]: unknown };
-
-// A service with the execution channel, and a device that signs in to it. The SSH probe is replaced: these
-// tests are about how connections are admitted and joined, and play both `ssh` and the SSH service themselves.
-async function fixture(t: TestContext, pairMs = 5000) {
-  const directory = mkdtempSync(join(tmpdir(), 'cc-desk-tunnel-channel-'));
-  const server = createProxyServer({
-    token,
-    dataDir: directory,
-    tunnel: { pairMs, probe: async () => {} },
-  });
-  const url = (await server.listen(0)).replace('http', 'ws') + '/ws';
-  const sockets: (WebSocket | Socket)[] = [];
-  t.after(async () => {
-    for (const socket of sockets) 'terminate' in socket ? socket.terminate() : socket.destroy();
-    await server.close();
-    rmSync(directory, { recursive: true, force: true });
-  });
-  async function socket() {
-    const created = new WebSocket(url);
-    sockets.push(created);
-    await once(created, 'open');
-    return created;
-  }
-  // Signs in on a control connection; `next` waits for a message of one type.
-  async function signIn(tunnel = true) {
-    const control = await socket();
-    const messages: Message[] = [];
-    control.on('message', (raw) => messages.push(JSON.parse(raw.toString())));
-    async function next(type: string) {
-      for (let attempt = 0; attempt < 600; attempt++) {
-        const index = messages.findIndex((message) => message.type === type);
-        if (index >= 0) return messages.splice(index, 1)[0]!;
-        await delay(5);
+test(
+  'a pinned desktop connection executes session-bound MCP operations and loses command authority on disconnect',
+  {
+    timeout: 60000,
+    skip:
+      process.platform === 'win32' &&
+      'The server PTY runs on a POSIX host; Windows device paths are exercised by project-access.test.mjs.',
+  },
+  async (t) => {
+    const temp = mkdtempSync(join(process.platform === 'win32' ? tmpdir() : '/tmp', 'ccdt-p-'));
+    const project = join(temp, 'private-user-project');
+    mkdirSync(project);
+    writeFileSync(join(project, 'index.ts'), 'original\n');
+    const originalConfig = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = join(temp, 'test-config');
+    t.after(() => {
+      if (originalConfig === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = originalConfig;
+    });
+    const helper = buildProjectFiles(temp);
+    const device = randomUUID(),
+      token = randomUUID(),
+      events: any[] = [];
+    const driver = Symbol.for('ccdt-project-fixture');
+    let mcp!: Client, finish!: () => void;
+    let activeRun: Parameters<typeof runClaude>[1];
+    const done = new Promise<void>((ok) => {
+      finish = ok;
+    });
+    Reflect.set(globalThis, driver, async (_opts: unknown, run: any) => {
+      activeRun = run;
+      mcp = new Client({ name: 'fixture', version: '1' });
+      await mcp.connect(
+        new StdioClientTransport({
+          command: process.execPath,
+          args: [resolve('apps/server/src/project-mcp.ts'), run.projectTools.args[1]],
+        }),
+      );
+      await done;
+      await mcp.close();
+      return 'completed';
+    });
+    const hooks = registerHooks({
+      resolve(spec, ctx, next) {
+        if (spec === './claude.ts' && ctx.parentURL?.includes('project-fixture'))
+          return {
+            url:
+              'data:text/javascript,' +
+              encodeURIComponent(`
+      export const runClaude=(...args)=>globalThis[Symbol.for('ccdt-project-fixture')](...args);
+      export * from ${JSON.stringify(new URL('../src/claude.ts', import.meta.url).href)};
+    `),
+            shortCircuit: true,
+          };
+        return next(spec, ctx);
+      },
+    });
+    const { createProxyServer } = await import(
+      new URL('../src/server.ts?project-fixture', import.meta.url).href
+    );
+    const fake = join(temp, 'fixture-cli.mjs');
+    const owner = join(temp, 'terminal-owner');
+    writeFileSync(owner, 'org-a');
+    writeFileSync(
+      fake,
+      `#!${process.execPath}
+import {Client} from ${JSON.stringify(import.meta.resolve('@modelcontextprotocol/sdk/client/index.js'))};
+import {StdioClientTransport} from ${JSON.stringify(import.meta.resolve('@modelcontextprotocol/sdk/client/stdio.js'))};
+import {readFileSync} from 'node:fs';
+import {execFileSync} from 'node:child_process';
+const org = readFileSync(${JSON.stringify(owner)}, 'utf8');
+if (process.argv.slice(2).join(' ') === 'auth status --json') {
+  const personal = process.env.CCDT_ACCOUNT_PROFILE === 'terminal';
+  console.log(JSON.stringify(personal ? {loggedIn:true,authMethod:'claude.ai',email:'alice@example.test',orgId:org}
+                                      : {loggedIn:true,authMethod:'api_key'}));
+  process.exit(0);
+}
+if (process.argv.slice(2).join(' ') === 'auth login') {
+  if (process.env.CCDT_ACCOUNT_PROFILE !== 'terminal' || process.env.CCDT_RUNTIME_SESSION) process.exit(2);
+  console.log('FIXTURE-AUTH-URL');
+  const {createInterface}=await import('node:readline');
+  for await (const line of createInterface({input:process.stdin})) process.exit(line==='fixture-reply' ? 0 : 3);
+}
+const config=JSON.parse(process.argv[process.argv.indexOf('--mcp-config')+1]).mcpServers.project;
+const client=new Client({name:'fixture-pty',version:'1'});await client.connect(new StdioClientTransport(config));
+if (!(await client.listTools()).tools.some(tool=>tool.name==='command')) throw new Error('missing initial session grant');
+const result=await client.callTool({name:'read',arguments:{path:'index.ts'}});
+const session=process.argv[process.argv.includes('--resume') ? process.argv.indexOf('--resume')+1 : process.argv.indexOf('--session-id')+1];
+const record={attributes:Object.entries({'event.name':'api_request','session.id':session,'user.email':'alice@example.test','organization.id':org,model:'fixture'}).map(([key,stringValue])=>({key,value:{stringValue}}))};
+const res=await fetch(process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({resourceLogs:[{scopeLogs:[{logRecords:[record]}]}]})});
+if (!res.ok) throw new Error('fixture telemetry rejected');
+const {statusLine}=JSON.parse(readFileSync(process.argv[process.argv.indexOf('--settings')+1],'utf8'));
+execFileSync('sh',['-c',statusLine.command],{input:JSON.stringify({rate_limits:{five_hour:{used_percentage:0},seven_day:{used_percentage:5,resets_at:Math.floor(Date.now()/1000)+86400}}})});
+console.log('PTY-FIXTURE',result.content[0].text);await client.close();
+`,
+      { mode: 0o755 },
+    );
+    const server = createProxyServer({
+      token,
+      dataDir: join(temp, 'broker'),
+      tls: { cert: Buffer.from(defaultCertificate.cert), key: Buffer.from(defaultCertificate.key) },
+      claude: { executable: fake },
+    });
+    const url = (await server.listen(0)).replace('https', 'wss') + '/ws';
+    const connect = async () => {
+      const bridge = await openProxyBridge(
+        { url, fingerprint: new X509Certificate(defaultCertificate.cert).fingerprint256 },
+        {
+          environment: { HOME: temp, ZDOTDIR: temp },
+          projects: {
+            helper,
+            database: join(temp, 'bindings.sqlite'),
+            chooseRoot: async (path: string) => path === realpathSync(project),
+            confirmFile: async (file: string) =>
+              file === realpathSync(join(temp, 'attachment.PNG')),
+          },
+        },
+      );
+      const socket = new WebSocket(bridge.url);
+      socket.on('message', (raw) => events.push(JSON.parse(String(raw))));
+      await once(socket, 'open');
+      socket.send(
+        JSON.stringify({
+          type: 'auth',
+          protocolVersion: PROTOCOL_VERSION,
+          deviceName: 'test',
+          token,
+        }),
+      );
+      socket.send(JSON.stringify({ type: 'device', id: device }));
+      return { bridge, socket };
+    };
+    let { bridge, socket } = await connect();
+    t.after(async () => {
+      finish();
+      await bridge.close();
+      socket.terminate();
+      await server.close();
+      hooks.deregister();
+      Reflect.deleteProperty(globalThis, driver);
+      rmSync(temp, { recursive: true, force: true });
+    });
+    async function request(fields: Record<string, unknown>, connection = socket, ok = true) {
+      const requestId = randomUUID();
+      connection.send(JSON.stringify({ ...fields, requestId }));
+      for (let n = 0; n < 300; n++) {
+        const result = events.find((e) => e.type === 'response' && e.requestId === requestId);
+        if (result) {
+          assert.equal(result.ok, ok, result.message);
+          return result;
+        }
+        await delay(10);
       }
-      throw new Error(`No ${type}: ${JSON.stringify(messages)}`);
+      throw new Error('missing response');
     }
-    control.send(
+    const { sessionId } = await request({
+      type: 'session.create',
+      projectPath: project,
+      title: 'fixture',
+    });
+    assert.match(server.store.get(sessionId).session.projectPath, /^project:/);
+    await request({ type: 'message.send', sessionId, text: 'fixture' });
+    for (let n = 0; !mcp?.getServerVersion() && n < 300; n++) await delay(10);
+    const call = async (name: string, args: Record<string, unknown>) => {
+      const r = await mcp.callTool({ name, arguments: args });
+      const content = r.content as { text: string }[];
+      return { text: content[0].text, error: r.isError };
+    };
+    // A legacy session with native context must be explicitly accepted before a background run can reuse it.
+    const previous = { ...server.store.get(sessionId).session };
+    delete previous.projectAccess;
+    const legacyId = randomUUID();
+    server.store.database
+      .prepare('INSERT INTO sessions VALUES(?,?,?)')
+      .run(legacyId, JSON.stringify({ ...previous, id: legacyId, activeRun: null }), randomUUID());
+    const rid = randomUUID();
+    socket.send(
       JSON.stringify({
-        type: 'auth',
-        token,
-        protocolVersion: PROTOCOL_VERSION,
-        deviceName: '测试',
-        tunnel,
+        type: 'message.send',
+        requestId: rid,
+        sessionId: legacyId,
+        text: 'scheduled',
+        scheduled: 'scheduled',
       }),
     );
-    control.send(JSON.stringify({ type: 'device', id: randomUUID() }));
-    const ready = await next('ready');
-    return { control, messages, next, connectionId: ready.connectionId as string };
-  }
-  // A device whose tunnel is ready; `ssh()` connects as `ssh` on the service's machine would.
-  async function device() {
-    const signed = await signIn();
-    const offer = await signed.next('tunnel.offer');
-    signed.control.send(
-      JSON.stringify({
-        type: 'tunnel.credentials',
-        connectionId: signed.connectionId,
-        username: 'user',
-        privateKey: 'unused',
-        hostPublicKey: 'ssh-ed25519 AAAA',
-        shells: ['bash', 'pwsh'],
-      }),
+    for (let n = 0; !events.find((e) => e.requestId === rid) && n < 100; n++) await delay(10);
+    assert.equal(events.find((e) => e.requestId === rid)?.code, 'history_consent');
+    await request({ type: 'session.acceptHistory', sessionId: legacyId });
+    assert.equal(server.store.get(legacyId).session.projectAccess, 1);
+    const before = JSON.parse((await call('read', { path: 'index.ts' })).text);
+    assert.equal(before.text, 'original\n');
+    assert.ok((await call('search', { path: '.', query: 'original' })).text.includes('index.ts:1'));
+    writeFileSync(join(project, 'index.ts'), 'external original\n');
+    const edit = { path: 'index.ts', old: 'original', new: 'edited', revision: before.revision };
+    assert.ok((await call('edit', edit)).error);
+    edit.revision = JSON.parse((await call('read', { path: 'index.ts' })).text).revision;
+    assert.ok(!(await call('edit', edit)).error);
+    assert.equal(readFileSync(join(project, 'index.ts'), 'utf8'), 'external edited\n');
+    assert.ok((await call('read', { path: '../bindings.sqlite' })).error);
+    // Place a valid PNG metadata chunk before IEND to make a 1 MiB fixture with known original bytes.
+    const png = Buffer.from(
+      'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGMQMgn7DwAClAGcHVtGXwAAAABJRU5ErkJggg==',
+      'base64',
     );
-    await signed.next('tunnel.ready');
-    const config = readFileSync(
-      join(directory, 'connections', signed.connectionId, 'ssh_config'),
-      'utf8',
-    );
-    // The SSH service's shells are hosts of their own, PowerShell first, and every window is told of them.
-    assert.match(config, /^Host device device-pwsh device-bash$/m);
-    assert.deepEqual(
-      (
-        signed.messages.findLast((message) => message.type === 'devices')?.devices as {
-          shells?: string[];
-        }[]
-      ).at(-1)?.shells,
-      ['pwsh', 'bash'],
-    );
-    const port = Number(/Port (\d+)/.exec(config)![1]);
-    function ssh() {
-      const created = connect(port, '127.0.0.1');
-      sockets.push(created);
-      return created;
+    const chunk = Buffer.alloc(1024 * 1024 - png.length, 65);
+    chunk.writeUInt32BE(chunk.length - 12);
+    chunk.write('tEXtNote\0', 4);
+    chunk.writeUInt32BE(crc32(chunk.subarray(4, -4)), chunk.length - 4);
+    const image = Buffer.concat([png.subarray(0, -12), chunk, png.subarray(-12)]);
+    writeFileSync(join(project, 'sample.png'), image);
+    writeFileSync(join(temp, 'attachment.PNG'), image);
+    const attachment = await bridge.projects.attachment(sessionId, {
+      path: join(temp, 'attachment.PNG'),
+    });
+    writeFileSync(join(temp, 'attachment.PNG'), 'replaced after approval');
+    const execute = bridge.projects.call.bind(bridge.projects);
+    const offsets: number[] = [];
+    bridge.projects.call = async (message: { operation: { path: string; offset: number } }) => {
+      offsets.push(message.operation.offset);
+      const part = await execute(message);
+      if (message.operation.path === 'changing.png' && message.operation.offset === 0)
+        appendFileSync(join(project, 'changing.png'), 'x');
+      return part;
+    };
+    for (const path of ['sample.png', attachment.path]) {
+      offsets.length = 0;
+      const result = await mcp.callTool({ name: 'read', arguments: { path } });
+      const block = (result.content as { type: string; mimeType: string; data: string }[])[0];
+      assert.equal(block.type, 'image');
+      assert.equal(block.mimeType, 'image/png');
+      assert.ok(Buffer.from(block.data, 'base64').equals(image));
+      assert.deepEqual(
+        offsets,
+        Array.from({ length: 16 }, (_, i) => i * 65536),
+      );
     }
-    // Opens the channel the service asked for; resolves to the close code, or to the channel once bytes may flow.
-    async function attach(
-      channelId: unknown,
-      secret: unknown = offer.secret,
-      id = signed.connectionId,
-    ) {
-      const channel = await socket();
-      channel.send(JSON.stringify({ type: 'tunnel.attach', connectionId: id, channelId, secret }));
-      return channel;
-    }
-    return { ...signed, secret: offer.secret as string, port, ssh, attach };
-  }
-  const closeCode = async (channel: WebSocket) => ((await once(channel, 'close')) as [number])[0];
-  return { directory, server, url, socket, signIn, device, closeCode };
-}
-function collect(socket: Socket) {
-  const chunks: Buffer[] = [];
-  socket.on('data', (chunk) => chunks.push(chunk));
-  return async (length: number) => {
-    for (let attempt = 0; Buffer.concat(chunks).length < length; attempt++) {
-      assert.ok(attempt < 600, `received ${Buffer.concat(chunks).length} of ${length} bytes`);
-      await delay(5);
-    }
-    return Buffer.concat(chunks);
-  };
-}
-
-test('a device signing in is offered a tunnel; its SSH connections are announced to it alone and joined', async (t) => {
-  const f = await fixture(t);
-  const device = await f.device();
-  const viewer = await f.signIn(false);
-  assert.equal(
-    viewer.messages.some((message) => message.type.startsWith('tunnel.')),
-    false,
-  );
-
-  const ssh = device.ssh();
-  const output = collect(ssh);
-  ssh.write('from ssh');
-  const open = await device.next('tunnel.open');
-  assert.equal(open.connectionId, device.connectionId);
-  const channel = await device.attach(open.channelId);
-  const frames: { data: Buffer; binary: boolean }[] = [];
-  channel.on('message', (data: Buffer, binary: boolean) => frames.push({ data, binary }));
-  channel.send(Buffer.from('from device'));
-  assert.equal((await output(11)).toString(), 'from device');
-  for (let attempt = 0; !frames.length; attempt++) {
-    assert.ok(attempt < 600);
-    await delay(5);
-  }
-  // Something every signed-in connection is told about: the channel must hear none of it.
-  const requestId = randomUUID();
-  viewer.control.send(
-    JSON.stringify({ type: 'session.create', requestId, title: '广播', projectPath: 'D:\\work' }),
-  );
-  await viewer.next('response');
-  await device.next('session.updated');
-  // Whatever a channel carries is bytes for SSH: a sign-in sent over it reaches `ssh` and nothing answers.
-  channel.send(
-    JSON.stringify({ type: 'auth', token, protocolVersion: PROTOCOL_VERSION, deviceName: 'x' }),
-  );
-  assert.match((await output(40)).toString(), /^from device\{"type":"auth"/);
-  await delay(100);
-  assert.deepEqual(
-    frames.map((frame) => [frame.data.toString(), frame.binary]),
-    [['from ssh', true]],
-  );
-  assert.equal(
-    viewer.messages.some((message) => message.type === 'tunnel.open'),
-    false,
-  );
-});
-test('a channel is admitted only with the secret of a live tunnel and the name of a waiting connection', async (t) => {
-  const f = await fixture(t);
-  const device = await f.device();
-  const other = await f.signIn(false);
-  device.ssh();
-  const { channelId } = await device.next('tunnel.open');
-  // A tunnel that does not exist, a connection without a tunnel, and a malformed request: turned away, not counted.
-  for (let attempt = 0; attempt < 4; attempt++) {
-    assert.equal(
-      await f.closeCode(await device.attach(channelId, device.secret, randomUUID())),
-      TUNNEL_CLOSE.unknown,
+    assert.ok((await call('read', { path: 'sample.png', offset: 12000 })).error);
+    writeFileSync(join(project, 'changing.png'), image);
+    const changedImage = await call('read', { path: 'changing.png' });
+    assert.ok(changedImage.error);
+    assert.match(changedImage.text, /图片已变更/);
+    truncateSync(join(project, 'changing.png'), 20 * 1024 * 1024 + 1);
+    const oversized = await call('read', { path: 'changing.png' });
+    assert.ok(oversized.error);
+    assert.match(oversized.text, /20 MiB/);
+    writeFileSync(join(project, 'long.txt'), 'x'.repeat(12001));
+    assert.equal(JSON.parse((await call('read', { path: 'long.txt' })).text).next, 12000);
+    const input = JSON.stringify({ new: 'private-edit-marker' + '写'.repeat(22000) });
+    const decision = activeRun!.approve(
+      'tool-1',
+      'approval',
+      'mcp__project__edit',
+      activeRun!.signal,
+      { input, title: '编辑文件', description: '审批详情' },
     );
-    assert.equal(
-      await f.closeCode(await device.attach(channelId, device.secret, other.connectionId)),
-      TUNNEL_CLOSE.unknown,
-    );
-    assert.equal(await f.closeCode(await device.attach(channelId, 'short')), TUNNEL_CLOSE.unknown);
-    assert.equal(await f.closeCode(await device.attach('not-a-uuid')), TUNNEL_CLOSE.unknown);
-    assert.equal(await f.closeCode(await device.attach(randomUUID())), TUNNEL_CLOSE.unknown);
-  }
-  // The right secret still gets in after all of that, and only once.
-  const channel = await device.attach(channelId);
-  channel.send(Buffer.from('x'));
-  await delay(50);
-  assert.equal(channel.readyState, WebSocket.OPEN);
-  assert.equal(await f.closeCode(await device.attach(channelId)), TUNNEL_CLOSE.unknown);
-});
-test('wrong secrets for a live tunnel count against the address like wrong tokens', async (t) => {
-  const f = await fixture(t);
-  const device = await f.device();
-  device.ssh();
-  const { channelId } = await device.next('tunnel.open');
-  for (let attempt = 0; attempt < 6; attempt++)
-    assert.equal(
-      await f.closeCode(await device.attach(channelId, 'w'.repeat(43))),
-      TUNNEL_CLOSE.refused,
-    );
-  const blocked = new WebSocket(f.url);
-  const [error] = (await once(blocked, 'error')) as [Error];
-  assert.match(error.message, /429/);
-});
-test('a control connection cannot turn into a channel, nor a channel request arrive later', async (t) => {
-  const f = await fixture(t);
-  const device = await f.device();
-  device.ssh();
-  const { channelId } = await device.next('tunnel.open');
-  device.control.send(
-    JSON.stringify({
-      type: 'tunnel.attach',
-      connectionId: device.connectionId,
-      channelId,
-      secret: device.secret,
-    }),
-  );
-  const error = await device.next('connection.error');
-  assert.equal(error.code, 'invalid_command');
-  assert.equal(device.control.readyState, WebSocket.OPEN);
-});
-test('channels do not use up the places for connections that have not signed in', async (t) => {
-  const f = await fixture(t);
-  const device = await f.device();
-  // Three times the number of unauthenticated connections one address may hold at once.
-  const outputs = [];
-  for (let index = 0; index < 12; index++) {
-    const ssh = device.ssh();
-    outputs.push(collect(ssh));
-    const { channelId } = await device.next('tunnel.open');
-    (await device.attach(channelId)).send(Buffer.from(`channel ${index}`));
-  }
-  for (const [index, output] of outputs.entries())
-    assert.equal((await output(`channel ${index}`.length)).toString(), `channel ${index}`);
-  // A failed attach gives its place back as well.
-  for (let attempt = 0; attempt < 8; attempt++)
-    await f.closeCode(await device.attach(randomUUID()));
-  await f.signIn(false);
-});
-test('an SSH connection is dropped when the device does not open its channel in time', async (t) => {
-  const f = await fixture(t, 150);
-  const device = await f.device();
-  const ssh = device.ssh();
-  const { channelId } = await device.next('tunnel.open');
-  await once(ssh, 'close');
-  assert.equal(await f.closeCode(await device.attach(channelId)), TUNNEL_CLOSE.unknown);
-});
-test('the tunnel ends with its control connection: channels, SSH connections, port and credentials', async (t) => {
-  const f = await fixture(t);
-  const device = await f.device();
-  const [joined, waiting] = [device.ssh(), device.ssh()];
-  const first = await device.next('tunnel.open');
-  const second = await device.next('tunnel.open');
-  const channel = await device.attach(first.channelId);
-  channel.send(Buffer.from('x'));
-  // An end is only seen by a connection that reads what came before it.
-  joined.resume();
-  const ended = Promise.all([once(joined, 'close'), once(waiting, 'close'), f.closeCode(channel)]);
-  device.control.close();
-  await ended;
-  const late = connect(device.port, '127.0.0.1');
-  const [error] = (await once(late, 'error')) as [NodeJS.ErrnoException];
-  assert.equal(error.code, 'ECONNREFUSED');
-  // The secret died with the tunnel.
-  assert.equal(await f.closeCode(await device.attach(second.channelId)), TUNNEL_CLOSE.unknown);
-  for (let attempt = 0; ; attempt++) {
+    const entry = server.store
+      .get(sessionId)
+      .events.findLast((e: any) => e.payload.type === 'approval.requested')!;
+    assert.ok(entry.payload.type === 'approval.requested');
+    const approval = { sessionId, runId: entry.runId, approvalId: entry.payload.approvalId };
+    const inspect = { type: 'approval.inspect', ...approval, offset: 0 };
+    const observer = await connect();
     try {
-      readFileSync(join(f.directory, 'connections', device.connectionId, 'identity'));
-    } catch {
-      break;
+      assert.equal((await request(inspect, observer.socket, false)).code, 'approval_inactive');
+    } finally {
+      await observer.bridge.close();
+      observer.socket.terminate();
     }
-    assert.ok(attempt < 200, 'credentials were left behind');
-    await delay(10);
+    const page = async (offset: number) => {
+      const { requestId } = await request({ ...inspect, offset });
+      return events.find((e) => e.type === 'approval.detail' && e.requestId === requestId);
+    };
+    const first = await page(0),
+      second = await page(first.next);
+    assert.equal(first.title, '编辑文件');
+    assert.equal(first.description, '审批详情');
+    assert.equal(first.input + second.input, input);
+    assert.equal(second.next, undefined);
+    await request({ type: 'approval.reply', ...approval, allowed: false });
+    assert.equal((await decision).allowed, false);
+    assert.equal((await request(inspect, socket, false)).code, 'approval_inactive');
+    assert.ok(!JSON.stringify(server.store.get(sessionId).events).includes('private-edit-marker'));
+    const commandListed = async () =>
+      (await mcp.listTools()).tools.some((tool) => tool.name === 'command');
+    const changed = () =>
+      new Promise<void>((resolve) =>
+        mcp.setNotificationHandler(ToolListChangedNotificationSchema, () => resolve()),
+      );
+    assert.equal(await commandListed(), false);
+    let update = changed();
+    bridge.projects.commands(sessionId, true);
+    await update;
+    assert.equal(await commandListed(), true);
+    assert.match((await call('command', { command: 'echo fixture' })).text, /fixture/);
+    update = changed();
+    bridge.projects.commands(sessionId, false);
+    await update;
+    assert.equal(await commandListed(), false);
+    update = changed();
+    bridge.projects.commands(sessionId, true);
+    await update;
+    const disconnected = changed();
+    let writes = 0;
+    bridge.projects.call = async (message: unknown) => {
+      const result = await execute(message);
+      writes++;
+      const closed = once(socket, 'close');
+      socket.terminate();
+      await closed;
+      await delay(20);
+      return result;
+    };
+    const interrupted = await call('create', { path: 'once.txt', new: 'first' });
+    assert.ok(interrupted.error);
+    assert.equal(readFileSync(join(project, 'once.txt'), 'utf8'), 'first');
+    assert.equal(writes, 1);
+    await disconnected;
+    ({ bridge, socket } = await connect());
+    for (let n = 0; !bridge.projects.sessions.has(sessionId) && n < 300; n++) await delay(10);
+    assert.equal(await commandListed(), false);
+    assert.ok(!events.some((e) => e.type.startsWith('tunnel.')));
+    finish();
+    for (let n = 0; server.store.get(sessionId).session.activeRun && n < 300; n++) await delay(10);
+    const terminal = new Service();
+    terminal.bridge = await openProxyBridge(
+      { url, fingerprint: new X509Certificate(defaultCertificate.cert).fingerprint256 },
+      {
+        projects: {
+          helper,
+          database: join(temp, 'bindings.sqlite'),
+          chooseRoot: async () => false,
+          confirmFile: async () => false,
+        },
+      },
+    );
+    await terminal.open(token, device);
+    await terminal.channel(3000);
+    try {
+      assert.equal(
+        terminal.devices.find((d: { id: string }) => d.id === device).name,
+        `设备 ${device.slice(0, 8)}`,
+      );
+      terminal.bridge.projects.commands(sessionId, true);
+      const output = new PassThrough();
+      let printed = '';
+      output.on('data', (b) => (printed += String(b)));
+      const result = await relay(terminal, sessionId, {}, new PassThrough(), output);
+      assert.equal(result.code, 0);
+      assert.match(printed, /PTY-FIXTURE.*external edited/);
+      assert.ok(!printed.includes(project));
+      const summary = await terminal.request({ type: 'usage.summary', profile: 'terminal' });
+      assert.deepEqual(
+        summary.windows.map((w: { utilization: number }) => w.utilization),
+        [0, 5],
+      );
+      assert.equal(summary.windows[1].requests, 1);
+      assert.deepEqual((await terminal.request({ type: 'usage.summary' })).windows, []);
+      writeFileSync(owner, 'org-b');
+      const switched = await terminal.request({ type: 'usage.summary', profile: 'terminal' });
+      assert.deepEqual(switched.windows, []);
+      const previous = server.store.list(true).map((session: Session) => session.id);
+      const keys = new PassThrough(),
+        screen = new PassThrough();
+      let answered = false,
+        display = '';
+      screen.on('data', (chunk) => {
+        display += String(chunk);
+        if (!answered && display.includes('FIXTURE-AUTH-URL')) {
+          answered = true;
+          keys.write('fixture-reply\r');
+        }
+      });
+      const auth = await relay(terminal, randomUUID(), { login: true }, keys, screen);
+      assert.equal(auth.code, 0);
+      assert.equal(answered, true);
+      assert.deepEqual(
+        server.store.list(true).map((session: Session) => session.id),
+        previous,
+      );
+    } finally {
+      await terminal.close();
+    }
+  },
+);
+
+test(
+  'the official SDK sends queued project input only after an acknowledged stdin configuration',
+  {
+    skip: process.platform === 'win32',
+    timeout: 20000,
+  },
+  async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), 'ccdt-sdk-init-'));
+    const original = process.env.CLAUDE_CONFIG_DIR;
+    process.env.CLAUDE_CONFIG_DIR = join(directory, 'config');
+    t.after(() => {
+      if (original === undefined) delete process.env.CLAUDE_CONFIG_DIR;
+      else process.env.CLAUDE_CONFIG_DIR = original;
+      rmSync(directory, { recursive: true, force: true });
+    });
+    const executable = join(directory, 'fixture-cli.mjs');
+    writeFileSync(
+      executable,
+      `#!${process.execPath}
+import { appendFileSync } from 'node:fs';
+import { createInterface } from 'node:readline';
+for await (const line of createInterface({input: process.stdin})) {
+  const frame = JSON.parse(line);
+  const say = message => console.log(JSON.stringify(message));
+  const reply = response => say({type:'control_response',response:{request_id:frame.request_id,...response}});
+  if (frame.request?.subtype === 'initialize') {
+    appendFileSync(process.env.FIXTURE_TRACE,JSON.stringify({type:'initialize',argv:process.argv.slice(2),servers:frame.request.mcpServers,prompt:frame.request.appendSystemPrompt})+'\\n');
+    if (process.env.FIXTURE_ACK === 'error') reply({subtype:'error',error:'fixture initialize rejected'});
+    else reply({subtype:'success',response:{commands:[],models:[],agents:[],account:{},
+      ...(process.env.FIXTURE_ACK !== 'missing' && {mcp_servers_applied:process.env.FIXTURE_ACK === 'true'})}});
+  } else if (frame.type === 'user') {
+    appendFileSync(process.env.FIXTURE_TRACE,'{"type":"user"}\\n');
+    say({type:'system',subtype:'init',session_id:frame.session_id,model:'fixture',claude_code_version:'fixture',mcp_servers:[{name:'project',status:'pending'}]});
+    say({type:'system',subtype:'informational',session_id:frame.session_id,level:'warning',tag:'managed_mcp_arrived',content:'fixture policy'});
+  } else if (frame.request?.subtype === 'mcp_status') {
+    reply({subtype:'success',response:{mcpServers:[{name:'project',status:'connected',config:{unused:'private configuration'}}]}});
   }
-  // The next device is welcome once the first is gone.
-  await f.device();
-});
-test('two devices are online at once, each with an execution channel of its own', async (t) => {
-  const f = await fixture(t);
-  const first = await f.device();
-  const second = await f.device();
-  assert.notEqual(first.port, second.port);
-  second.ssh();
-  const open = await second.next('tunnel.open');
-  assert.equal(open.connectionId, second.connectionId);
-  assert.equal(
-    first.messages.some((message) => message.type === 'tunnel.open'),
-    false,
-  );
-  // The secret of one opens nothing on the other.
-  assert.equal(
-    await f.closeCode(await first.attach(open.channelId, first.secret, second.connectionId)),
-    TUNNEL_CLOSE.refused,
-  );
-  // One leaving takes nothing from the other.
-  second.control.close();
-  first.ssh();
-  assert.equal((await first.next('tunnel.open')).connectionId, first.connectionId);
-});
+}
+`,
+      { mode: 0o755 },
+    );
+    const projectTools = {
+      type: 'stdio' as const,
+      command: 'node',
+      args: ['project-mcp.ts', join(directory, 'project.sock')],
+    };
+    for (const ack of ['true', 'false', 'missing', 'error']) {
+      const sessionId = randomUUID(),
+        receipt = join(directory, ack + '.jsonl');
+      const stop = new AbortController();
+      const controls: Parameters<typeof runClaude>[1]['controls'] = {};
+      const statuses: string[] = [];
+      const input = new NativeInput(sessionId, () => {});
+      input.submit(randomUUID(), 'fixture input');
+      const outcome = await runClaude(
+        { executable, environment: { FIXTURE_ACK: ack, FIXTURE_TRACE: receipt } },
+        {
+          sessionId,
+          nativeRoot: sessionId,
+          projectTools,
+          permissionMode: 'default',
+          input,
+          resume: false,
+          dataDir: directory,
+          signal: AbortSignal.any([stop.signal, t.signal]),
+          emit(event) {
+            if (event.type === 'native.project_mcp') {
+              statuses.push(event.status);
+              if (event.status === 'policy') void controls.refreshProject!();
+              if (event.status === 'connected') stop.abort();
+            }
+          },
+          approve: async () => ({ allowed: false }),
+          waiting() {},
+          turnEnded() {},
+          controls,
+        },
+      );
+      assert.equal(outcome, ack === 'true' ? 'cancelled' : 'failed', ack);
+      const frames = readFileSync(receipt, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line));
+      const { argv, servers, prompt } = frames[0];
+      assert.equal(frames.filter((f) => f.type === 'user').length, Number(ack === 'true'), ack);
+      if (ack === 'true') assert.deepEqual(statuses, ['pending', 'policy', 'connected']);
+      if (ack === 'false') assert.deepEqual(statuses, ['not_applied']);
+      assert.deepEqual(servers, { project: projectTools });
+      assert.equal(prompt, projectPrompt);
+      assert.doesNotMatch(prompt, /\b(?:ssh|scp|sftp)\b/i);
+      assert.ok(argv.includes('--tools=AskUserQuestion,EnterPlanMode,ExitPlanMode'));
+      assert.ok(argv.includes('--strict-mcp-config'));
+      assert.ok(!argv.join(' ').includes('ssh device'));
+      assert.ok(!argv.includes('--mcp-config'));
+      assert.ok(!JSON.stringify(argv).includes(projectTools.args[1]));
+    }
+  },
+);

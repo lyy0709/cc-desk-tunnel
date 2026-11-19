@@ -16,7 +16,7 @@ program() {
   cp "$ROOT/deploy/compose.yml" "$1/deploy/"
   cp "$ROOT/deploy/docker/program.sh" "$1/deploy/docker/"
   cp "$ROOT/deploy/docker/compose.yaml" "$1/deploy/docker/"
-  printf '{\n  "version": "%s",\n}\n' "$2" > "$1/apps/desktop/package.json"
+  printf '{\n  "version": "%s",\n  "repository": "https://github.com/lyy0709/cc-desk-tunnel"\n}\n' "$2" > "$1/apps/desktop/package.json"
 }
 # The release on the stand-in GitHub: its archive and SHA256SUMS.
 release() {
@@ -54,7 +54,7 @@ while (($#)); do
   shift
 done
 file="$MOCK_RELEASE/${url##*/}"
-[[ "$url" == https://github.com/sun168567/cc-desk-tunnel/releases/* && -f "$file" ]] || exit 22
+[[ "$url" == https://github.com/lyy0709/cc-desk-tunnel/releases/* && -f "$file" ]] || exit 22
 version="$(ls "$MOCK_RELEASE" | sed -n 's/^cc-desk-tunnel-server-\(.*\)\.tar\.gz$/\1/p')"
 [[ "$url" == */latest/download/* || "$url" == */download/v$version/* ]] || exit 22
 if [[ -n "$output" ]]; then cp "$file" "$output"; else cat "$file"; fi
@@ -86,7 +86,7 @@ image() { sed -n "s/^PROXY_IMAGE='\(.*\)'$/\1/p" "$PROXY_DEPLOY_CONFIG"; }
 # The prebuilt image of the program's own version.
 deployment 1.2.3
 manage pull
-test "$(image)" = ghcr.io/sun168567/cc-desk-tunnel:1.2.3
+test "$(image)" = ghcr.io/lyy0709/cc-desk-tunnel:1.2.3
 ! grep -q ' build ' "$MOCK_LOG"
 ! grep -q ' up ' "$MOCK_LOG"
 # No image to pull: built here, and only then configured.
@@ -111,16 +111,16 @@ CC_DESK_TUNNEL_BUILD=1 CC_DESK_TUNNEL_UNPACKED=1 manage upgrade > /dev/null
 # up gets the image first when there is none yet, as after init.
 deployment 1.2.3
 MISSING_IMAGE=1 manage up
-grep -q '^pull ghcr.io/sun168567/cc-desk-tunnel:1.2.3' "$MOCK_LOG"
+grep -q '^pull ghcr.io/lyy0709/cc-desk-tunnel:1.2.3' "$MOCK_LOG"
 
 # upgrade fetches the newest release, checks it, unpacks it and goes on with the script it brought. The image it
 # replaces goes; one of the administrator's own stays.
 release 1.3.0
-deployment 1.2.3 ghcr.io/sun168567/cc-desk-tunnel:1.2.3
+deployment 1.2.3 ghcr.io/lyy0709/cc-desk-tunnel:1.2.3
 manage upgrade > "$TEMP/upgrade.log"
 grep -q '"version": "1.3.0"' "$DEPLOYED/apps/desktop/package.json"
-test "$(image)" = ghcr.io/sun168567/cc-desk-tunnel:1.3.0
-grep -q '^image rm ghcr.io/sun168567/cc-desk-tunnel:1.2.3' "$MOCK_LOG"
+test "$(image)" = ghcr.io/lyy0709/cc-desk-tunnel:1.3.0
+grep -q '^image rm ghcr.io/lyy0709/cc-desk-tunnel:1.2.3' "$MOCK_LOG"
 deployment 1.2.3 my-own:1
 manage upgrade > /dev/null
 ! grep -q '^image rm' "$MOCK_LOG"
@@ -128,7 +128,7 @@ manage upgrade > /dev/null
 release 1.2.3
 deployment 1.2.3 old:1
 manage upgrade > /dev/null
-test "$(image)" = ghcr.io/sun168567/cc-desk-tunnel:1.2.3
+test "$(image)" = ghcr.io/lyy0709/cc-desk-tunnel:1.2.3
 release 1.2.0
 deployment 1.2.3 old:1
 manage upgrade > /dev/null
@@ -136,12 +136,12 @@ grep -q '"version": "1.2.3"' "$DEPLOYED/apps/desktop/package.json"
 rm -f "$MOCK_RELEASE"/*
 deployment 1.2.3 old:1
 manage upgrade > /dev/null
-test "$(image)" = ghcr.io/sun168567/cc-desk-tunnel:1.2.3
+test "$(image)" = ghcr.io/lyy0709/cc-desk-tunnel:1.2.3
 # A version asked for, and one that does not exist.
 release 1.2.9
 deployment 1.2.3
 CC_DESK_TUNNEL_VERSION=1.2.9 manage upgrade > /dev/null
-test "$(image)" = ghcr.io/sun168567/cc-desk-tunnel:1.2.9
+test "$(image)" = ghcr.io/lyy0709/cc-desk-tunnel:1.2.9
 deployment 1.2.3 old:1
 if CC_DESK_TUNNEL_VERSION=9.9.9 manage upgrade > /dev/null 2>&1; then echo 'A missing version was accepted.' >&2; exit 1; fi
 if CC_DESK_TUNNEL_VERSION=latest manage upgrade > /dev/null 2>&1; then echo 'A malformed version was accepted.' >&2; exit 1; fi
@@ -160,11 +160,15 @@ deployment 1.2.3
 data="$TEMP/data" backups="$TEMP/backups"
 mkdir -p "$data"/{home,workspace,tls,state/connections} "$backups"
 printf "PROXY_TOKEN='from-backup'\nPROXY_TLS_MODE='direct'\nPROXY_CERT_NAME='old.example'\n" > "$data/config/service.env"
+mkdir -p "$data"/{app-home,cc-runner,state/project-sockets}
+echo history > "$data/app-home/history"
+echo temporary > "$data/cc-runner/endpoint"; echo temporary > "$data/state/project-sockets/endpoint"
 echo kept > "$data/home/marker"; echo moment > "$data/state/connections/key"; echo old > "$data/tls/control.crt"
 (cd "$backups" && manage backup > /dev/null)
 archive="$(ls "$backups"/cc-desk-tunnel-backup-*.tar.gz)"
 tar -tzf "$archive" | grep -Fxq ./home/marker
-! tar -tzf "$archive" | grep -q 'connections/key'
+if tar -tzf "$archive" | grep -E 'connections/key|cc-runner/endpoint|project-sockets/endpoint'; then exit 1; fi
+test "$(tar -xzOf "$archive" ./app-home/history)" = history
 tar -xzOf "$archive" cc-desk-tunnel-backup.txt | grep -qx 'version=1.2.3'
 if manage backup "$data/home/inside.tar.gz" > /dev/null 2>&1; then echo 'A backup inside the data was accepted.' >&2; exit 1; fi
 printf "PROXY_TOKEN='here'\nPROXY_TLS_MODE='reverse-proxy'\nPROXY_CERT_NAME='new.example'\n" > "$data/config/service.env"
@@ -246,11 +250,11 @@ grep -q '"version": "1.3.0"' "$TEMP/installed/apps/desktop/package.json"
 grep -q "CONNECTION_URL='wss://my_box.example.com/ws'" "$TEMP/installed/.local/docker.env"
 grep -q "deploy/manage.sh" "$CC_DESK_TUNNEL_COMMAND"
 MISSING_IMAGE=1 bash "$CC_DESK_TUNNEL_COMMAND" up > /dev/null
-grep -q "PROXY_IMAGE='ghcr.io/sun168567/cc-desk-tunnel:1.3.0'" "$TEMP/installed/.local/docker.env"
+grep -q "PROXY_IMAGE='ghcr.io/lyy0709/cc-desk-tunnel:1.3.0'" "$TEMP/installed/.local/docker.env"
 release 1.4.0
 : > "$MOCK_LOG"
 printf 'y\n' | bash "$TEMP/install.sh" > "$TEMP/reinstall.log"
-grep -q "PROXY_IMAGE='ghcr.io/sun168567/cc-desk-tunnel:1.4.0'" "$TEMP/installed/.local/docker.env"
+grep -q "PROXY_IMAGE='ghcr.io/lyy0709/cc-desk-tunnel:1.4.0'" "$TEMP/installed/.local/docker.env"
 test "$(grep -c '^pull ' "$MOCK_LOG")" = 1
 bash "$CC_DESK_TUNNEL_COMMAND" uninstall > /dev/null
 test ! -e "$CC_DESK_TUNNEL_COMMAND"

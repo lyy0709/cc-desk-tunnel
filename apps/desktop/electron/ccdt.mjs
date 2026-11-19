@@ -123,11 +123,13 @@ const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // `missing` when ccdt is not installed, `outdated` when it is not of this client's release, which is the service's;
 // the window then says how to install it. Anything else that goes wrong is thrown, in words for the user.
 export async function openSession(
-  { url, fingerprint, token, sessionId, projectPath },
+  { url, fingerprint, token, sessionId, projectPath, login },
   { version, platform = process.platform, env = process.env, home = homedir() },
 ) {
   if (
-    !uuid.test(sessionId) ||
+    (login === true
+      ? sessionId !== undefined || projectPath !== undefined
+      : !uuid.test(sessionId)) ||
     !/^wss?:\/\/[^\s"'%^&|<>`$\\]+$/.test(url) ||
     !/^[0-9A-Fa-f:]*$/.test(fingerprint ?? '')
   )
@@ -154,7 +156,12 @@ export async function openSession(
   );
   const cwd = projectPath && existsSync(projectPath) ? projectPath : home;
   await launch(
-    terminalCommand(system, ccdt, ['open', sessionId, '--server', url], cwd),
+    terminalCommand(
+      system,
+      ccdt,
+      [...(login === true ? ['auth', 'login'] : ['open', sessionId]), '--server', url],
+      cwd,
+    ),
     system,
     cwd,
   );

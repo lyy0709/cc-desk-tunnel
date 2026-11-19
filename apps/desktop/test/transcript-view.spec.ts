@@ -233,6 +233,7 @@ updatedPermissions: [
 async function openPlan(
   page: import('@playwright/test').Page,
   input = JSON.stringify({ plan: planText }),
+  privateTool?: 'ExitPlanMode' | 'AskUserQuestion',
 ) {
   const now = new Date().toISOString();
   const connectionId = randomUUID(),
@@ -276,8 +277,9 @@ async function openPlan(
     event({
       type: 'tool.requested',
       toolId: 'plan-tool',
-      name: 'ExitPlanMode',
-      input,
+      name: privateTool ?? 'ExitPlanMode',
+      input: privateTool ? '' : input,
+      ...(privateTool && { privateInput: true }),
       target: 'Linux',
     }),
     event({ type: 'approval.requested', approvalId, toolId: 'plan-tool' }),
@@ -317,6 +319,21 @@ async function openPlan(
           hasEarlier: false,
           events,
         });
+      if (message.type === 'approval.inspect') {
+        expect([message.sessionId, message.runId, message.approvalId]).toEqual([
+          session.id,
+          runId,
+          approvalId,
+        ]);
+        const end = message.offset + 16000;
+        send({
+          type: 'approval.detail',
+          requestId: message.requestId,
+          input: input.slice(message.offset, end),
+          ...(!message.offset && { title: '原生审批标题', description: '原生审批说明' }),
+          ...(end < input.length && { next: end }),
+        });
+      }
       if (message.type === 'approval.reply') replies.push(message);
       send({ type: 'response', requestId: message.requestId, ok: true });
     });
@@ -359,6 +376,39 @@ async function openPlan(
     },
     publish,
   };
+}
+
+for (const name of ['ExitPlanMode', 'AskUserQuestion'] as const) {
+  test(`pending ${name} shows native approval details and releases them on resolution`, async ({
+    page,
+  }) => {
+    const input = JSON.stringify(
+      name === 'ExitPlanMode'
+        ? { plan: '# 待批计划', note: 'p'.repeat(16000) + '尾项' }
+        : { questions: [{ question: '选择目标', options: [{ label: '本地项目' }] }] },
+    );
+    const fixture = await openPlan(page, input, name);
+    await expect(page.getByText('原生审批标题', { exact: true })).toBeVisible();
+    await expect(page.getByText('原生审批说明', { exact: true })).toBeVisible();
+    await page.getByText('查看完整工具参数', { exact: true }).click();
+    await expect(page.locator('.approval-preview > details pre')).toHaveText(input);
+    if (name === 'ExitPlanMode')
+      await page.getByRole('button', { name: '批准并执行', exact: true }).click();
+    else {
+      const form = page.getByRole('form', { name: 'Claude 的提问' });
+      await form.getByText('本地项目', { exact: true }).click();
+      await form.locator('button[type="submit"]').click();
+    }
+    await expect.poll(() => fixture.replies.length).toBe(1);
+    expect(fixture.replies[0]).toMatchObject(
+      name === 'ExitPlanMode'
+        ? { allowed: true, executionMode: 'auto' }
+        : { allowed: true, answers: { 选择目标: '本地项目' } },
+    );
+    fixture.resolve(true);
+    await expect(page.locator('.approval-preview')).toHaveCount(0);
+    await expect(page.getByText('原生审批说明', { exact: true })).toHaveCount(0);
+  });
 }
 
 test('plans render as documents, expand without a nested scroller, and support copy, search and enlarged reading', async ({

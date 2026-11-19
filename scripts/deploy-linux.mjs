@@ -1,7 +1,7 @@
 import { readFileSync, mkdirSync, writeFileSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { randomBytes, createHash } from 'node:crypto';
+import { createHash } from 'node:crypto';
 import { Client } from 'ssh2';
 import { packageServer } from './package-server.mjs';
 
@@ -49,93 +49,76 @@ const quote = (text) => "'" + text.replaceAll("'", "'\\''") + "'";
 try {
   const home = (await exec('printf %s "$HOME"')).trim();
   const base = `${home}/.local/share/cc-desk-tunnel`;
-  console.log('Installing ordinary-user runtime...');
-  console.log(await exec('bash -s', readFileSync(join(root, 'scripts/install-linux.sh'), 'utf8')));
+  const app = base + '/app',
+    data = base + '/data',
+    manage = 'bash ' + quote(app + '/deploy/manage.sh');
+  const port = config.servicePort ?? 8787;
+  if (!Number.isInteger(port) || port < 1024 || port > 65535)
+    throw new Error('Invalid service port');
+  await exec('docker compose version >/dev/null');
+  if ((await exec('test -f ' + quote(base + '/service.env') + ' && echo legacy || true')).trim())
+    throw new Error(
+      '检测到旧的裸机开发部署。请先备份旧服务与原生历史，使用单独的 Compose 部署目录；旧进程和数据未改动。',
+    );
   const local = join(root, '.local');
   mkdirSync(local, { recursive: true });
   const archive = join(local, 'service.tar.gz');
   packageServer(root, archive);
-  await exec(`mkdir -p ${quote(base + '/app')} ${quote(base + '/state')} ${quote(base + '/logs')}`);
-  const certPath = `${base}/tls/server.crt`;
-  const keyPath = `${base}/tls/server.key`;
-  await exec(
-    `umask 077; mkdir -p ${quote(base + '/tls')}; if [ ! -f ${quote(certPath)} ]; then openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 365 -subj '/CN=cc-desk-tunnel.local' -addext 'subjectAltName=DNS:cc-desk-tunnel.local' -addext 'basicConstraints=critical,CA:TRUE' -keyout ${quote(keyPath)} -out ${quote(certPath)} >/dev/null 2>&1; fi`,
+  await exec('umask 077; mkdir -p ' + quote(app));
+  const sftp = await new Promise((ok, fail) =>
+    client.sftp((err, ch) => (err ? fail(err) : ok(ch))),
   );
+  const remoteArchive = base + '/service.tar.gz';
+  await new Promise((ok, fail) =>
+    sftp.fastPut(archive, remoteArchive, { mode: 0o600 }, (err) => (err ? fail(err) : ok())),
+  );
+  await exec('tar -xzf ' + quote(remoteArchive) + ' -C ' + quote(app));
+  const initialized = (
+    await exec('test -f ' + quote(app + '/.local/docker.env') + ' && echo yes || true')
+  ).trim();
+  if (!initialized) {
+    const args = ['init', '--data', data, '--host', config.host, '--control-port', String(port)];
+    if (config.token) args.push('--token', config.token);
+    await exec(manage + ' ' + args.map(quote).join(' '));
+  }
+  const provider = data + '/config/provider.json';
+  if (config.provider)
+    await exec('umask 077; cat > ' + quote(provider), JSON.stringify({ env: config.provider }));
+  else if (config.settingsPath)
+    await exec('cp -- ' + quote(config.settingsPath) + ' ' + quote(provider));
+  const settings = {
+    CLAUDE_MODEL: config.model,
+    CLAUDE_CONTEXT_RETENTION_DAYS: config.contextRetentionDays,
+  };
+  const lines = Object.entries(settings)
+    .filter(([, v]) => v != null)
+    .map(([k, v]) => {
+      if (!/^[a-zA-Z0-9_.:/-]+$/.test(String(v)))
+        throw new Error('Invalid model or retention setting');
+      return k + '=' + v;
+    });
+  if (lines.length)
+    await exec('cat >> ' + quote(data + '/config/service.env'), '\n' + lines.join('\n') + '\n');
+  await exec(manage + ' build');
+  await exec(manage + ' up');
+  const token = (
+    await exec('. ' + quote(data + '/config/service.env') + '; printf %s "$PROXY_TOKEN"')
+  ).trim();
   const fingerprint = (
-    await exec(`openssl x509 -in ${quote(certPath)} -noout -fingerprint -sha256`)
+    await exec(
+      'openssl x509 -in ' + quote(data + '/tls/control.crt') + ' -noout -fingerprint -sha256',
+    )
   )
     .trim()
     .split('=')
     .at(-1);
-  const sftp = await new Promise((resolve, reject) =>
-    client.sftp((error, channel) => (error ? reject(error) : resolve(channel))),
-  );
-  const upload = (local, remote) =>
-    new Promise((resolve, reject) =>
-      sftp.fastPut(local, remote, { mode: 0o600 }, (error) => (error ? reject(error) : resolve())),
-    );
-  await upload(archive, base + '/service.tar.gz');
-  const token = config.token ?? randomBytes(32).toString('base64url');
-  const port = config.servicePort ?? 8787;
-  if (!Number.isInteger(port) || port < 1 || port > 65535 || token.length < 24)
-    throw new Error('Invalid service port or token');
-  const settingsPath = config.settingsPath ?? `${base}/provider.json`;
-  const env = {
-    PROXY_TOKEN: token,
-    PROXY_PORT: String(port),
-    PROXY_HOST: '0.0.0.0',
-    PROXY_TLS_CERT: certPath,
-    PROXY_TLS_KEY: keyPath,
-    CLAUDE_CONTEXT_RETENTION_DAYS: String(config.contextRetentionDays ?? 3650),
-    PROXY_ADAPTER: 'claude-code',
-    PROXY_DATA_DIR: `${base}/state`,
-    CLAUDE_PATH: `${base}/runtime/cli/bin/claude`,
-    ...(config.model ? { CLAUDE_MODEL: config.model } : {}),
-    ...(config.provider || config.settingsPath ? { CLAUDE_SETTINGS_PATH: settingsPath } : {}),
-  };
-  const envFile = join(local, 'service.env');
-  writeFileSync(
-    envFile,
-    Object.entries(env)
-      .map(([key, value]) => `${key}=${JSON.stringify(value)}`)
-      .join('\n') + '\n',
-    { mode: 0o600 },
-  );
-  await upload(envFile, base + '/service.env');
-  if (config.provider) {
-    const providerFile = join(local, 'provider.local.json');
-    writeFileSync(providerFile, JSON.stringify({ env: config.provider }, null, 2), { mode: 0o600 });
-    await upload(providerFile, settingsPath);
-  }
-  console.log('Installing locked service dependencies...');
-  console.log(
-    await exec(
-      `tar -xzf ${quote(base + '/service.tar.gz')} -C ${quote(base + '/app')}; cd ${quote(base + '/app')}; export PATH=${quote(base + '/runtime/node/bin')}:$PATH; npm ci --omit=dev --workspace=@cc-desk-tunnel/server --workspace=@cc-desk-tunnel/protocol`,
-    ),
-  );
-  // Only stop the exact executable and script previously launched by this deployment. A small machine takes a few
-  // seconds to start the service; its health is asked for until then.
-  const script = `${base}/app/apps/server/src/main.ts`;
-  console.log(
-    await exec(
-      `pid_file=${quote(base + '/service.pid')}; if [ -f "$pid_file" ]; then pid="$(cat "$pid_file")"; if [ -r "/proc/$pid/cmdline" ] && tr '\\0' '\\n' < "/proc/$pid/cmdline" | grep -Fxq ${quote(script)}; then kill -TERM "$pid"; for i in $(seq 1 30); do kill -0 "$pid" 2>/dev/null || break; sleep 0.2; done; fi; fi; cd ${quote(base + '/app')}; nohup ${quote(base + '/runtime/node/bin/node')} --env-file=${quote(base + '/service.env')} ${quote(script)} </dev/null >${quote(base + '/logs/service.log')} 2>&1 & echo $! > "$pid_file"; for i in $(seq 1 30); do sleep 0.5; curl --cacert ${quote(certPath)} --resolve cc-desk-tunnel.local:${port}:127.0.0.1 -fsS https://cc-desk-tunnel.local:${port}/health 2>/dev/null && exit 0; done; curl --cacert ${quote(certPath)} --resolve cc-desk-tunnel.local:${port}:127.0.0.1 -fsS https://cc-desk-tunnel.local:${port}/health`,
-    ),
-  );
   writeFileSync(
     join(local, 'native-connection.json'),
-    JSON.stringify(
-      {
-        url: `wss://${config.host}:${port}/ws`,
-        fingerprint,
-        token,
-      },
-      null,
-      2,
-    ),
+    JSON.stringify({ url: `wss://${config.host}:${port}/ws`, fingerprint, token }, null, 2),
     { mode: 0o600 },
   );
   console.log(
-    'Native service deployed. Pinned WSS address and secret token saved in .local/native-connection.json.',
+    'Compose deployment is healthy. Connection details are in .local/native-connection.json.',
   );
   sftp.end();
 } finally {

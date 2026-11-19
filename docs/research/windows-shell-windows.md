@@ -1,5 +1,7 @@
 # Windows SSH 命令弹窗：根因与处理
 
+> 此文保留当时的设计和测试记录。0.4.0 的项目执行链路见[现行架构](../architecture.md)。
+
 2026-10-03 初查，2026-10-06 复核并落地。环境：Windows build 26200，随包 Win32-OpenSSH `10.0.0.0p2-Preview`，默认终端为 Windows Terminal。
 
 ## 结论

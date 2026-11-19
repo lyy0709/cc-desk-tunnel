@@ -1,5 +1,6 @@
+import { projectPrompt } from './project-tools.ts';
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
-import { delimiter, join } from 'node:path';
+import { join } from 'node:path';
 import { query, getSessionInfo } from '@anthropic-ai/claude-agent-sdk';
 import type {
   PermissionResult,
@@ -14,13 +15,17 @@ import type {
   PermissionMode,
   PlanExecutionMode,
 } from '@cc-desk-tunnel/protocol';
-import { deviceTerms } from './device-terms.ts';
-import type { Execution } from './device-terms.ts';
+import { mcpConnectionStatus } from '@cc-desk-tunnel/protocol';
 import { ClaudeStream } from './claude-stream.ts';
-import type { SshConnection } from './tunnel.ts';
 import { cacheTtl, cacheWrites } from './idle-compaction.ts';
 import { loginExpiryWarnings } from './login-expiry.ts';
-import { loginOf, nativeCapabilities, nativeMetrics, Quotas } from './native-controls.ts';
+import {
+  loginOf,
+  nativeCapabilities,
+  nativeMetrics,
+  optionalStatus,
+  Quotas,
+} from './native-controls.ts';
 import type { NativeInput } from './native-input.ts';
 import { readNativeSettings } from './native-settings.ts';
 import { questionTally } from './question.ts';
@@ -58,9 +63,6 @@ export type ClaudeRun = {
   sessionId: string;
   // The session whose Linux directory holds this session's native history; itself unless it is a fork.
   nativeRoot: string;
-  projectPath: string;
-  // How commands run on the device, as the session's prompt has it.
-  execution: Execution;
   permissionMode: PermissionMode;
   model?: string | null;
   effort?: Effort | null;
@@ -77,6 +79,7 @@ export type ClaudeRun = {
     waiting: 'approval' | 'question',
     toolName: string,
     signal: AbortSignal,
+    preview: ApprovalPreview,
   ) => Promise<{
     allowed: boolean;
     answers?: Record<string, string>;
@@ -84,7 +87,7 @@ export type ClaudeRun = {
     executionMode?: PlanExecutionMode;
   }>;
   // Absent only for a session owned by the service itself.
-  ssh?: SshConnection;
+  projectTools?: { type: 'stdio'; command: string; args: string[] };
   // Told when Claude has finished its turn and the run goes on only for background tasks, and when it resumes.
   waiting: (background: boolean) => void;
   // Told when a turn ends: the figures so far for the user message the turn answered. A turn that a background task
@@ -102,11 +105,13 @@ export type ClaudeRun = {
   // one of its background tasks.
   controls: {
     refresh?: (asked?: boolean) => Promise<void>;
+    refreshProject?: () => Promise<void>;
     stopTask?: (taskId: string) => Promise<void>;
     backgroundTask?: (toolId: string) => Promise<boolean>;
   };
 };
 export type Unanswered = 'skipped' | 'replied_in_chat';
+export type ApprovalPreview = { input: string; title?: string; description?: string };
 // User decisions are returned through the SDK's permission callback, including a plan's execution mode.
 export function toolPermission(
   name: string,
@@ -152,33 +157,6 @@ const RECEIPT_WAIT_MS = 30_000;
 const loginExpiry = loginExpiryWarnings();
 // The plan quota, held by login for every session and device; the service tells it which clients want it current.
 export const quotas = new Quotas();
-// The PATH of a session's CLI, with its own `ssh`, `scp` and `sftp` first (see `sessionSsh`).
-export function sshPath(
-  ssh: SshConnection | undefined,
-  path = process.env.PATH ?? '',
-): Record<string, string> {
-  return ssh?.bin ? { PATH: path ? `${ssh.bin}${delimiter}${path}` : ssh.bin } : {};
-}
-
-// `sessionId` is the proxy's name for the session, which a scheduled task needs to continue it.
-export function remotePrompt(projectPath: string, sessionId: string, execution: Execution) {
-  const terms = deviceTerms(execution, projectPath);
-  return [
-    "The user's projects are on their own computer, the device, NOT on this Linux host, which only runs Claude Code and has no copy of them.",
-    `Device: ${terms.name}. Project directory: ${JSON.stringify(projectPath)}.`,
-    "Do all project reads, edits, searches and commands on the device with your native Bash tool over SSH: here ssh, scp and sftp know the device by the host names below, and reach any other host as they otherwise would. Do not use this host's Read/Edit tools on project files, and do not read or copy the keys these hosts sign in with.",
-    terms.script,
-    terms.command,
-    'If the device is unreachable, say so; never fall back to this host. After an interruption report results as unknown; do not repeat side effects on your own.',
-    'To look at a picture on the device, such as a pasted screenshot or an attached image, copy that one file with scp to a temporary file on this host, open it with the Read tool, and delete the copy afterwards. That is the only use of Read on this host for a file from the device.',
-    'Commands may run concurrently. One that blocks holds the turn until its Bash timeout: size the timeout to the work, and run anything long-lived, such as a dev server or watcher, as a background Bash task. Do not count on a process outliving the ssh command that started it, nor on ending the command to stop it: keep the command running for as long as the process is needed, and stop the process itself on the device.',
-    `Scheduled and recurring prompts are sent by the desktop client, not by cron on this host: edit the UTF-8 JSON file whose path is in the device's CC_DESK_TUNNEL_SCHEDULES environment variable (its "说明" field documents the format; changes apply within seconds). Where that variable is empty the device is connected by ccdt, which sends none: say so instead of making a schedule elsewhere. This session's ID for a task that continues it: ${sessionId}.`,
-  ].join('\n');
-}
-
-// The Linux working directory of a session's project, which its sessions share as they would the project's own
-// folder: the CLI keys native history, auto memory and project settings by it. A fork stays in the directory of
-// the session it came from, which is where the CLI puts a fork's history.
 export function nativeDirectory(dataDir: string, root: string) {
   return join(dataDir, 'native', root);
 }
@@ -233,9 +211,31 @@ export async function runClaude(
   let exiting: ReturnType<typeof setTimeout> | undefined;
   let receiptWait: ReturnType<typeof setTimeout> | undefined;
   let settled = false;
+  let confirmProject: ((applied: boolean) => void) | undefined;
+  const projectReady =
+    run.projectTools &&
+    new Promise<boolean>((resolve) => {
+      confirmProject = resolve;
+    });
+  async function* projectInput() {
+    if ((await projectReady) && !run.signal.aborted) yield* run.input.stream();
+  }
+  type ProjectStatus = Extract<EventPayload, { type: 'native.project_mcp' }>['status'];
+  let lastProjectStatus: ProjectStatus | undefined;
+  const reportProject = (status: ProjectStatus) => {
+    if (!run.projectTools || run.signal.aborted || lastProjectStatus === status) return;
+    lastProjectStatus = status;
+    run.emit({ type: 'native.project_mcp', status });
+  };
+  const reportServers = (servers: { name: string; status: string }[]) => {
+    const project = servers.find((server) => server.name === 'project');
+    reportProject(
+      project ? (mcpConnectionStatus.safeParse(project.status).data ?? 'unknown') : 'missing',
+    );
+  };
   try {
     session = query({
-      prompt: run.input.stream(),
+      prompt: projectReady ? projectInput() : run.input.stream(),
       options: {
         cwd,
         pathToClaudeCodeExecutable: options.executable,
@@ -244,13 +244,17 @@ export async function runClaude(
         permissionMode: run.permissionMode,
         // The SDK takes the mode that asks about nothing only with this said as well.
         allowDangerouslySkipPermissions: run.permissionMode === 'bypassPermissions',
+        ...(run.projectTools && {
+          tools: ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'],
+          mcpServers: { project: run.projectTools },
+          mcpServersDelivery: 'initialize',
+          strictMcpConfig: true,
+        }),
         persistSession: true,
         systemPrompt: {
           type: 'preset',
           preset: 'claude_code',
-          ...(run.ssh
-            ? { append: remotePrompt(run.projectPath, run.sessionId, run.execution) }
-            : {}),
+          ...(run.projectTools && { append: projectPrompt }),
           snapshot: false,
         },
         ...(run.resume ? { resume: run.sessionId } : { sessionId: run.sessionId }),
@@ -259,8 +263,10 @@ export async function runClaude(
         // Newer models return no reasoning text unless a summary is asked for; headless runs ignore the
         // showThinkingSummaries setting, so this is the only switch. It follows that setting.
         extraArgs: thinkingShown() ? { 'thinking-display': 'summarized' } : {},
-        settings: options.settingsPath,
-        settingSources: ['user', 'project', 'local'],
+        settings: run.projectTools
+          ? { cleanupPeriodDays: options.contextRetentionDays ?? 3650 }
+          : options.settingsPath,
+        settingSources: run.projectTools ? ['user'] : ['user', 'project', 'local'],
         hooks: {
           UserPromptSubmit: [
             {
@@ -278,19 +284,24 @@ export async function runClaude(
         env: {
           ...process.env,
           ...options.environment,
-          ...sshPath(run.ssh),
+          CCDT_RUNTIME_SESSION: run.sessionId,
+          ...(run.projectTools && { CCDT_PROJECT_SOCKET: run.projectTools.args[1] }),
           ...(run.scheduled ? { CLAUDE_CODE_HOST_SCHEDULED_RUN: '1' } : {}),
         },
         stderr: (text) => {
           stderr = (stderr + text).slice(-8192);
         },
         canUseTool: async (name, input, context) => {
-          const tool = mapper.tool(name, input, context.toolUseID);
+          const tool = mapper.tool(name, context.toolUseID);
           const question = name === 'AskUserQuestion';
           const signal = AbortSignal.any([context.signal, run.signal]);
           const { allowed, answers, unanswered, executionMode } = signal.aborted
             ? { allowed: false }
-            : await run.approve(tool.id, question ? 'question' : 'approval', name, signal);
+            : await run.approve(tool.id, question ? 'question' : 'approval', name, signal, {
+                input: JSON.stringify(input, null, 2),
+                title: context.title?.slice(0, 512),
+                description: context.description?.slice(0, 2048),
+              });
           if (signal.aborted) {
             return { behavior: 'deny', message: 'The permission request was cancelled.' };
           }
@@ -322,8 +333,12 @@ export async function runClaude(
       },
     });
     const initialized = await session.initializationResult();
+    if (run.projectTools && initialized.mcp_servers_applied !== true) {
+      reportProject('not_applied');
+      throw new Error('原生进程未加载项目 MCP 配置，本次消息未发送。');
+    }
+    confirmProject?.(true);
     const login = loginOf(initialized.account);
-    quotas.identify(login);
     // The commands change while the run goes on: each turn's `init` names those bound to the CLI's terminal, and
     // skills found on the way bring a new list. A change is passed on once.
     let commands = initialized.commands;
@@ -348,6 +363,15 @@ export async function runClaude(
     let refresh: Promise<void> | undefined;
     let refreshedAt = 0;
     const running = session;
+    if (run.projectTools)
+      run.controls.refreshProject = async () => {
+        const before = lastProjectStatus;
+        const result = await optionalStatus(() => running.mcpServerStatus(), 5000);
+        if (lastProjectStatus !== before || run.signal.aborted || !run.controls.refreshProject)
+          return;
+        if (result.value) reportServers(result.value);
+        else run.emit({ type: 'native.notice', text: '本次未能读取项目 MCP 状态。' });
+      };
     run.controls.stopTask = (taskId) => running.stopTask(taskId);
     run.controls.backgroundTask = (toolId) => running.backgroundTasks(toolId);
     run.controls.refresh = async (asked) => {
@@ -385,10 +409,18 @@ export async function runClaude(
     for await (const message of session) {
       if (message.type === 'rate_limit_event') quotas.observe(login, message);
       if (message.type === 'system' && message.subtype === 'init') {
+        if (run.projectTools && Array.isArray(message.mcp_servers))
+          reportServers(message.mcp_servers);
         capabilities = message.capabilities ?? [];
         terminal = message.terminal_slash_commands ?? [];
         offer();
       }
+      if (
+        message.type === 'system' &&
+        message.subtype === 'informational' &&
+        message.tag === 'managed_mcp_arrived'
+      )
+        reportProject('policy');
       if (message.type === 'system' && message.subtype === 'commands_changed') {
         commands = message.commands;
         offer();
@@ -547,11 +579,13 @@ export async function runClaude(
     if (!settled)
       failure = error instanceof Error ? error : new Error('Native SDK process failed.');
   } finally {
+    confirmProject?.(false);
     clearTimeout(settle);
     clearTimeout(exiting);
     clearTimeout(receiptWait);
     run.input.onDrain = undefined;
     run.controls.refresh = undefined;
+    run.controls.refreshProject = undefined;
     run.controls.stopTask = undefined;
     run.controls.backgroundTask = undefined;
     run.input.close();
@@ -569,7 +603,7 @@ export async function runClaude(
         toolId: tool.id,
         status: 'unknown',
         output:
-          '运行结束；该工具最终执行结果未确认。已发出的 SSH 命令可能继续执行，副作用未撤销，不能自动重放。',
+          '运行结束；该工具最终执行结果未确认。已发出的本机命令可能继续执行，副作用未撤销，不能自动重放。',
         exitCode: null,
       });
     }
@@ -624,8 +658,13 @@ export async function readNativeStatus(
         ...(saved ? { resume: sessionId } : {}),
         abortController: controller,
         settings: options.settingsPath,
-        settingSources: ['user', 'project', 'local'],
-        env: { ...globalThis.process.env, ...options.environment },
+        settingSources: ['user'],
+        env: {
+          ...globalThis.process.env,
+          ...options.environment,
+          CCDT_RUNTIME_SESSION: sessionId,
+          ...(saved && { CLAUDE_CODE_DISABLE_DEFERRED_TOOL_RESUME: '1' }),
+        },
       },
     });
     // Keep draining while control requests are in flight; no model prompt is submitted.
@@ -636,7 +675,6 @@ export async function readNativeStatus(
     })().catch(() => {});
     const initialized = await process.initializationResult();
     const login = loginOf(initialized.account);
-    quotas.identify(login);
     return [
       nativeCapabilities(
         initialized.models,

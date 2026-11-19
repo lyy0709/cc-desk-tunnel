@@ -1,9 +1,6 @@
 // What to tell the user when a connection fails: what went wrong, in the first line, and what to check, in the
 // lines after it. The causes are told apart by what the operating system, the TLS layer and the components report.
 
-const securityHint =
-  '请查看杀毒软件 / Windows 安全中心的“保护历史记录”：核对文件来源后，可以还原被隔离的文件并只为它设置例外，再重新连接。详见项目主页的“杀毒软件与 SmartScreen”。';
-
 // Whether a failed connection is the kind that a later attempt may get past: the way to the service was not
 // there or broke. A certificate that is not the service's, or an address that is something else, is not.
 export function passing(error) {
@@ -74,48 +71,4 @@ export function controlFailure(error, target, proxy) {
   if (code === 'ECONNRESET' || code === 'EPIPE' || /socket hang up/.test(text))
     return `与 ${target} 的连接被中断。\n常见于该端口上不是本服务，或中间的网络设备切断了连接；请核对地址后重试。${via}`;
   return `无法连接 ${target}${code ? `（${code}）` : ''}。\n请检查服务地址和网络。${via}`;
-}
-
-// The Windows error codes with which the system, or security software through it, refuses to start a program.
-const blocked = new Set(['2', '5', '225', '1260', '4551']);
-
-// The execution channel did not get ready within `seconds`, although the service accepted the sign-in and the
-// local SSH service started. `error` is why the last channel connection to `target` could not be opened, if
-// that is what stood in the way; `proxy` the system proxy in use.
-export function channelFailure(seconds, error, target, proxy) {
-  const head = `执行通道在 ${seconds} 秒内没有就绪。`;
-  if (error)
-    return `${head}\n服务凭据已通过，但为执行通道再连接服务端时失败：${controlFailure(error, target, proxy).split('\n')[0]}\n执行通道与控制连接走同一个地址，每条 SSH 连接另占一条连接：请确认反向代理、系统代理或防火墙没有限制同一地址的并发连接数。`;
-  // What may keep the probe from an answer differs: on Windows the bundled programs that run it, elsewhere
-  // the user's own shell.
-  const check =
-    process.platform === 'win32'
-      ? '请检查安全软件是否拦截了内置的 sshd.exe 或 PowerShell，网络较慢时'
-      : '请重新连接；登录 shell 的启动脚本或网络较慢时';
-  return `${head}\n服务凭据已通过，本机的 SSH 服务也已启动，但服务端经执行通道发来的探测命令没有得到应答：${check}可在“设置 → 连接”里调大等待时间。`;
-}
-
-// The component host ended while the connection was wanted. `output` is what it and its components printed,
-// `early` whether this was while the connection was being set up.
-export function componentFailure(output, early) {
-  const refused = /cc-desk-tunnel: cannot start (\S+) error (\d+)/.exec(output);
-  if (refused) {
-    const [, name, code] = refused;
-    return blocked.has(code)
-      ? `${name} 被 Windows 或安全软件拦截，无法启动（系统错误 ${code}）。\n${securityHint}`
-      : `${name} 无法启动（系统错误 ${code}）。\n请重新安装本应用；仍然出现时检查安全软件的拦截记录。`;
-  }
-  const exited = /cc-desk-tunnel: (\S+) exited (\d+)/.exec(output);
-  const name = exited?.[1] ?? '';
-  const code = exited ? `（退出代码 ${exited[2]}）` : '';
-  if (/^sshd/i.test(name))
-    return `内置的 OpenSSH 服务（sshd.exe）已退出${code}。\n请重新连接；反复出现时检查安全软件是否拦截了它，或重新安装本应用。`;
-  return early
-    ? `本机的 SSH 服务没能启动。\n常见原因是内置的 PowerShell 或 OpenSSH 被安全软件拦截。${securityHint}`
-    : '本机的 SSH 服务已退出。\n请重新连接；反复出现时检查安全软件的保护记录。';
-}
-
-// A bundled program is not where it was installed, which is what a quarantine leaves behind.
-export function missingComponent(name) {
-  return `找不到随应用安装的 ${name}。\n它多半被杀毒软件或 Windows 安全中心隔离或删除了。${securityHint}\n没有隔离记录时请重新安装本应用。`;
 }

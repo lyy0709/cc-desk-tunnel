@@ -44,6 +44,36 @@ test('quota display watches per preference, refreshes on request and expires whi
           sessions: [session],
         });
       requests.push(message);
+      if (message.type === 'usage.summary' && message.profile === 'terminal')
+        send({
+          type: 'usage.summary',
+          requestId: message.requestId,
+          retentionDays: 35,
+          firstRecordAt: now,
+          measuredAt: now,
+          windows: [
+            {
+              name: 'seven_day',
+              startedAt: now,
+              resetsAt: new Date(Date.parse(now) + 86400000).toISOString(),
+              utilization: 5,
+              requests: 321,
+              inputTokens: 90,
+              outputTokens: 10,
+              cacheReadTokens: 0,
+              cacheCreationTokens: 0,
+              costUsd: 53.36,
+            },
+          ],
+        });
+      if (message.type === 'usage.summary' && !message.profile)
+        send({
+          type: 'usage.summary',
+          requestId: message.requestId,
+          retentionDays: 35,
+          firstRecordAt: null,
+          windows: [],
+        });
       send({ type: 'response', requestId: message.requestId, ok: true });
     });
   });
@@ -57,6 +87,14 @@ test('quota display watches per preference, refreshes on request and expires whi
   await page.getByRole('menuitem', { name: '设置', exact: true }).click();
   const sections = page.getByRole('navigation', { name: '设置分类' });
   await sections.getByRole('button', { name: '账号与额度', exact: true }).click();
+  await expect(page.getByRole('heading', { name: '订阅用量', exact: true })).toBeVisible();
+  await expect(page.getByText('5% 已用 · 95% 剩余')).toBeVisible();
+  await expect(page.getByRole('button', { name: /本周期 321 次请求/ })).toBeVisible();
+  await expect(page.getByRole('link', { name: /完整订阅用量/ })).toHaveAttribute(
+    'href',
+    'https://claude.ai/settings/usage',
+  );
+  await page.getByRole('button', { name: '模型服务', exact: true }).click();
   const watch = page.getByRole('switch', { name: '运行中每分钟读取一次额度', exact: true });
   await expect(watch).toBeChecked();
   expect(requests.some((message) => message.type === 'quota.watch' && message.active)).toBe(true);
@@ -87,6 +125,22 @@ test('quota display watches per preference, refreshes on request and expires whi
     },
   });
   await expect(page.getByText('37% 已用 · 63% 剩余')).toBeVisible();
+  publish({
+    type: 'session.event',
+    event: {
+      sessionId: session.id,
+      runId: randomUUID(),
+      sequence: 2,
+      createdAt: now,
+      payload: {
+        type: 'native.metrics',
+        profile: 'terminal',
+        context: null,
+        usage: null,
+        rateLimits: null,
+      },
+    },
+  });
   await expect(page.locator('.account-updated')).toContainText('更新于');
   await page.screenshot({ path: join(screenshots, 'quota-observed-light.png') });
   await page.emulateMedia({ colorScheme: 'dark' });

@@ -1,22 +1,13 @@
 param(
-  [Parameter(Mandatory)][string]$Runtime,
-  [Parameter(Mandatory)][string]$OpenSshDirectory,
+  [string]$Bash,
   [Parameter(Mandatory)][int]$OwnerProcessId
 )
 $ErrorActionPreference = 'Stop'
-$Runtime = [IO.Path]::GetFullPath($Runtime)
-if ([IO.Path]::GetDirectoryName($Runtime) -ne [IO.Path]::GetTempPath().TrimEnd('\') -or
-    [IO.Path]::GetFileName($Runtime) -notlike 'cc-desk-tunnel-ssh-*') {
-  throw 'Component runtime must be a client-allocated temporary directory.'
-}
 Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
-using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
-using System.Threading.Tasks;
 
 public static class ComponentHost {
   const uint JobKillOnClose = 0x2000;
@@ -24,7 +15,6 @@ public static class ComponentHost {
   const uint CreateNoWindow = 0x08000000;
   const uint Synchronize = 0x100000;
   const uint Infinite = uint.MaxValue;
-  const uint WaitTimeout = 258;
   const int StartUseStdHandles = 0x100;
   [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)]
   struct StartupInfo {
@@ -67,16 +57,15 @@ public static class ComponentHost {
   [DllImport("kernel32.dll", SetLastError=true)] static extern bool GetExitCodeProcess(IntPtr process, out uint code);
   [DllImport("kernel32.dll", SetLastError=true)] static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
   [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
+  [DllImport("kernel32.dll", SetLastError=true)]
+  static extern uint WaitForMultipleObjects(uint count, IntPtr[] handles, bool waitAll, uint milliseconds);
   [DllImport("kernel32.dll")] static extern IntPtr GetStdHandle(int kind);
   [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr handle);
 
-  public static int Run(string[] executables, string[] arguments, int ownerPid, string stopPath) {
+  public static int Run(string executable, string arguments, int ownerPid) {
     var job = CreateJobObject(IntPtr.Zero,null);
     if(job == IntPtr.Zero) throw new Win32Exception();
-    var processes = new IntPtr[executables.Length];
-    IntPtr owner = IntPtr.Zero;
-    var stopping = new CancellationTokenSource();
-    Task watcher = null;
+    IntPtr owner = IntPtr.Zero, child = IntPtr.Zero;
     try {
       var limits = new ExtendedLimit { basic = new BasicLimit { flags = JobKillOnClose } };
       var size = Marshal.SizeOf<ExtendedLimit>();
@@ -87,84 +76,49 @@ public static class ComponentHost {
       } finally { Marshal.FreeHGlobal(memory); }
       owner = OpenProcess(Synchronize,false,ownerPid);
       if(owner == IntPtr.Zero) throw new Win32Exception();
-      var waits = new Task[executables.Length + 1];
-      var ownerHandle = owner;
-      watcher = waits[executables.Length] = Task.Run(() => {
-        while(!stopping.IsCancellationRequested && !File.Exists(stopPath)) {
-          var state = WaitForSingleObject(ownerHandle,250);
-          if(state == 0) return;
-          if(state != WaitTimeout) throw new Win32Exception();
-        }
-      });
-      for(int index=0; index<executables.Length; index++) {
-        var startup = new StartupInfo {
-          cb=Marshal.SizeOf<StartupInfo>(), flags=StartUseStdHandles,
-          input=GetStdHandle(-10),output=GetStdHandle(-11),error=GetStdHandle(-12)
-        };
-        ProcessInfo info;
-        var command = new StringBuilder("\""+executables[index]+"\" "+arguments[index]);
-        // Assign while suspended so no component child can escape the owner's job.
-        if(!CreateProcess(executables[index],command,IntPtr.Zero,IntPtr.Zero,true,CreateNoWindow | CreateSuspended,
-          IntPtr.Zero,null,ref startup,out info)) {
-          var refused = new Win32Exception();
-          // Read by the client to tell the user which component the system would not start, and why.
-          Console.Error.WriteLine("cc-desk-tunnel: cannot start "+Path.GetFileName(executables[index])+" error "+refused.NativeErrorCode);
-          throw refused;
-        }
-        processes[index] = info.process;
-        try {
-          if(!AssignProcessToJobObject(job,info.process)) {
-            var error = new Win32Exception();
-            TerminateProcess(info.process,1);
-            throw error;
-          }
-          if(ResumeThread(info.thread) == uint.MaxValue) throw new Win32Exception();
-        } finally { CloseHandle(info.thread); }
-        var handle = info.process;
-        waits[index] = Task.Run(() => {
-          if(WaitForSingleObject(handle,Infinite) != 0) throw new Win32Exception();
-        });
+      var startup = new StartupInfo {
+        cb=Marshal.SizeOf<StartupInfo>(), flags=StartUseStdHandles,
+        input=GetStdHandle(-10),output=GetStdHandle(-11),error=GetStdHandle(-12)
+      };
+      ProcessInfo info;
+      var command = new StringBuilder("\""+executable+"\" "+arguments);
+      // Assign while suspended so no component child can escape the owner's job.
+      if(!CreateProcess(executable,command,IntPtr.Zero,IntPtr.Zero,true,CreateNoWindow | CreateSuspended,
+        IntPtr.Zero,null,ref startup,out info)) {
+        var refused = new Win32Exception();
+        // Read by the client to tell the user which component the system would not start, and why.
+        Console.Error.WriteLine("cc-desk-tunnel: cannot start "+System.IO.Path.GetFileName(executable)+" error "+refused.NativeErrorCode);
+        throw refused;
       }
-      var completed = Task.WaitAny(waits);
-      waits[completed].GetAwaiter().GetResult();
-      if(completed >= executables.Length) return 0;
+      child = info.process;
+      try {
+        if(!AssignProcessToJobObject(job,info.process)) {
+          var error = new Win32Exception();
+          TerminateProcess(info.process,1);
+          throw error;
+        }
+        if(ResumeThread(info.thread) == uint.MaxValue) throw new Win32Exception();
+      } finally { CloseHandle(info.thread); }
+      var completed = WaitForMultipleObjects(2, new IntPtr[] { child, owner }, false, Infinite);
+      if(completed == 1) return 0;
+      if(completed != 0) throw new Win32Exception();
       uint code;
-      if(!GetExitCodeProcess(processes[completed],out code)) throw new Win32Exception();
-      Console.Error.WriteLine("cc-desk-tunnel: "+Path.GetFileName(executables[completed])+" exited "+code);
-      return code == 0 ? 1 : (int)code;
+      if(!GetExitCodeProcess(child,out code)) throw new Win32Exception();
+      return (int)code;
     } finally {
       CloseHandle(job);
-      stopping.Cancel();
-      if(watcher != null) watcher.GetAwaiter().GetResult();
-      stopping.Dispose();
       if(owner != IntPtr.Zero) CloseHandle(owner);
-      foreach(var handle in processes) {
-        if(handle == IntPtr.Zero) continue;
-        WaitForSingleObject(handle,5000);
-        CloseHandle(handle);
+      if(child != IntPtr.Zero) {
+        WaitForSingleObject(child,5000);
+        CloseHandle(child);
       }
     }
   }
 }
 '@
-$executables = @((Join-Path $OpenSshDirectory 'sshd.exe'))
-$arguments = @("-D -e -f `"$(Join-Path $Runtime 'sshd_config')`"")
-# sshd detaches its session process, so each command's cmd.exe would open a visible console on the user's desktop.
-# This OpenSSH switch makes sshd create its children with CREATE_NO_WINDOW; it is set for this host's children only.
-$env:SSH_TEST_ENVIRONMENT = '1'
-# The service has Claude run PowerShell by this variable, which every command of the SSH service inherits: the
-# one this host runs in, whichever others the computer has installed. The path of a command is not inherited;
-# the SSH service makes it anew from the computer's settings.
-$env:CC_DESK_TUNNEL_PWSH = [Environment]::ProcessPath
-# OpenSSH hands the state of its descriptors to its own children in this variable. Started from inside an SSH
-# session (a command Claude runs on this computer, such as the project's own tests), sshd would take the outer
-# session's state for its own and never answer a connection once its error output is a pipe.
-Get-ChildItem Env: | Where-Object Name -Like '*_POSIX_FD_STATE' | ForEach-Object { Remove-Item -LiteralPath "Env:$($_.Name)" }
-$code = 1
-try {
-  $code = [ComponentHost]::Run($executables, $arguments, $OwnerProcessId, (Join-Path $Runtime 'stop'))
-} finally {
-  # Runtime is allocated by the client, not supplied by a remote message.
-  Remove-Item -LiteralPath $Runtime -Recurse -Force
+if ($Bash) {
+  exit [ComponentHost]::Run($Bash, '-s', $OwnerProcessId)
 }
-exit $code
+$program = '[Console]::InputEncoding=[Text.UTF8Encoding]::new($false); [Console]::OutputEncoding=[Console]::InputEncoding; $s=[Console]::In.ReadToEnd(); $global:LASTEXITCODE=$null; & ([scriptblock]::Create($s)); $ok=$?; if ($null -ne $LASTEXITCODE) { exit $LASTEXITCODE }; exit [int](-not $ok)'
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($program))
+exit [ComponentHost]::Run([Environment]::ProcessPath, "-NoLogo -NoProfile -NonInteractive -EncodedCommand $encoded", $OwnerProcessId)

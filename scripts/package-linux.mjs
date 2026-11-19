@@ -1,14 +1,12 @@
+import { buildProjectFiles } from './build-project-files.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build as electronBuild, Platform, Arch } from 'electron-builder';
-import { posixService, stageDesktop } from './package-desktop.mjs';
+import { stageDesktop } from './package-desktop.mjs';
 
-// Builds the Linux package: a .deb for x64, made for and tried on the current Ubuntu LTS. Like the macOS
-// package it carries no OpenSSH or shell of its own: the SSH service runs inside the program, with the
-// user's shell and the system's sftp-server, which the package asks for. It cannot upgrade itself.
 const root = fileURLToPath(new URL('..', import.meta.url));
 const args = process.argv.slice(2);
 if (args.some((arg) => arg !== '--dir')) throw new Error('Usage: npm run package:linux -- [--dir]');
@@ -20,7 +18,6 @@ const output = join(root, 'artifacts/linux');
 const program = join(output, 'linux-unpacked/cc-desk-tunnel');
 await stageDesktop(root, app, {
   description: 'Linux client for a native remote Claude Code session',
-  ...posixService,
 });
 const electron = JSON.parse(readFileSync(join(root, 'node_modules/electron/package.json'), 'utf8'));
 const results = await electronBuild({
@@ -34,6 +31,10 @@ const results = await electronBuild({
     directories: { app, output },
     npmRebuild: false,
     asar: true,
+    extraResources: [
+      { from: join(app, 'licenses'), to: 'licenses' },
+      { from: buildProjectFiles(join(app, '../helper')), to: 'project-files' },
+    ],
     files: ['package.json', 'electron/**', 'dist/**', 'node_modules/**'],
     linux: {
       target: 'deb',
@@ -44,8 +45,6 @@ const results = await electronBuild({
       artifactName: 'CC-Desk-Tunnel-${version}-linux-${arch}.${ext}',
     },
     deb: {
-      // What Electron needs, as electron-builder lists it by default, and the SFTP server, which comes
-      // without the SSH daemon and starts no service.
       depends: [
         'libgtk-3-0',
         'libnotify4',
@@ -56,8 +55,6 @@ const results = await electronBuild({
         'libatspi2.0-0',
         'libuuid1',
         'libsecret-1-0',
-        'openssh-client',
-        'openssh-sftp-server',
       ],
       // The interface is in Chinese, which a system set up in another language may have no font for.
       recommends: ['fonts-noto-cjk'],

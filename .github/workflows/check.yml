@@ -21,8 +21,7 @@ jobs:
         with:
           node-version: 24
           cache: npm
-      # The tests of the SSH service of macOS and Linux write their fixtures for zsh; the desktop client opens ccdt in
-      # a terminal window, here xterm on a screen of xvfb's.
+      # The CLI terminal-window test uses xterm under xvfb; shell tests use zsh.
       - run: sudo apt-get update && sudo apt-get install -y --no-install-recommends zsh xterm xvfb
       - run: npm ci
       - run: npm run check
@@ -62,9 +61,7 @@ jobs:
         env:
           DOCKER_BUILDKIT: '0'
       - run: sudo bash deploy/test.sh
-  # The parts of the client that only run on Windows. Without the bundled OpenSSH and PowerShell the tests that
-  # need them skip themselves; this job is here to learn what a hosted Windows machine can run, and does not
-  # hold a change back yet.
+  # Windows-specific project access and command lifecycle tests.
   windows:
     runs-on: windows-2022
     timeout-minutes: 25
@@ -78,7 +75,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm test
-  # The SSH service of the macOS client, with the system's own ssh, scp and sftp-server.
+  # Exercise the macOS client and its local project tools.
   macos:
     runs-on: macos-15
     timeout-minutes: 20

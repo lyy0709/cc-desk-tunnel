@@ -1,6 +1,9 @@
+import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { DatabaseSync } from 'node:sqlite';
-import type { ServerMessage } from '@cc-desk-tunnel/protocol';
+import { USAGE_SLICE_MINUTES, type Command, type ServerMessage } from '@cc-desk-tunnel/protocol';
+import { subscriptionScope } from './native-account.ts';
+import { DomainError } from './errors.ts';
 
 type Summary = Omit<Extract<ServerMessage, { type: 'usage.summary' }>, 'type' | 'requestId'>;
 type Page = Omit<Extract<ServerMessage, { type: 'usage.page' }>, 'type' | 'requestId'>;
@@ -8,17 +11,30 @@ type RateLimits = {
   windows: { name: string; utilization: number | null; resetsAt: string | null }[];
   measuredAt?: string | null;
 };
-export type UsageQuery = {
-  from?: string;
-  to?: string;
-  model?: string;
-  beforeId?: number;
-  offset?: number;
-  limit: number;
-  bucketMinutes: number;
-  offsetMinutes: number;
-};
+export type UsageQuery = Omit<Extract<Command, { type: 'usage.query' }>, 'type' | 'requestId'>;
 
+function usageBounds(range: UsageQuery['range'], now: number): [number, number] {
+  if (range === 'today') return [new Date(now).setHours(0, 0, 0, 0), now];
+  if (typeof range === 'string')
+    return [now - { '24h': 1, '7d': 7, '30d': 30 }[range] * 86_400_000, now];
+  if ('from' in range) return [Date.parse(range.from), range.to ? Date.parse(range.to) : now];
+  const bounds = [range.serverFrom, range.serverTo].map((wall) => {
+    const date = new Date(wall);
+    // A DST jump can skip the time entered in the proxy's calendar.
+    if (
+      new Date(date.getTime() - date.getTimezoneOffset() * 60_000).toISOString().slice(0, 16) !==
+      wall
+    )
+      throw new DomainError('invalid_range', '所选时间在代理时区内不存在。');
+    return date.getTime();
+  });
+  if (bounds[0] >= bounds[1]) throw new DomainError('invalid_range', '结束时间须晚于开始时间。');
+  return [bounds[0], bounds[1]];
+}
+
+const windowTable = `CREATE TABLE IF NOT EXISTS usage_windows (
+  name TEXT NOT NULL, started_at INTEGER NOT NULL, resets_at INTEGER, utilization REAL, observed_at INTEGER NOT NULL,
+  scope TEXT NOT NULL DEFAULT 'sdk', PRIMARY KEY(scope,name))`;
 const windowLength: Record<string, number> = { five_hour: 5 * 3600_000 };
 const lengthOf = (name: string) =>
   windowLength[name] ?? (name.startsWith('seven_day') ? 7 * 24 * 3600_000 : undefined);
@@ -61,18 +77,54 @@ export class UsageLog {
         id INTEGER PRIMARY KEY, at INTEGER NOT NULL, session_id TEXT, model TEXT NOT NULL,
         input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
         cache_read_tokens INTEGER NOT NULL, cache_creation_tokens INTEGER NOT NULL,
-        cost_usd REAL NOT NULL, duration_ms INTEGER NOT NULL, ttft_ms INTEGER, source TEXT, request_id TEXT UNIQUE
+        cost_usd REAL NOT NULL, duration_ms INTEGER NOT NULL, ttft_ms INTEGER, source TEXT, request_id TEXT UNIQUE, profile TEXT
       );
       CREATE INDEX IF NOT EXISTS api_requests_at ON api_requests(at);
-      CREATE TABLE IF NOT EXISTS usage_windows (
-        name TEXT PRIMARY KEY, started_at INTEGER NOT NULL, resets_at INTEGER, utilization REAL, observed_at INTEGER NOT NULL
-      );
+      ${windowTable};
       CREATE TABLE IF NOT EXISTS migrations (name TEXT PRIMARY KEY);
     `);
     // The prompt a request belongs to, which is how one turn's requests, subagents included, are told apart.
     const columns = database.prepare('PRAGMA table_info(api_requests)').all() as { name: string }[];
     if (!columns.some((column) => column.name === 'prompt_id'))
       database.exec('ALTER TABLE api_requests ADD COLUMN prompt_id TEXT');
+    const mixed = !columns.some((column) => column.name === 'profile');
+    const scoped = database
+      .prepare('PRAGMA table_info(usage_windows)')
+      .all()
+      .some((column) => column.name === 'scope');
+    if (mixed || !scoped) {
+      // Old quota windows and readings can contain both accounts. Keep call records and conversation history.
+      database.exec('BEGIN IMMEDIATE');
+      try {
+        if (mixed)
+          database.exec(
+            'ALTER TABLE api_requests ADD COLUMN profile TEXT; DELETE FROM usage_windows',
+          );
+        if (!scoped)
+          database.exec(`ALTER TABLE usage_windows RENAME TO unscoped_windows;
+          ${windowTable};
+          INSERT INTO usage_windows(name,started_at,resets_at,utilization,observed_at)
+          SELECT name,started_at,resets_at,utilization,observed_at FROM unscoped_windows;
+          DROP TABLE unscoped_windows`);
+        if (
+          mixed &&
+          database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get()
+        ) {
+          const { changes } = database
+            .prepare(
+              `UPDATE events SET data=json_set(data,'$.payload.rateLimits',NULL)
+            WHERE json_extract(data,'$.payload.type')='native.metrics' AND json_type(data,'$.payload.rateLimits')='object'`,
+            )
+            .run();
+          if (changes)
+            database.prepare("UPDATE history_meta SET value=? WHERE key='id'").run(randomUUID());
+        }
+        database.exec('COMMIT');
+      } catch (error) {
+        database.exec('ROLLBACK');
+        throw error;
+      }
+    }
     database.exec('CREATE INDEX IF NOT EXISTS api_requests_prompt ON api_requests(prompt_id)');
     database.exec('CREATE INDEX IF NOT EXISTS api_requests_session ON api_requests(session_id)');
     this.restoreStarts();
@@ -84,7 +136,9 @@ export class UsageLog {
     if (this.database.prepare("SELECT 1 FROM migrations WHERE name = 'usage-window-start'").get())
       return;
     const windows = (
-      this.database.prepare('SELECT name, started_at, resets_at FROM usage_windows').all() as {
+      this.database
+        .prepare("SELECT name, started_at, resets_at FROM usage_windows WHERE scope='sdk'")
+        .all() as {
         name: string;
         started_at: number;
         resets_at: number | null;
@@ -104,7 +158,7 @@ export class UsageLog {
       const resets = windows.length ? this.earlyResets(windows, now) : new Map<string, number>();
       for (const window of windows)
         this.database
-          .prepare('UPDATE usage_windows SET started_at = ? WHERE name = ?')
+          .prepare("UPDATE usage_windows SET started_at = ? WHERE scope='sdk' AND name = ?")
           .run(
             Math.min(window.started_at, Math.max(window.expected, resets.get(window.name) ?? 0)),
             window.name,
@@ -165,10 +219,10 @@ export class UsageLog {
     return resets;
   }
   // Accepts one OTLP/HTTP JSON log export and keeps only the model request records.
-  ingest(body: unknown) {
+  ingest(body: unknown, profile: 'sdk' | 'terminal' = 'sdk') {
     const insert = this.database.prepare(`INSERT OR IGNORE INTO api_requests
-      (at, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, duration_ms, ttft_ms, source, request_id, prompt_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      (at, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, duration_ms, ttft_ms, source, request_id, prompt_id, profile)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     let stored = 0;
     for (const resource of asArray((body as { resourceLogs?: unknown })?.resourceLogs))
       for (const scope of asArray(resource?.scopeLogs))
@@ -210,21 +264,32 @@ export class UsageLog {
               text('query_source'),
               text('request_id'),
               text('prompt.id'),
+              profile === 'terminal'
+                ? (subscriptionScope(text('user.email'), text('organization.id')) ?? 'terminal')
+                : profile,
             ).changes,
           );
         }
     return stored;
   }
+  terminalScopeAt(session: string, since: number, until: number) {
+    return this.database
+      .prepare(
+        `SELECT profile FROM api_requests WHERE session_id=? AND at BETWEEN ? AND ?
+      AND (profile='terminal' OR profile GLOB 'terminal:*') ORDER BY at DESC, id DESC LIMIT 1`,
+      )
+      .get(session, since, until)?.profile;
+  }
   // Statistics follow the official quota periods. A period ends when the reported reset time moves or the utilization
   // falls by more than the jitter between readings, which also covers resets granted outside the normal schedule.
-  observe(rateLimits: RateLimits, now = Date.now()) {
+  observe(rateLimits: RateLimits, now = Date.now(), scope = 'sdk') {
     const measuredAt = (rateLimits.measuredAt && Date.parse(rateLimits.measuredAt)) || now;
     for (const window of rateLimits.windows) {
       const previous = this.database
         .prepare(
-          'SELECT started_at, resets_at, utilization, observed_at FROM usage_windows WHERE name = ?',
+          'SELECT started_at, resets_at, utilization, observed_at FROM usage_windows WHERE name = ? AND scope = ?',
         )
-        .get(window.name) as
+        .get(window.name, scope) as
         | {
             started_at: number;
             resets_at: number | null;
@@ -254,33 +319,41 @@ export class UsageLog {
       // stays, so that the next period is recognised by its new reset time however little had been used.
       this.database
         .prepare(
-          `INSERT INTO usage_windows (name, started_at, resets_at, utilization, observed_at) VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(name) DO UPDATE SET started_at = excluded.started_at, resets_at = excluded.resets_at,
+          `INSERT INTO usage_windows (name, started_at, resets_at, utilization, observed_at, scope) VALUES (?, ?, ?, ?, ?, ?)
+        ON CONFLICT(scope,name) DO UPDATE SET started_at = excluded.started_at, resets_at = excluded.resets_at,
           utilization = excluded.utilization, observed_at = excluded.observed_at`,
         )
         .run(
           window.name,
           startedAt,
-          resetsAt ?? previous?.resets_at ?? null,
+          scope === 'sdk' ? (resetsAt ?? previous?.resets_at ?? null) : resetsAt,
           window.utilization,
           measuredAt,
+          scope,
         );
     }
   }
-  summary(now = Date.now()): Summary {
+  summary(now = Date.now(), scope: string | null = 'sdk'): Summary {
     const windows = this.database
-      .prepare('SELECT name, started_at, resets_at, utilization FROM usage_windows ORDER BY rowid')
-      .all() as {
+      .prepare(
+        `SELECT name, started_at, resets_at, utilization, observed_at FROM usage_windows WHERE scope=?
+        AND (scope='sdk' OR resets_at>? OR (resets_at IS NULL AND observed_at>?)) ORDER BY rowid`,
+      )
+      .all(scope, now, now - 3600_000) as {
       name: string;
       started_at: number;
       resets_at: number | null;
       utilization: number | null;
+      observed_at: number;
     }[];
     const first = this.database.prepare('SELECT MIN(at) AS at FROM api_requests').get() as {
       at: number | null;
     };
     return {
       retentionDays: this.retentionDays,
+      ...(windows.length && {
+        measuredAt: new Date(Math.max(...windows.map((w) => w.observed_at))).toISOString(),
+      }),
       firstRecordAt: first.at ? new Date(first.at).toISOString() : null,
       windows: windows.map((window) => {
         // Past the reset time nothing has been reported yet for the next period; only later requests can belong to it.
@@ -292,8 +365,8 @@ export class UsageLog {
           resetsAt: window.resets_at && !expired ? new Date(window.resets_at).toISOString() : null,
           utilization: expired ? null : window.utilization,
           ...(this.database
-            .prepare(`SELECT ${totals} FROM api_requests WHERE at >= ?`)
-            .get(startedAt) as Omit<
+            .prepare(`SELECT ${totals} FROM api_requests WHERE profile = ? AND at >= ?`)
+            .get(scope, startedAt) as Omit<
             Summary['windows'][number],
             'name' | 'startedAt' | 'resetsAt' | 'utilization'
           >),
@@ -301,14 +374,21 @@ export class UsageLog {
       }),
     };
   }
-  query(query: UsageQuery, title: (sessionId: string) => string | null): Page {
+  query(
+    query: UsageQuery,
+    title: (sessionId: string) => string | null,
+    now = Date.now(),
+    terminalScope: string | null = null,
+  ): Page {
     const conditions = ['at >= ?', 'at < ?'];
-    const range: (string | number)[] = [
-      query.from ? Date.parse(query.from) : 0,
-      query.to ? Date.parse(query.to) : Number.MAX_SAFE_INTEGER,
-    ];
+    const range = usageBounds(query.range, now);
+    const scoped: (number | string | null)[] = [...range];
+    if (query.profile) {
+      conditions.push('profile = ?');
+      scoped.push(query.profile === 'sdk' ? 'sdk' : terminalScope);
+    }
     const filtered = [...conditions, ...(query.model ? ['model = ?'] : [])].join(' AND ');
-    const values = [...range, ...(query.model ? [query.model] : [])];
+    const values = [...scoped, ...(query.model ? [query.model] : [])];
     const rows = this.database
       .prepare(
         `SELECT id, at, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens,
@@ -327,17 +407,16 @@ export class UsageLog {
       FROM api_requests WHERE ${filtered}`,
       )
       .get(...values) as Record<string, number | null>;
-    const bucket = query.bucketMinutes * 60_000,
-      offset = query.offsetMinutes * 60_000;
+    const bucket = USAGE_SLICE_MINUTES * 60_000;
     const series = this.database
       .prepare(
-        `SELECT CAST((at + ?) / ? AS INTEGER) AS bucket, COUNT(*) AS requests, SUM(cost_usd) AS costUsd,
+        `SELECT CAST(at / ? AS INTEGER) AS bucket, COUNT(*) AS requests, SUM(cost_usd) AS costUsd,
         SUM(input_tokens + output_tokens + cache_read_tokens + cache_creation_tokens) AS tokens,
         SUM(input_tokens) AS inputTokens, SUM(output_tokens) AS outputTokens,
         SUM(cache_read_tokens) AS cacheReadTokens, SUM(cache_creation_tokens) AS cacheCreationTokens
       FROM api_requests WHERE ${filtered} GROUP BY bucket ORDER BY bucket`,
       )
-      .all(offset, bucket, ...values) as ({
+      .all(bucket, ...values) as ({
       bucket: number;
       tokens: number;
     } & Page['series'][number])[];
@@ -347,9 +426,12 @@ export class UsageLog {
         `SELECT model, ${totals} FROM api_requests WHERE ${conditions.join(' AND ')}
         GROUP BY model ORDER BY costUsd DESC, requests DESC, model`,
       )
-      .all(...range) as Page['byModel'];
+      .all(...scoped) as Page['byModel'];
     const { streamedTokens, streamedMs, ...sums } = total;
     return {
+      from: new Date(range[0]).toISOString(),
+      to: new Date(range[1]).toISOString(),
+      timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       rows: rows.slice(0, query.limit).map((row) => ({
         id: row.id as number,
         at: new Date(row.at as number).toISOString(),
@@ -375,7 +457,7 @@ export class UsageLog {
       byModel,
       series: series.map(({ bucket: index, ...item }) => ({
         ...item,
-        at: new Date(index * bucket - offset).toISOString(),
+        at: new Date(index * bucket).toISOString(),
       })),
     };
   }
@@ -455,7 +537,8 @@ function asArray(value: unknown): any[] {
 // Loopback only: the CLI processes on this host are the only senders.
 export function createUsageReceiver(log: UsageLog) {
   const server = createServer((request, response) => {
-    if (request.method !== 'POST' || request.url !== '/v1/logs') {
+    const terminal = request.url === '/terminal/v1/logs';
+    if (request.method !== 'POST' || (!terminal && request.url !== '/v1/logs')) {
       response.writeHead(404).end();
       return;
     }
@@ -468,7 +551,10 @@ export function createUsageReceiver(log: UsageLog) {
     });
     request.on('end', () => {
       try {
-        log.ingest(JSON.parse(Buffer.concat(chunks).toString('utf8')));
+        log.ingest(
+          JSON.parse(Buffer.concat(chunks).toString('utf8')),
+          terminal ? 'terminal' : 'sdk',
+        );
         response.writeHead(200, { 'Content-Type': 'application/json' }).end('{}');
       } catch {
         response.writeHead(400).end();

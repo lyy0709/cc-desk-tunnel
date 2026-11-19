@@ -92,7 +92,6 @@ import TitleBar from './TitleBar.tsx';
 import type { BarMenu } from './TitleBar.tsx';
 import IdleReminder from './IdleReminder.tsx';
 import { CcdtDialog } from './CcdtDialog.tsx';
-import { SetupTokenDialog } from './SetupTokenDialog.tsx';
 import { IconButton, Menu } from './ui.tsx';
 import type { MenuItem, MenuPosition } from './ui.tsx';
 
@@ -337,6 +336,14 @@ export function App({
   }, [unplaced]);
   const onThis = (session: Session) => !browser && isHere(session, state.device, absent);
   const localProject = window.desktop && selected && onThis(selected) ? selected.projectPath : null;
+  useEffect(() => {
+    if (selected?.id && window.desktop?.revokeSessionCommands) {
+      const id = selected.id;
+      return () => {
+        void window.desktop?.revokeSessionCommands(id);
+      };
+    }
+  }, [selected?.id]);
   const [existingProject, setExistingProject] = useState<string | null>(null);
   useEffect(() => {
     setChangesProject(null);
@@ -548,7 +555,12 @@ export function App({
       detail: metrics?.context ? `已使用 ${metrics.context.percentage}%` : '/compact',
       reason: controlReason || (!canCompact ? '当前没有可压缩的原生上下文' : ''),
     },
-    { name: 'refresh', title: '刷新原生状态', detail: '上下文与订阅额度', reason: controlReason },
+    {
+      name: 'refresh',
+      title: '刷新原生状态',
+      detail: '上下文与模型服务额度',
+      reason: controlReason,
+    },
   ];
   const composition = selected ? (drafts[selected.id] ?? emptyDraft) : emptyDraft;
   const draft = composition.text;
@@ -824,7 +836,17 @@ export function App({
     void refreshStatus(selected.id);
   }, [nativeMode, selected?.id, connected, history?.loading, selected?.activeRun, anyChat]);
   useEffect(() => {
-    if (nativeMode && connected) void client.request({ type: 'account.status' }).catch(() => {});
+    if (!nativeMode || !connected) return;
+    const read = () =>
+      void client.request({ type: 'account.status' }).catch((error) => {
+        if (accountOpen)
+          setError(error instanceof Error ? error.message : '无法读取官方认证状态。');
+      });
+    read();
+    if (accountOpen) {
+      window.addEventListener('focus', read);
+      return () => window.removeEventListener('focus', read);
+    }
   }, [nativeMode, connected, accountOpen]);
   // The browser has no local sessions; before it opens a conversation it shows the quota the service holds, as the
   // desktop account page does. Only the refresh button forces a new reading.
@@ -1041,14 +1063,18 @@ export function App({
     visit({ page, section, sessionId: client.state.selectedId });
   };
   // The session in ccdt, signed in as this window is; the window says how to install ccdt where it is missing.
-  async function openInCcdt(session: Session) {
+  async function openInCcdt(session?: Session) {
     await act(async () => {
       const opened = await window.desktop!.openInCcdt({
         url: form.url,
         fingerprint: form.fingerprint,
         token: form.token,
-        sessionId: session.id,
-        projectPath: onThis(session) ? session.projectPath : undefined,
+        ...(session
+          ? {
+              sessionId: session.id,
+              projectPath: onThis(session) ? session.projectPath : undefined,
+            }
+          : { login: true }),
       });
       if (opened.status !== 'opened')
         setCcdtNeeded(opened.status === 'outdated' ? { installed: opened.installed } : {});
@@ -1688,7 +1714,7 @@ export function App({
             label: `账号 · ${accountName}`,
             icon: <UserRound />,
             detail: signedOut
-              ? '点击登录 Claude 账号'
+              ? '查看服务器模型凭据配置'
               : (state.account?.subscriptionType ??
                 capabilities?.account.subscriptionType ??
                 '账号与额度'),
@@ -1984,7 +2010,7 @@ export function App({
       <QuotaSummary
         metrics={signedOut ? null : accountMetrics}
         connected={connected}
-        emptyMessage={signedOut ? '尚未登录 Claude' : undefined}
+        emptyMessage={signedOut ? '服务器尚未配置模型凭据' : undefined}
         onOpen={() => open('settings', 'account')}
       />
     ) : undefined;
@@ -2049,6 +2075,14 @@ export function App({
               : '未选择项目',
           },
           { label: '当前任务', value: runtime.task },
+          ...(runtime.projectLabel
+            ? [
+                {
+                  label: '项目 MCP',
+                  value: connected ? runtime.projectLabel : `最后已知：${runtime.projectLabel}`,
+                },
+              ]
+            : []),
           { label: selected?.activeRun ? '运行模式' : '下次运行模式', value: runtime.modeLabel },
           { label: '模式说明', value: runtime.modeDetail },
         ]}
@@ -2101,16 +2135,25 @@ export function App({
                 inBrowser && !state.sessions.length ? '开始会话后可读取额度' : undefined
               }
               account={nativeMode ? state.account : null}
+              openTerminal={
+                nativeMode && connected && window.desktop?.openInCcdt
+                  ? () => void openInCcdt()
+                  : undefined
+              }
               capabilities={signedOut ? null : capabilities}
               metrics={signedOut ? null : accountMetrics}
               refreshing={refreshing}
-              disabled={
-                !state.sessions.length || !connected || refreshing || (inBrowser && signedOut)
-              }
+              disabled={!connected || refreshing}
               error={inBrowser ? quotaError : currentError}
-              refresh={() => {
-                if (inBrowser) refreshQuota();
-                else void refreshStatus(undefined, true);
+              refresh={(sdkQuota) => {
+                if (inBrowser) {
+                  if (sdkQuota) refreshQuota();
+                } else {
+                  void act(async () => {
+                    await client.request({ type: 'account.status' });
+                  });
+                  if (sdkQuota && quotaSession && !signedOut) void refreshStatus(undefined, true);
+                }
               }}
             />
           }
@@ -2181,6 +2224,7 @@ export function App({
                   </div>
                 )}
                 <Conversation
+                  inspectApproval={client.inspectApproval}
                   reviewing={!!shownTurn || (!!changesProject && changesProject === localProject)}
                   findRequest={findRequest}
                   session={selected}
@@ -2273,6 +2317,21 @@ export function App({
                     return sent;
                   }}
                 />
+                {selected &&
+                  connected &&
+                  runtime.projectMcp &&
+                  runtime.projectMcp !== 'connected' && (
+                    <div className="elsewhere-bar" role="status">
+                      <p>项目 MCP · {runtime.projectLabel}</p>
+                      <button
+                        type="button"
+                        className="button"
+                        onClick={() => void refreshStatus(selected.id)}
+                      >
+                        刷新状态
+                      </button>
+                    </div>
+                  )}
                 {state.status === 'reconnecting' && (
                   <div className="elsewhere-bar" role="status">
                     <Unplug />
@@ -2434,6 +2493,46 @@ export function App({
                     stop={stopRun}
                   />
                 )}
+                {selected && !selected.projectAccess && nativeMode && (
+                  <button
+                    type="button"
+                    className="button secondary"
+                    onClick={() =>
+                      void act(async () => {
+                        if (
+                          !window.confirm(
+                            '旧会话的原生历史可能包含用户名和绝对路径，续聊将重新使用这些内容。继续？',
+                          )
+                        )
+                          return;
+                        if (localProject && window.desktop) {
+                          const path = await window.desktop.chooseProject();
+                          if (!path) return;
+                          await client.request({
+                            type: 'session.move',
+                            sessionId: selected.id,
+                            projectPath: path,
+                          });
+                        }
+                        await client.request({
+                          type: 'session.acceptHistory',
+                          sessionId: selected.id,
+                        });
+                      })
+                    }
+                  >
+                    确认使用旧上下文
+                  </button>
+                )}
+                {selected && localProject && nativeMode && (
+                  <button
+                    type="button"
+                    className="button secondary"
+                    onClick={() => void act(() => window.desktop!.sessionCommands(selected.id))}
+                  >
+                    本会话命令权限
+                  </button>
+                )}
                 {selected && (!away || (browser && remote)) && (
                   <SessionBar
                     client={client}
@@ -2566,12 +2665,6 @@ export function App({
         />
       )}
       {notesDialog}
-      {state.setupToken && (
-        <SetupTokenDialog
-          result={state.setupToken}
-          close={() => client.update({ setupToken: null })}
-        />
-      )}
     </div>
   );
 }

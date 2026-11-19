@@ -3,7 +3,7 @@ import { effortSchema } from '@cc-desk-tunnel/protocol';
 import type { Effort } from '@cc-desk-tunnel/protocol';
 
 // Scheduled tasks belong to this computer: a task is a message the client sends by itself when its time
-// comes. They live in one JSON file the user, this window and Claude (over SSH) may all edit; the file
+// comes. They live in one JSON file the user and this window may edit; the file
 // explains its own format, and a task that does not fit it is reported instead of run.
 export type Schedule =
   | { type: 'once'; at: string }

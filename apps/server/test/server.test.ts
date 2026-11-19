@@ -75,89 +75,6 @@ test('message priority persists and a retry cannot silently change delivery', as
   assert.ok(conflict.type === 'response' && !conflict.ok && conflict.code === 'request_conflict');
 });
 
-test('account changes clear current quota and rejection state durably without rearming cached turns', async (t) => {
-  const directory = mkdtempSync(join(tmpdir(), 'ccdt-quota-reset-'));
-  const configDirectory = process.env.CLAUDE_CONFIG_DIR;
-  process.env.CLAUDE_CONFIG_DIR = directory;
-  const stub = `
-    export async function accountStatus() { return {loggedIn:true,authMethod:'claude.ai'}; }
-    export async function accountLogout() {}
-    export function configureSetupToken() {}
-    export class NativeLogin {
-      constructor(executable, done, notice, options) {
-        this.method = options.method; this.done = done;
-        this.url = Promise.resolve('https://claude.ai/oauth/authorize?fixture=true');
-      }
-      submit() { this.done(true); }
-      cancel() { this.cancelled = true; }
-    }
-  `;
-  const hooks = registerHooks({
-    resolve(specifier, context, next) {
-      return specifier === './native-account.ts'
-        ? { url: 'data:text/javascript,' + encodeURIComponent(stub), shortCircuit: true }
-        : next(specifier, context);
-    },
-  });
-  const server = createProxyServer({
-    token,
-    dataDir: directory,
-    claude: { executable: '/does-not-exist/claude' },
-    tunnel: {},
-    reverseProxy: true,
-  });
-  const client = new Client(await server.listen(0));
-  t.after(async () => {
-    client.socket.terminate();
-    await server.close();
-    hooks.deregister();
-    quotas.clear();
-    if (configDirectory === undefined) delete process.env.CLAUDE_CONFIG_DIR;
-    else process.env.CLAUDE_CONFIG_DIR = configDirectory;
-    rmSync(directory, { recursive: true, force: true });
-  });
-  await client.open();
-  const session = server.store.create(randomUUID(), '旧账号额度', '/fixture', device);
-  for (const type of ['account.token', 'account.logout', 'account.login'] as const) {
-    quotas.observe('old', {
-      type: 'rate_limit_event',
-      uuid: randomUUID(),
-      session_id: session.id,
-      rate_limit_info: { status: 'rejected', rateLimitType: 'five_hour' },
-    });
-    server.store.append(session.id, randomUUID(), {
-      type: 'native.metrics',
-      context: null,
-      usage: null,
-      cacheTtl: '1h',
-      rateLimits: {
-        available: true,
-        windows: [{ name: 'five_hour', utilization: 100, resetsAt: null }],
-      },
-    });
-    const cached = server.store.lastCachedTurn(session.id);
-    const response = await client.request({
-      type,
-      ...(type === 'account.token' ? { token: 'fixture-token' } : {}),
-    });
-    assert.ok(response.type === 'response' && response.ok);
-    if (type === 'account.login') {
-      await client.wait((message) => message.type === 'account.state' && !!message.login);
-      const code = await client.request({ type: 'account.code', code: 'fixture#state' });
-      assert.ok(code.type === 'response' && code.ok);
-    }
-    assert.equal(quotas.blockedUntil('old', server.store.lastQuota(session.id)), null);
-    assert.deepEqual(server.store.lastCachedTurn(session.id), cached);
-    const reopened = new SessionStore(directory);
-    try {
-      assert.equal(reopened.lastQuota(session.id)?.available, false);
-      assert.equal(reopened.lastMetrics(session.id)?.cacheTtl, undefined);
-    } finally {
-      reopened.close();
-    }
-  }
-});
-
 test(
   'native approval cancellation removes stale controls and keeps the remaining wait reason',
   { skip: process.platform === 'win32' },
@@ -196,7 +113,6 @@ test(
       token,
       dataDir: directory,
       claude: { executable: '/does-not-exist/claude' },
-      tunnel: {},
       reverseProxy: true,
     });
     const client = new Client(await server.listen(0));

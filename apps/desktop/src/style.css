@@ -2868,6 +2868,14 @@ details[open] > summary > .fold-chevron {
 .command-status.failed {
   color: var(--fail);
 }
+.approval-preview {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.approval-preview > details {
+  margin-block: 6px;
+  font-size: 13px;
+}
 .approval-actions {
   display: flex;
   justify-content: flex-end;
@@ -3989,9 +3997,6 @@ dialog:has(.attachment-preview) h2 {
 .account-identity > .account-login-actions {
   margin-left: auto;
 }
-.account-login.setup-token-login p {
-  display: block;
-}
 .account-confirm {
   display: flex;
   align-items: center;
@@ -4587,15 +4592,6 @@ dialog::backdrop {
   justify-content: flex-end;
   gap: 10px;
   margin-top: 10px;
-}
-.setup-token-value {
-  padding: 12px;
-  border: 1px solid var(--line);
-  border-radius: var(--radius-s);
-  background: var(--surface-2);
-  color: var(--ink);
-  font-family: monospace;
-  resize: none;
 }
 .delete-question {
   overflow-wrap: anywhere;

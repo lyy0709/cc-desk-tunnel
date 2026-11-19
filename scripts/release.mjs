@@ -21,11 +21,20 @@ const unknown = process.argv
 if (unknown.length)
   throw new Error(`Unknown argument ${unknown.join(' ')}. Use --dry-run, --prerelease, --publish.`);
 const gh = process.env.GH ?? 'gh';
+const { version, repository } = JSON.parse(
+  readFileSync(join(root, 'apps/desktop/package.json'), 'utf8'),
+);
+const slug = new URL(repository).pathname.slice(1);
 const run = (file, args, options = {}) =>
-  execFileSync(file, args, { cwd: root, encoding: 'utf8', windowsHide: true, ...options });
+  execFileSync(file, args, {
+    cwd: root,
+    encoding: 'utf8',
+    windowsHide: true,
+    ...(file === gh && { env: { ...process.env, GH_REPO: slug } }),
+    ...options,
+  });
 const git = (...args) => run('git', args).trim();
 
-const version = JSON.parse(readFileSync(join(root, 'apps/desktop/package.json'), 'utf8')).version;
 const tag = `v${version}`;
 const section = new RegExp(
   `^## ${version.replaceAll('.', '\\.')}\\s*\\n([\\s\\S]*?)(?=^## |$(?![\\s\\S]))`,
@@ -39,7 +48,6 @@ if (!section) throw new Error(`CHANGELOG.md has no section "## ${version}".`);
 const alert = /^> \[!(?:NOTE|TIP|IMPORTANT|WARNING|CAUTION)\]\n(?:>.*(?:\n|$))*/gm;
 const alerts = section.match(alert)?.map((block) => block.trim()) ?? [];
 const body = section.replace(alert, '').replace(/\n{3,}/g, '\n\n');
-const repository = 'https://github.com/sun168567/cc-desk-tunnel';
 const [
   installer,
   server,
@@ -55,7 +63,7 @@ const [
 // A file of this release, downloaded by following the link.
 const file = (name) => `${repository}/releases/download/${tag}/${name}`;
 const link = (words, name) => `[${words}](${file(name)})`;
-const raw = 'https://raw.githubusercontent.com/sun168567/cc-desk-tunnel/main/deploy';
+const raw = `https://raw.githubusercontent.com/${slug}/main/deploy`;
 // Every release reads the same way: how to get and upgrade to it first, each file a link that downloads it; then
 // what the project is, this version's section of the change log with its headings one level up, and where each
 // system stands. A preview carries the same text, so that making it the release later changes nothing a reader has
@@ -84,7 +92,7 @@ const notes = [
   '```',
   '',
   '- **已在使用**：在图形客户端的“设置 → 关于与更新”里先升级服务端，再按提示升级客户端；`ccdt` 运行 `ccdt upgrade`，服务端与它自己一起升级。',
-  `- **新部署服务端**：在服务器上用一条命令安装，见[快速开始](${repository}#快速开始)；镜像为 \`ghcr.io/sun168567/cc-desk-tunnel:${version}\`，${link('服务端程序包', server)}是安装和升级时下载的。`,
+  `- **新部署服务端**：在服务器上用一条命令安装，见[快速开始](${repository}#快速开始)；镜像为 \`ghcr.io/${slug.toLowerCase()}:${version}\`，${link('服务端程序包', server)}是安装和升级时下载的。`,
   `- **校验**：${link('SHA256SUMS', 'SHA256SUMS')} · ${link('release.json', 'release.json')}。Windows 安装包没有代码签名，SmartScreen 与杀毒软件的提示见[说明](${repository}#杀毒软件与-smartscreen)。`,
   '',
   '---',
@@ -114,7 +122,7 @@ if (dryRun) {
   // A release is cut from exactly what the main branch on GitHub holds, so the tag matches the files.
   const commit = git('rev-parse', 'HEAD');
   if (git('status', '--porcelain')) throw new Error('Commit or discard local changes first.');
-  const remote = run(gh, ['api', 'repos/{owner}/{repo}/commits/main', '--jq', '.sha']).trim();
+  const remote = run(gh, ['api', `repos/${slug}/commits/main`, '--jq', '.sha']).trim();
   if (remote !== commit) throw new Error('Check out the current main branch from GitHub first.');
   let exists = true;
   try {

@@ -31,7 +31,7 @@
     "deploy:linux": "node scripts/deploy-linux.mjs",
     "package:server": "node scripts/package-server.mjs",
     "prepare:windows": "pwsh.exe -NoLogo -NoProfile -File scripts/prepare-windows.ps1",
-    "prepare:windows:package": "pwsh.exe -NoLogo -NoProfile -File scripts/prepare-windows.ps1 -IncludePowerShell",
+    "prepare:windows:package": "pwsh.exe -NoLogo -NoProfile -File scripts/prepare-windows.ps1",
     "package:windows": "node scripts/package-windows.mjs",
     "package:macos": "node scripts/package-macos.mjs",
     "package:linux": "node scripts/package-linux.mjs",

@@ -1,15 +1,12 @@
+import { buildProjectFiles } from './build-project-files.mjs';
 import { execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { existsSync, readFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { build as electronBuild, Platform, Arch } from 'electron-builder';
-import { posixService, stageDesktop } from './package-desktop.mjs';
+import { stageDesktop } from './package-desktop.mjs';
 
-// Builds the macOS package: a disk image to install from and a ZIP of the same application. It is not signed
-// with a Developer ID and not notarized, so macOS asks the user to allow it on first start (see docs/macos.md),
-// and it cannot upgrade itself. It carries no OpenSSH or shell of its own: the SSH service runs inside the
-// program, with the user's shell and the system's sftp-server.
 const root = fileURLToPath(new URL('..', import.meta.url));
 const args = process.argv.slice(2);
 if (
@@ -29,7 +26,6 @@ const output = join(root, 'artifacts/macos');
 const bundle = join(output, architecture === 'arm64' ? 'mac-arm64' : 'mac', 'CC Desk Tunnel.app');
 await stageDesktop(root, app, {
   description: 'macOS client for a native remote Claude Code session',
-  ...posixService,
 });
 // The system's icon format wants a source of 512 pixels or more; the artwork is the one of the Windows package.
 const icon = join(app, 'macos-icon.png');
@@ -58,6 +54,10 @@ const results = await electronBuild({
     directories: { app, output },
     npmRebuild: false,
     asar: true,
+    extraResources: [
+      { from: join(app, 'licenses'), to: 'licenses' },
+      { from: buildProjectFiles(join(app, '../helper'), architecture), to: 'project-files' },
+    ],
     files: ['package.json', 'electron/**', 'dist/**', 'node_modules/**'],
     mac: {
       category: 'public.app-category.developer-tools',

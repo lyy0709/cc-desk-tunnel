@@ -1,10 +1,12 @@
+import { projectCall } from './project.ts';
+export * from './project.ts';
 import { z } from 'zod';
 import { webCommandSchemas, webSettingsStateSchema, webTotpSetupSchema } from './web.ts';
 import { webCertificateStateSchema } from './web-certificate.ts';
 export * from './web.ts';
 export * from './web-certificate.ts';
 
-export const PROTOCOL_VERSION = 32;
+export const PROTOCOL_VERSION = 36;
 // The release each protocol version began with, from 0.2.4 on: a client newer than its service signs in with
 // the service's number to have it upgrade (see the README). A new number adds its line here.
 export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
@@ -31,8 +33,10 @@ export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
   '0.3.20': 30,
   '0.3.21': 31,
   '0.3.23': 32,
+  '0.4.0': 36,
 };
 export const MAX_FRAME_BYTES = 256 * 1024;
+export const APPROVAL_PAGE_CHARS = 16000;
 // The longest global instructions edited here, in characters; it keeps a frame of them within MAX_FRAME_BYTES.
 export const INSTRUCTIONS_LIMIT = 64_000;
 const id = z.uuid();
@@ -59,7 +63,14 @@ export const fileAttachmentSchema = z
       .string()
       .min(1)
       .max(16000)
-      .refine((value) => !value.includes('\0') && (value.startsWith('/') || isWindowsPath(value))),
+      .refine(
+        (value) =>
+          !value.includes('\0') &&
+          (value.startsWith('/') ||
+            isWindowsPath(value) ||
+            /^attachment:[0-9a-f-]{36}$/.test(value) ||
+            value.startsWith('project:/')),
+      ),
     name: z.string().min(1).max(1024),
     size: z.number().int().nonnegative().optional(),
     deviceId: id,
@@ -119,6 +130,14 @@ export const nativeAccountSchema = z.object({
 });
 export const accountStateSchema = z.object({
   loggedIn: z.boolean(),
+  terminal: z
+    .object({
+      loggedIn: z.boolean(),
+      authMethod: z.string().optional(),
+      email: z.string().optional(),
+      organization: z.string().optional(),
+    })
+    .optional(),
   authMethod: z.string().optional(),
   email: z.string().optional(),
   organization: z.string().optional(),
@@ -126,19 +145,9 @@ export const accountStateSchema = z.object({
   // When a stored claude.ai sign-in ends for good (ISO 8601), as `claude auth status` reads it: renewing the access
   // token does not move it, and the real end can be up to three days earlier. Absent for any other credential.
   loginExpiresAt: z.string().optional(),
-  // Present while the official sign-in command waits for the code shown after browser authorization.
-  login: z
-    .object({ url: z.url(), method: z.enum(['browser', 'setup-token']).optional() })
-    .nullable(),
   notice: z.string().optional(),
 });
 export type AccountState = z.infer<typeof accountStateSchema>;
-const setupTokenResultSchema = z.object({
-  token: z.string(),
-  saved: z.boolean(),
-  error: z.string().optional(),
-});
-export type SetupTokenResult = z.infer<typeof setupTokenResultSchema>;
 // The part of the official CLI's user settings the GUI edits. null means unset: the CLI's own default applies.
 const toggle = z.boolean().nullable();
 export const nativeSettingsSchema = z.object({
@@ -233,9 +242,20 @@ const usageTotals = {
   // The official CLI's API-price estimate, not a subscription bill.
   costUsd: z.number().nonnegative(),
 };
+// Sparse UTC slices can be regrouped on the viewer, including in quarter-hour time zones.
+export const USAGE_SLICE_MINUTES = 15;
+const serverMinute = z.iso.datetime({ local: true, precision: -1 }).length(16);
+const usageRange = z.union([
+  z.enum(['today', '24h', '7d', '30d']),
+  // Absolute instants returned by the service for a quota window or a fixed page range.
+  z.object({ from: timestamp, to: timestamp.optional() }).strict(),
+  // Wall-clock values entered in the proxy's time zone.
+  z.object({ serverFrom: serverMinute, serverTo: serverMinute }).strict(),
+]);
 export const usageSummarySchema = z.object({
   retentionDays: z.number().int().positive(),
   firstRecordAt: timestamp.nullable(),
+  measuredAt: timestamp.optional(),
   // One entry per official quota period; totals cover requests since that period started.
   windows: z.array(
     z.object({
@@ -248,6 +268,9 @@ export const usageSummarySchema = z.object({
   ),
 });
 export const usagePageSchema = z.object({
+  from: timestamp,
+  to: timestamp,
+  timeZone: z.string().min(1),
   rows: z.array(
     z.object({
       id: z.number().int().positive(),
@@ -313,8 +336,16 @@ const toolSchema = z.object({
   toolId: z.string().min(1),
   name: z.string().min(1),
   input: z.string(),
-  target: z.enum(['Windows (simulation)', 'Windows', 'Linux']),
+  privateInput: z.literal(true).optional(),
+  target: z.enum(['Windows (simulation)', 'Windows', 'Linux', '项目设备']),
 });
+export const mcpConnectionStatus = z.enum([
+  'connected',
+  'pending',
+  'failed',
+  'needs-auth',
+  'disabled',
+]);
 export const eventPayloadSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('message.user'),
@@ -364,6 +395,10 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     updatedAt: timestamp.optional(),
   }),
   z.object({ type: z.literal('native.notice'), text: z.string() }),
+  z.object({
+    type: z.literal('native.project_mcp'),
+    status: mcpConnectionStatus.or(z.enum(['missing', 'not_applied', 'policy', 'unknown'])),
+  }),
   // The background tasks alive in the run's CLI; each list replaces the one before.
   z.object({
     type: z.literal('native.tasks'),
@@ -388,6 +423,7 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
   }),
   z.object({
     type: z.literal('native.metrics'),
+    profile: z.literal('terminal').optional(),
     context: contextUsageSchema.nullable(),
     usage: nativeUsageSchema.nullable(),
     rateLimits: rateLimitsSchema.nullable(),
@@ -456,7 +492,7 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
   z.object({
     type: z.literal('tool.result'),
     toolId: z.string().min(1),
-    status: z.enum(['completed', 'denied', 'cancelled', 'failed', 'unknown']),
+    status: z.enum(['completed', 'denied', 'cancelled', 'failed', 'unknown', 'deferred']),
     output: z.string(),
     exitCode: z.number().int().nullable(),
   }),
@@ -537,30 +573,7 @@ export const sessionSchema = z.object({
   // project, which all sessions of the project share. A fork keeps it from the session it was forked from.
   // Sessions from before projects had one leave it out and work in a directory named after themselves.
   nativeRoot: id.optional(),
-  // What the system prompt of the session's native runs says. It is kept word for word until a compaction,
-  // which loses the prompt cache anyway: a move to another project or another computer is told to Claude
-  // with the user's next message instead, and `told` is what it was last told that way.
-  prompt: z
-    .object({
-      projectPath: z.string(),
-      device: id.optional(),
-      // The system the prompt describes; Windows where none is recorded.
-      platform: devicePlatformSchema.optional(),
-      // The device's shells the prompt names, and the one it says the user prefers, if any.
-      shells: z.array(deviceShellSchema).optional(),
-      shell: deviceShellSchema.optional(),
-      told: z
-        .object({
-          projectPath: z.string(),
-          device: id.optional(),
-          platform: devicePlatformSchema.optional(),
-          shells: z.array(deviceShellSchema).optional(),
-          shell: deviceShellSchema.optional(),
-        })
-        .optional(),
-      compacted: z.boolean().optional(),
-    })
-    .optional(),
+  projectAccess: z.literal(1).optional(),
   createdAt: timestamp,
   updatedAt: timestamp,
   // The last outcome lets a window pause its unsent queue while another session is selected.
@@ -664,38 +677,27 @@ export const commandSchema = z.discriminatedUnion('type', [
       projectPath: z.string().trim().min(1).max(2048),
     })
     .strict(),
+  z.object({ type: z.literal('session.acceptHistory'), sessionId: id, ...request }).strict(),
   z.object({ type: z.literal('account.status'), ...request }).strict(),
+  z
+    .object({
+      type: z.literal('approval.inspect'),
+      ...request,
+      sessionId: id,
+      runId: id,
+      approvalId: id,
+      offset: z.number().int().nonnegative(),
+    })
+    .strict(),
   z
     .object({
       type: z.literal('account.login'),
       ...request,
-      method: z.enum(['browser', 'setup-token']).optional(),
+      sessionId: id,
+      cols: z.number().int().min(20).max(400),
+      rows: z.number().int().min(5).max(160),
     })
     .strict(),
-  z
-    .object({
-      type: z.literal('account.token'),
-      ...request,
-      token: z
-        .string()
-        .trim()
-        .min(1)
-        .max(8192)
-        .regex(/^[\x21-\x7e]+$/),
-    })
-    .strict(),
-  z
-    .object({
-      type: z.literal('account.code'),
-      ...request,
-      code: z
-        .string()
-        .trim()
-        .regex(/^[\x21-\x7e]{1,2048}$/),
-    })
-    .strict(),
-  z.object({ type: z.literal('account.cancel'), ...request }).strict(),
-  z.object({ type: z.literal('account.logout'), ...request }).strict(),
   z.object({ type: z.literal('settings.get'), ...request }).strict(),
   z
     .object({
@@ -726,7 +728,13 @@ export const commandSchema = z.discriminatedUnion('type', [
       version: z.string().max(100),
     })
     .strict(),
-  z.object({ type: z.literal('usage.summary'), ...request }).strict(),
+  z
+    .object({
+      type: z.literal('usage.summary'),
+      ...request,
+      profile: z.literal('terminal').optional(),
+    })
+    .strict(),
   z.object({ type: z.literal('session.stats'), ...request, sessionId: id }).strict(),
   z.object({ type: z.literal('service.update.check'), ...request }).strict(),
   z
@@ -742,16 +750,13 @@ export const commandSchema = z.discriminatedUnion('type', [
     .object({
       type: z.literal('usage.query'),
       ...request,
-      from: timestamp.optional(),
-      to: timestamp.optional(),
+      range: usageRange,
+      profile: z.enum(['sdk', 'terminal']).optional(),
       model: z.string().min(1).max(200).optional(),
       beforeId: z.number().int().positive().optional(),
       // Rows to skip from the newest, for a page of a range whose end is fixed.
       offset: z.number().int().min(0).max(10_000_000).optional(),
       limit: z.number().int().min(1).max(200).default(100),
-      bucketMinutes: z.number().int().min(5).max(1440).default(60),
-      // Minutes east of UTC, so day buckets follow the viewer's calendar.
-      offsetMinutes: z.number().int().min(-840).max(840).default(0),
     })
     .strict(),
   z.object({ type: z.literal('session.delete'), ...request, sessionId: id }).strict(),
@@ -956,7 +961,6 @@ export const terminalControlSchema = z.discriminatedUnion('type', [
     .strict(),
 ]);
 export type TerminalControl = z.infer<typeof terminalControlSchema>;
-const tunnelSecret = z.string().min(32).max(128);
 export const authSchema = z
   .object({
     type: z.literal('auth'),
@@ -964,14 +968,21 @@ export const authSchema = z
     protocolVersion: z.number().int().positive(),
     token: z.string().min(24).max(512),
     deviceName: z.string().trim().min(1).max(120),
-    tunnel: z.boolean().default(false),
+    // Older clients send this flag during version negotiation. It grants no capability.
+    tunnel: z.boolean().optional(),
   })
   .strict();
 // Which of the user's computers the connection is from, named by `auth.deviceName`. It follows `auth` as a
 // frame of its own because the frame of `auth` has to stay what every version reads.
 // The system is not the page's to say: the desktop's main process writes it into the frame on its way out.
 export const deviceIdentitySchema = z
-  .object({ type: z.literal('device'), id, platform: devicePlatformSchema.optional() })
+  .object({
+    type: z.literal('device'),
+    id,
+    platform: devicePlatformSchema.optional(),
+    files: z.literal(true).optional(),
+    shells: z.array(deviceShellSchema).min(1).max(3).optional(),
+  })
   .strict();
 // The client is closing the connection on purpose. Without it a connection that ends is taken for a fault on
 // the way, and what the device was running is kept for it to come back to.
@@ -984,6 +995,18 @@ export const historyControlSchema = z
   })
   .strict();
 export const serverMessageSchema = z.discriminatedUnion('type', [
+  projectCall,
+  z
+    .object({
+      type: z.literal('approval.detail'),
+      requestId: id,
+      input: z.string().max(APPROVAL_PAGE_CHARS),
+      next: z.number().int().positive().optional(),
+      title: z.string().max(512).optional(),
+      description: z.string().max(2048).optional(),
+    })
+    .strict(),
+  z.object({ type: z.literal('project.cancel'), requestId: id }),
   sessionOutlineSchema,
   sessionReadSchema,
   z.object({
@@ -1041,8 +1064,6 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     payload: eventPayloadSchema,
   }),
   z.object({ type: z.literal('account.state'), ...accountStateSchema.shape }),
-  // One-time result for the connection that generated it; never part of broadcast account state or history.
-  z.object({ type: z.literal('account.token.created'), ...setupTokenResultSchema.shape }),
   z.object({ type: z.literal('settings.state'), requestId: id, values: nativeSettingsSchema }),
   // Sent to every connection when it changes; the one that asked finds its request ID.
   z.object({
@@ -1130,42 +1151,5 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
       }),
     ),
   }),
-  // The execution channel runs over connections the device opens to this same address. `secret` signs them
-  // in; it belongs to this connection alone and ends with it.
-  z.object({ type: z.literal('tunnel.offer'), connectionId: id, secret: tunnelSecret }),
-  // An SSH connection is waiting on the service: the device opens one connection for it and attaches it.
-  z.object({ type: z.literal('tunnel.open'), connectionId: id, channelId: id }),
-  z.object({ type: z.literal('tunnel.ready'), connectionId: id }),
 ]);
 export type ServerMessage = z.infer<typeof serverMessageSchema>;
-
-// The first and only text frame of a channel connection. Once the service has accepted it, every frame in
-// either direction is the bytes of one SSH connection, and closing the connection ends that one.
-export const tunnelAttachSchema = z
-  .object({
-    type: z.literal('tunnel.attach'),
-    connectionId: id,
-    channelId: id,
-    secret: tunnelSecret,
-  })
-  .strict();
-export type TunnelAttach = z.infer<typeof tunnelAttachSchema>;
-// How a channel connection is closed when it could not be attached.
-export const TUNNEL_CLOSE = { refused: 4001, unknown: 4004 } as const;
-
-export const tunnelCredentialsSchema = z
-  .object({
-    type: z.literal('tunnel.credentials'),
-    connectionId: id,
-    username: z
-      .string()
-      .min(1)
-      .max(256)
-      .regex(/^[a-zA-Z0-9_.\\@ -]+$/),
-    privateKey: z.string().min(1).max(16384),
-    hostPublicKey: z.string().regex(/^ssh-ed25519 [A-Za-z0-9+/=]+$/),
-    // What the SSH service runs scripts in.
-    shells: z.array(deviceShellSchema).min(1).max(3),
-  })
-  .strict();
-export type TunnelCredentials = z.infer<typeof tunnelCredentialsSchema>;

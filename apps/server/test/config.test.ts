@@ -8,6 +8,7 @@ const native = {
   PROXY_TOKEN: 'a'.repeat(32),
   PROXY_PUBLIC_HOST: 'proxy.example.com',
   PROXY_TLS_MODE: 'reverse-proxy',
+  PROXY_RELEASE_REPO: 'none',
 };
 // What a deployment made before 0.2.10 still has in its configuration file.
 const legacy = {
@@ -23,18 +24,13 @@ test('reverse proxy mode leaves TLS to the proxy and defaults to loopback', () =
   assert.equal(options.reverseProxy, true);
   assert.equal(options.tls, undefined);
   assert.equal(port, 8787);
-  assert.deepEqual(options.tunnel, {});
 });
 test('the frp settings of an older deployment are ignored, as is a missing public host', () => {
   const { options } = environmentConfig(
     { ...native, ...legacy, PROXY_PUBLIC_HOST: undefined },
     '/state',
   );
-  assert.deepEqual(options.tunnel, {});
-  assert.equal(
-    environmentConfig({ PROXY_TOKEN: 'a'.repeat(32) }, '/state').options.tunnel,
-    undefined,
-  );
+  assert.deepEqual(options, environmentConfig(native, '/state').options);
 });
 test('explicit native TLS mode is required', () => {
   assert.throws(

@@ -138,7 +138,7 @@ test(
     child.write('\x1b[B');
     await new Promise((r) => setTimeout(r, 200));
     child.write('\r');
-    await until(/本机 SSH 服务启动（写 default/);
+    await until(/等待服务应答（写 default/);
     child.write('30');
     await new Promise((r) => setTimeout(r, 200));
     child.write('\r');
@@ -146,7 +146,7 @@ test(
     child.write('\x1b');
     assert.equal((await exited).exitCode, 0);
     assert.deepEqual(JSON.parse(readFileSync(join(directory, 'config.json'), 'utf8')).waits, {
-      ssh: 30,
+      ready: 30,
     });
   },
 );
