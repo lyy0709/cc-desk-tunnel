@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
 import { _electron } from '@playwright/test';
@@ -39,6 +39,7 @@ const application = await _electron.launch({
   env,
   timeout: 30_000,
 });
+const launcherProcess = application.process();
 try {
   const errors = [];
   const page = await application.firstWindow();
@@ -214,21 +215,47 @@ try {
   };
   // The sign-in window goes as the connection's window runs, and with it the page.
   await page.evaluate((connection) => window.desktop.openLegacy(connection), id).catch(() => {});
+  let servicePid;
   try {
     await until(true);
+    servicePid = JSON.parse(readFileSync(instance, 'utf8')).pid;
+    if (mac) {
+      // Launch Services used to retain the exited launcher as a second Dock application
+      // for the lifetime of its child. Check both PIDs while the service window is alive.
+      const registered = (pid, entries) => new RegExp(`^\\s*pid = ${pid}\\b`, 'm').test(entries);
+      for (let waited = 0; ; waited += 250) {
+        const entries = execFileSync('/usr/bin/lsappinfo', ['list'], { encoding: 'utf8' });
+        if (registered(servicePid, entries) && !registered(launcherProcess.pid, entries)) break;
+        assert.ok(waited < 10_000, 'Launch Services must keep only the service window registered');
+        await delay(250);
+      }
+    }
   } finally {
     execFileSync(executable, [...args, `--connection=${id}`, '--quit-connection'], {
       cwd: directory,
       env,
       timeout: 30_000,
     });
+    await until(false);
+    // Electron can still flush the profile after removing instance.json on quit.
+    if (servicePid) {
+      for (let waited = 0; ; waited += 100) {
+        try {
+          process.kill(servicePid, 0);
+        } catch (error) {
+          if (error.code === 'ESRCH') break;
+          throw error;
+        }
+        assert.ok(waited < 10_000, 'The service window did not exit.');
+        await delay(100);
+      }
+    }
   }
-  await until(false);
   console.log(
     'PASS: the packaged client starts offline, its SSH service runs a script and a connection opens in a process of its own.',
   );
 } finally {
   // The sign-in window may have gone already.
-  if (application.process().exitCode === null) await application.close().catch(() => {});
+  if (launcherProcess.exitCode === null) await application.close().catch(() => {});
   rmSync(directory, { recursive: true, force: true });
 }

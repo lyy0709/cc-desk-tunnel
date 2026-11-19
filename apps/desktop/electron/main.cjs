@@ -37,7 +37,8 @@ const { asOnDisk } = require('./disk-path.cjs');
 const { openLog } = require('./client-log.cjs');
 const { hostname, tmpdir } = require('node:os');
 const { randomUUID } = require('node:crypto');
-const { spawn } = require('node:child_process');
+const { execFile, spawn } = require('node:child_process');
+const { promisify } = require('node:util');
 const { mkdir, readdir, rmdir, unlink } = require('node:fs/promises');
 const { pathToFileURL } = require('node:url');
 let bridge;
@@ -669,7 +670,7 @@ handle('login:owner', (_event, url) => {
 // The sign-in window starts the service's connection, made for a service new here, and waits for its window to
 // run before it goes. A service whose window is open is that window's: it is shown instead.
 async function startConnection(id, flags, sign) {
-  launch(id, flags, sign);
+  await launch(id, flags, sign);
   for (let waited = 0; waited < 20_000; waited += 250) {
     if (connections.running(base, id)) {
       app.quit();
@@ -687,7 +688,7 @@ handle('launcher:start', async (_event, form) => {
   };
   const id = connections.create(base, login);
   if (connections.running(base, id)) {
-    launch(id);
+    await launch(id);
     return {
       shown: connections.labelOf(
         base,
@@ -710,7 +711,7 @@ handle('launcher:offline', async (_event, url) => {
   const service = connections.owner(base, url);
   if (!service) return { error: '请先选择已登录过的服务。' };
   if (connections.running(base, service.id)) {
-    launch(service.id);
+    await launch(service.id);
     return { shown: service.label };
   }
   return (await startConnection(service.id, ['--offline-history']))
@@ -722,7 +723,7 @@ handle('launcher:open', async (_event, id) => {
   if (!connections.list(base).some((entry) => entry.id === id))
     throw new Error('这个连接已不存在。');
   if (connections.running(base, id)) {
-    launch(id);
+    await launch(id);
     return { shown: true };
   }
   return (await startConnection(id, []))
@@ -730,8 +731,8 @@ handle('launcher:open', async (_event, id) => {
     : { error: '这个连接的窗口没有启动起来，请再试一次。' };
 });
 // A connection's window that has not signed in goes back to a sign-in window for another service.
-handle('login:elsewhere', () => {
-  launch(null);
+handle('login:elsewhere', async () => {
+  await launch(null);
   app.quit();
 });
 // Replaces a file whole through a flushed temporary file, so a crash or power loss in the middle of a write
@@ -826,36 +827,41 @@ const listed = () =>
 // show its window, or with `--quit-connection` to quit, through its control pipe (see `listen` in
 // connections.cjs); a window that does not answer is started over, as before (see `second-instance`).
 // `sign`: see `handed`.
-function launch(id, flags = [], sign = null) {
+async function launch(id, flags = [], sign = null) {
   if (id !== null && connections.running(base, id)) {
     const command = flags.includes('--quit-connection') ? 'quit' : 'show';
-    void connections.tell(base, id, command).then((told) => told || startProcess(id, flags, sign));
+    if (await connections.tell(base, id, command)) return;
+  }
+  const args = [
+    ...(app.isPackaged ? [] : [app.getAppPath()]),
+    ...process.argv.filter(
+      (item) =>
+        item.startsWith('--user-data-dir=') || item === '--smoke-test' || item === '--no-sandbox',
+    ),
+    ...(id === null ? [] : [`--connection=${id}`]),
+    ...flags,
+  ];
+  const env = sign ? { ...process.env, CC_DESK_TUNNEL_SIGN_IN: JSON.stringify(sign) } : process.env;
+  if (process.platform === 'darwin') {
+    // Launch Services gives the window its own application lifetime. A direct child keeps
+    // the old launcher's Dock tile alive even after it quits. open inherits the sign-in via env.
+    const bundle = path.resolve(path.dirname(process.execPath), '../..');
+    const background = args.includes('--quit-connection') || args.includes('--smoke-test');
+    await promisify(execFile)(
+      '/usr/bin/open',
+      [...(background ? ['-g'] : []), '-n', '-a', bundle, '--args', ...args],
+      { env },
+    );
     return;
   }
-  startProcess(id, flags, sign);
-}
-function startProcess(id, flags, sign) {
-  spawn(
-    process.execPath,
-    [
-      ...(app.isPackaged ? [] : [app.getAppPath()]),
-      ...process.argv.filter(
-        (item) =>
-          item.startsWith('--user-data-dir=') || item === '--smoke-test' || item === '--no-sandbox',
-      ),
-      ...(id === null ? [] : [`--connection=${id}`]),
-      ...flags,
-    ],
-    {
-      detached: true,
-      stdio: 'ignore',
-      env: sign ? { ...process.env, CC_DESK_TUNNEL_SIGN_IN: JSON.stringify(sign) } : process.env,
-    },
-  ).unref();
+  spawn(process.execPath, args, { detached: true, stdio: 'ignore', env }).unref();
 }
 function dismissOthers() {
-  for (const entry of others())
-    if (connections.running(base, entry.id)) launch(entry.id, ['--quit-connection']);
+  return Promise.all(
+    others()
+      .filter((entry) => connections.running(base, entry.id))
+      .map((entry) => launch(entry.id, ['--quit-connection'])),
+  );
 }
 // The page's choices that are the computer's (see prefs.ts) and the list of connections, as last read. Every
 // connection's window looks at the files every two seconds and takes what another one wrote.
@@ -936,7 +942,7 @@ handle('accounts:list', listed);
 handle('accounts:open', (_event, id) => {
   if (!connections.list(base).some((entry) => entry.id === id))
     throw new Error('这个连接已不存在。');
-  launch(id, ['--sign-in']);
+  return launch(id, ['--sign-in']);
 });
 handle('accounts:rename', (_event, id, name) => {
   connections.rename(base, String(id), name);
@@ -951,8 +957,8 @@ handle('accounts:forget', (_event, id) => {
   return listed();
 });
 handle('login:window', () => launch(null));
-handle('app:quit', (_event, all) => {
-  if (all === true) dismissOthers();
+handle('app:quit', async (_event, all) => {
+  if (all === true) await dismissOthers();
   app.quit();
 });
 let refreshTray = () => {};
@@ -1024,7 +1030,7 @@ handle('update:install', async (event, version) => {
     });
   }
   // The installer replaces the program under every connection's window, so the others go first.
-  dismissOthers();
+  await dismissOthers();
   for (
     let waited = 0;
     others().some((entry) => connections.running(base, entry.id));
@@ -1053,7 +1059,13 @@ app.whenReady().then(async () => {
   // window of its own.
   if (launcher && !connections.list(base).some((entry) => connections.running(base, entry.id))) {
     const auto = connections.autoLogin(base);
-    if (auto !== null && (await startConnection(auto, ['--sign-in']))) return;
+    if (auto !== null) {
+      try {
+        if (await startConnection(auto, ['--sign-in'])) return;
+      } catch (error) {
+        startProblems.push(error);
+      }
+    }
   }
   log(
     `Client ${app.getVersion()} started ${launcher ? 'to sign in' : `as connection ${connectionId}`}.`,
@@ -1202,9 +1214,14 @@ app.whenReady().then(async () => {
           .filter((entry) => entry.id !== connectionId)
           .map((entry) => ({
             label: `打开“${entry.label || '未保存地址的连接'}”`,
-            click: () => launch(entry.id),
+            click: () =>
+              launch(entry.id).catch((error) => dialog.showErrorBox('无法打开连接', error.message)),
           })),
-        { label: '新的登录窗口', click: () => launch(null) },
+        {
+          label: '新的登录窗口',
+          click: () =>
+            launch(null).catch((error) => dialog.showErrorBox('无法打开登录窗口', error.message)),
+        },
         {
           label: '关闭窗口时留在后台',
           type: 'checkbox',
@@ -1220,10 +1237,10 @@ app.whenReady().then(async () => {
           ? [
               {
                 label: '退出全部连接',
-                click: () => {
-                  dismissOthers();
-                  app.quit();
-                },
+                click: () =>
+                  dismissOthers()
+                    .then(() => app.quit())
+                    .catch((error) => dialog.showErrorBox('无法退出连接', error.message)),
               },
             ]
           : []),
