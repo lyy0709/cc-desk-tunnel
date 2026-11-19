@@ -29,6 +29,7 @@ jobs:
       - run: npm run format:check
       - run: xvfb-run -a npm test
       - run: bash deploy/test-scripts.sh
+      - run: docker pull node:24-bookworm && bash deploy/test-hardware.sh
   # The service as it is deployed: the image built on the machine, then every way of setting it up, on both
   # architectures a server may have. On arm64 the service's own tests run as well, for what it compiles there.
   deploy:

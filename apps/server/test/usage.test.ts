@@ -296,7 +296,7 @@ test('a period survives jitter and repeated readings, and a cut-short one is res
   old.exec("DELETE FROM migrations WHERE name = 'usage-window-start'");
   old
     .prepare(
-      'INSERT INTO usage_windows(name,started_at,resets_at,utilization,observed_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO scoped_usage_windows(name,started_at,resets_at,utilization,observed_at) VALUES (?, ?, ?, ?, ?)',
     )
     .run('seven_day', Date.now() - 60_000, resetsAt, 51, Date.now() - 1000);
   const records = old.prepare('SELECT * FROM api_requests ORDER BY id').all();
@@ -305,10 +305,10 @@ test('a period survives jitter and repeated readings, and a cut-short one is res
   assert.equal(restored.requests, 1);
   assert.deepEqual(old.prepare('SELECT * FROM api_requests ORDER BY id').all(), records);
   // Recovery is once only; a later explicitly observed reset must survive a restart.
-  old.prepare('UPDATE usage_windows SET started_at = ?').run(Date.now() - 500);
+  old.prepare('UPDATE scoped_usage_windows SET started_at = ?').run(Date.now() - 500);
   new UsageLog(old);
   assert.ok(
-    Number(old.prepare('SELECT started_at FROM usage_windows').get()!.started_at) >
+    Number(old.prepare('SELECT started_at FROM scoped_usage_windows').get()!.started_at) >
       Date.now() - 5000,
   );
 });
@@ -323,7 +323,7 @@ test('period recovery preserves an early reset recorded in the original quota ev
     "DELETE FROM migrations WHERE name = 'usage-window-start'; CREATE TABLE events (data TEXT NOT NULL)",
   );
   db.prepare(
-    'INSERT INTO usage_windows(name,started_at,resets_at,utilization,observed_at) VALUES (?, ?, ?, ?, ?)',
+    'INSERT INTO scoped_usage_windows(name,started_at,resets_at,utilization,observed_at) VALUES (?, ?, ?, ?, ?)',
   ).run('seven_day', now - 60000, end, 20, now);
   const insert = db.prepare('INSERT INTO events VALUES (?)');
   for (const [at, utilization] of [
@@ -378,6 +378,11 @@ test('upgrading discards unattributable quota readings and retains historical ca
     rateLimits: { available: true, windows: [] },
   };
   db.prepare('INSERT INTO events VALUES (?)').run(JSON.stringify({ payload }));
+  const legacyWrite = `INSERT INTO usage_windows VALUES ('five_hour', 1, NULL, 100, 1)
+    ON CONFLICT(name) DO UPDATE SET utilization=excluded.utilization`;
+  db.exec(
+    `CREATE TABLE usage_windows(name TEXT PRIMARY KEY,started_at INTEGER NOT NULL,resets_at INTEGER,utilization REAL,observed_at INTEGER NOT NULL);${legacyWrite}`,
+  );
   const updated = new UsageLog(db);
   assert.deepEqual(updated.summary(now).windows, []);
   assert.deepEqual(JSON.parse(String(db.prepare('SELECT data FROM events').get()!.data)).payload, {
@@ -399,7 +404,18 @@ test('upgrading discards unattributable quota readings and retains historical ca
     },
     now,
   );
+  // An old binary can write again and its mixed readings still cannot enter the SDK after re-upgrade.
+  db.exec(legacyWrite);
+  db.prepare('INSERT INTO events VALUES (?)').run(JSON.stringify({ payload }));
+  db.prepare('INSERT INTO events VALUES (?)').run(
+    JSON.stringify({ payload: { ...payload, profile: 'sdk' } }),
+  );
   assert.equal(new UsageLog(db).summary(now).windows[0].utilization, 1);
+  const restoredEvents = db
+    .prepare('SELECT data FROM events ORDER BY rowid')
+    .all()
+    .map((row) => JSON.parse(String(row.data)).payload.rateLimits);
+  assert.deepEqual(restoredEvents, [null, null, payload.rateLimits]);
 });
 
 test('loopback receiver counts only SDK calls towards the SDK window and retains both surfaces in the log', async () => {

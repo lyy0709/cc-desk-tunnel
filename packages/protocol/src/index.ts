@@ -423,7 +423,7 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
   }),
   z.object({
     type: z.literal('native.metrics'),
-    profile: z.literal('terminal').optional(),
+    profile: z.enum(['sdk', 'terminal']).optional(),
     context: contextUsageSchema.nullable(),
     usage: nativeUsageSchema.nullable(),
     rateLimits: rateLimitsSchema.nullable(),

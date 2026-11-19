@@ -16,6 +16,7 @@ Usage:
     [--data ABSOLUTE_PATH] [--control-port 8787]
     [--cert FULLCHAIN --key PRIVATE_KEY] [--url wss://DOMAIN/ws] [--token SECRET]
   manage.sh pull|build|up|status|logs|stop|restart|uninstall|connection|summary
+  manage.sh hardware                        retain the live server's hardware before its first stop or backup
   manage.sh upgrade [--from SERVER_ARCHIVE]   install the newest release (or the archive) and replace the container
   manage.sh client INSTALLER_EXE              offer a Windows installer to connected clients
   manage.sh token [SECRET]                    replace the service token (random when omitted) and restart
@@ -25,7 +26,7 @@ Usage:
   manage.sh certificate FULLCHAIN PRIVATE_KEY
   manage.sh renew
 
-Requires Docker Engine + Compose v2+, Bash, OpenSSL, curl, tar.
+Requires Docker Engine + Compose with per-network mac_address support (v2.23.2+), Bash, OpenSSL, curl, tar.
 Use sudo if your user cannot access Docker. Config defaults to .local/docker.env;
 set PROXY_DEPLOY_CONFIG to manage a different isolated installation.
 Set PROXY_COMPOSE_FILE when managing an image-only standalone compose.yml.
@@ -52,8 +53,16 @@ host_of() {
 valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535)); }
 safe_value() { [[ "$1" != *"'"* && "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *'$'* && "$1" != *'`'* ]]; }
 write_var() { safe_value "$2" || fail "Unsupported characters in $1"; printf "%s='%s'\n" "$1" "$2"; }
+source "$ROOT/deploy/hardware.sh"
 dc() {
+  local -a files=(-f "$COMPOSE")
   if [[ "${1:-}" = up ]]; then
+    retain_hardware
+    if [[ -d "$CONFIG.hardware" ]]; then
+      [[ "$(image_platform "$PROXY_IMAGE")" = "$(cat "$CONFIG.hardware/platform")" ]] || fail "The target server image uses a different architecture."
+      local cpu
+      cpu="$(cpu_capabilities "$PROXY_IMAGE")" && [[ -n "$cpu" && "$cpu" = "$(cat "$CONFIG.hardware/cpu")" ]] || fail "Server CPU capabilities changed. The running service was not replaced."
+    fi
     # Bind sources must exist before Compose creates either container (otherwise Docker makes them root-owned).
     for part in app-home cc-runner state/native state/terminals state/project-sockets; do
       if [[ ! -e "$DATA_DIR/$part" ]]; then
@@ -62,11 +71,21 @@ dc() {
       fi
     done
   fi
-  docker compose --env-file "$CONFIG" -p "$PROJECT_NAME" -f "$COMPOSE" "$@"; }
+  [[ ! -d "$CONFIG.hardware" ]] || files+=(-f "$CONFIG.hardware/runtime.yml")
+  docker compose --env-file "$CONFIG" -p "$PROJECT_NAME" "${files[@]}" "$@" || return
+  if [[ "${1:-}" = up && ! -d "$CONFIG.hardware" ]]; then
+    retain_hardware existing
+    docker compose --env-file "$CONFIG" -p "$PROJECT_NAME" -f "$COMPOSE" -f "$CONFIG.hardware/runtime.yml" "$@"
+  fi
+}
 load() {
   [[ -f "$CONFIG" ]] || fail "Run init first."
+  CONFIG="$(realpath -- "$CONFIG")"
   # This file is a private, locally generated deployment configuration.
   source "$CONFIG"
+  if [[ "$COMPOSE" = "$CONFIG.hardware/legacy.yml" ]]; then
+    COMPOSE="${PROXY_COMPOSE_FILE:-$(cat "$CONFIG.hardware/base")}"
+  fi
   [[ "$DATA_DIR" = /* && -f "$DATA_DIR/.cc-desk-tunnel-data" ]] || fail "Invalid managed data directory."
   DATA_DIR="$(realpath -- "$DATA_DIR")"
 }
@@ -102,7 +121,10 @@ wait_healthy() {
     state="$(docker inspect --format '{{.State.Health.Status}}' "$id")"
     if [[ "$state" = healthy ]]; then
       local runtime_id; runtime_id="$(dc ps -q runtime)"
-      if [[ -n "$runtime_id" && "$(docker inspect --format '{{.State.Health.Status}}' "$runtime_id")" = healthy ]]; then return; fi
+      if [[ -n "$runtime_id" && "$(docker inspect --format '{{.State.Health.Status}}' "$runtime_id")" = healthy ]]; then
+        if [[ -d "$CONFIG.hardware" ]]; then verify_runtime_hardware "$runtime_id"; fi
+        return
+      fi
     fi
     [[ "$(docker inspect --format '{{.State.Running}}' "$id")" = true ]] || break
     sleep 2
@@ -114,6 +136,7 @@ wait_healthy() {
 # on since drops the unpacked client, so that the image builds the client from the sources again.
 build_image() {
   local web="$ROOT/apps/server/web/index.html" commit
+  if [[ -f "$CONFIG.hardware/platform" ]]; then local -x DOCKER_DEFAULT_PLATFORM; DOCKER_DEFAULT_PLATFORM="$(cat "$CONFIG.hardware/platform")"; fi
   if [[ -f "$web" && -d "$ROOT/.git" ]] && command -v git >/dev/null; then
     commit="$(git -c safe.directory="$ROOT" -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 0)"
     if ((commit > $(stat -c %Y "$web"))); then rm -rf -- "$ROOT/apps/server/web"; fi
@@ -137,7 +160,9 @@ pull_image() {
   [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "No program version in $ROOT/apps/desktop/package.json."
   image="${CC_DESK_TUNNEL_IMAGE:-ghcr.io/${REPOSITORY,,}}:$version"
   echo "拉取镜像 $image …"
-  docker pull "$image" || return
+  local -a platform=()
+  if [[ -f "$CONFIG.hardware/platform" ]]; then platform=(--platform "$(cat "$CONFIG.hardware/platform")"); fi
+  docker pull "${platform[@]}" "$image" || return
   # Only a pulled image is configured: a failed pull leaves the deployment as it was.
   save_image "$image"
 }
@@ -459,9 +484,11 @@ if [[ "$command" = backup || "$command" = restore ]]; then
   source "$ROOT/deploy/docker/program.sh"
 fi
 case "$command" in
+  hardware) retain_hardware existing; echo "Server hardware retained in $CONFIG.hardware." ;;
   build) build_image ;;
   pull) pull_image ;;
   up)
+    retain_hardware
     docker image inspect "$PROXY_IMAGE" >/dev/null 2>&1 || prepare_image
     dc up -d --no-build; wait_healthy ;;
   status) dc ps ;;
@@ -482,12 +509,26 @@ case "$command" in
     if [[ -n "${ARCHIVE:-}" ]]; then
       if tar -tzf "$ARCHIVE" | grep -E '(^/|(^|/)\.\.(/|$))' >/dev/null; then fail "Unsafe archive paths."; fi
       tar -tzf "$ARCHIVE" | grep -Fx 'deploy/manage.sh' >/dev/null || fail "Not a CC Desk Tunnel server archive."
+      retain_hardware
+      incoming="$(tar -xzOf "$ARCHIVE" apps/desktop/package.json | sed -n 's/^ *"version": "\([0-9.]*\)".*/\1/p')"
+      if [[ "$incoming" = 0.3.* && -d "$CONFIG.hardware" ]]; then
+        # Let the old Compose up retire only our runtime, after its target image is ready.
+        services="$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format '{{.Label "com.docker.compose.service"}}')"
+        if grep -Ev '^(runtime|proxy)?$' <<< "$services" >/dev/null; then fail "Other services use this Compose project. Cannot remove orphans on downgrade."; fi
+        export COMPOSE_REMOVE_ORPHANS=true
+        export DOCKER_DEFAULT_PLATFORM
+        DOCKER_DEFAULT_PLATFORM="$(cat "$CONFIG.hardware/platform")"
+      fi
       tar -xzf "$ARCHIVE" -C "$ROOT" --no-same-owner
+      if [[ "$incoming" = 0.3.* && -d "$CONFIG.hardware" ]]; then
+        docker compose --env-file "$CONFIG" -p "$PROJECT_NAME" -f "$CONFIG.hardware/legacy.yml" config --quiet
+      fi
       # The script just unpacked goes on, so that what this version changed in it applies.
       CC_DESK_TUNNEL_UNPACKED=1 bash "$ROOT/deploy/manage.sh" upgrade
       exit
     fi
     echo "程序版本 $(version_of)。"
+    retain_hardware
     link_command
     previous="$PROXY_IMAGE"
     prepare_image

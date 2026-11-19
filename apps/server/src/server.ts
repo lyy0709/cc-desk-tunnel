@@ -634,8 +634,10 @@ export function createProxyServer(options: ServerOptions) {
 
   // Stores an event and sends it to the session's subscribers; quota readings also drive the usage periods.
   function record(sessionId: string, runId: string, payload: EventPayload, createdAt?: string) {
-    if (payload.type === 'native.metrics' && !payload.profile && payload.rateLimits?.available)
-      usage.observe(payload.rateLimits);
+    if (payload.type === 'native.metrics' && payload.profile !== 'terminal' && payload.rateLimits) {
+      payload = { ...payload, profile: 'sdk' };
+      if (payload.rateLimits?.available) usage.observe(payload.rateLimits);
+    }
     const event = store.append(sessionId, runId, payload, createdAt);
     broadcast({ type: 'session.event', event }, sessionId);
     if (payload.type === 'native.metrics' && payload.cacheTtl)

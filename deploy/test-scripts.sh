@@ -12,7 +12,7 @@ mkdir -p "$TEMP/bin" "$MOCK_RELEASE"
 # A program directory as a release archive unpacks it, at a version of our choosing.
 program() {
   mkdir -p "$1/deploy/docker" "$1/apps/desktop"
-  for file in manage.sh install.sh; do tr -d '\r' < "$ROOT/deploy/$file" > "$1/deploy/$file"; done
+  for file in manage.sh install.sh hardware.sh; do tr -d '\r' < "$ROOT/deploy/$file" > "$1/deploy/$file"; done
   cp "$ROOT/deploy/compose.yml" "$1/deploy/"
   cp "$ROOT/deploy/docker/program.sh" "$1/deploy/docker/"
   cp "$ROOT/deploy/docker/compose.yaml" "$1/deploy/docker/"
@@ -29,13 +29,38 @@ cat > "$TEMP/bin/docker" <<'MOCK'
 #!/usr/bin/env bash
 echo "$*" >> "$MOCK_LOG"
 case "$1 $2" in
+  'info --format') echo "fixture-engine linux x86_64 2 2147483648"; exit ;;
+  'ps -aq')
+    for arg in "$@"; do
+      if [[ "$arg" = label=com.docker.compose.project=* ]]; then echo "${arg#label=com.docker.compose.project=}" > "$MOCK_LOG.project"; fi
+    done
+    echo fixture-runtime; exit ;;
+  'network ls') echo fixture_default; exit ;;
+  'network inspect')
+    if [[ "$*" = *'.Labels'* ]]; then
+      name="$(cat "$MOCK_LOG.project")"
+      echo "$name|default"
+    elif [[ "${MAC_OCCUPIED:-0}" = 1 ]]; then
+      echo 'another-container 02:42:00:00:00:01'
+    fi
+    exit ;;
+  'exec '*) printf 'fixture-host\n02:42:00:00:00:01\n'; exit ;;
   'pull '*) [[ "${FAIL_PULL:-0}" != 1 ]]; exit ;;
   'image inspect')
-    [[ "${MISSING_IMAGE:-0}" != 1 ]] || exit 1
+    [[ "$*" = *'{{.Architecture}}'* || "${MISSING_IMAGE:-0}" != 1 ]] || exit 1
     [[ "$*" != *'{{.Id}}'* ]] || echo "sha256:${*: -1}"
+    [[ "$*" != *'{{.Architecture}}'* ]] || echo linux/amd64
     exit ;;
   'image rm') exit 0 ;;
-  'inspect '*) echo healthy; exit ;;
+  'inspect '*)
+    case "$*" in
+      *'{{.NanoCpus}}'*) echo '0||0|0|0|0|0|0|67108864|' ;;
+      *'{{.Image}}'*) echo fixture-image ;;
+      *'.Config.Hostname'*) echo 'fixture-host|' ;;
+      *'.NetworkSettings.Networks'*) if [[ "${MAC_MISSING:-0}" = 1 ]]; then echo 'fixture_default|'; else echo 'fixture_default|02:42:00:00:00:01'; fi ;;
+      *) echo healthy ;;
+    esac
+    exit ;;
 esac
 case " $* " in
   *' build '*) [[ "${FAIL_BUILD:-0}" != 1 ]]; exit ;;
@@ -43,6 +68,7 @@ case " $* " in
   *' ps --status running '*) [[ "${MOCK_STOPPED:-0}" = 1 ]] || echo mock-container ;;
   *' ps '*) echo mock-container ;;
   *' --entrypoint node '*) echo "$MOCK_IMAGE_VERSION" ;;
+  *' --entrypoint /bin/sh '*) echo 'model name : test cpu' ;;
 esac
 exit 0
 MOCK
@@ -83,6 +109,14 @@ CONFIG
 manage() { bash "$DEPLOYED/deploy/manage.sh" "$@"; }
 image() { sed -n "s/^PROXY_IMAGE='\(.*\)'$/\1/p" "$PROXY_DEPLOY_CONFIG"; }
 
+deployment 1.2.3 old:1
+if MAC_MISSING=1 manage up > "$TEMP/no-mac" 2>&1; then exit 1; fi
+grep -q 'no verifiable MAC' "$TEMP/no-mac"
+test ! -d "$PROXY_DEPLOY_CONFIG.hardware"
+if MAC_OCCUPIED=1 manage up > "$TEMP/occupied" 2>&1; then exit 1; fi
+grep -q 'in use by another container' "$TEMP/occupied"
+! grep -q ' up -d' "$MOCK_LOG"
+
 # The prebuilt image of the program's own version.
 deployment 1.2.3
 manage pull
@@ -111,7 +145,7 @@ CC_DESK_TUNNEL_BUILD=1 CC_DESK_TUNNEL_UNPACKED=1 manage upgrade > /dev/null
 # up gets the image first when there is none yet, as after init.
 deployment 1.2.3
 MISSING_IMAGE=1 manage up
-grep -q '^pull ghcr.io/lyy0709/cc-desk-tunnel:1.2.3' "$MOCK_LOG"
+grep -qx 'pull --platform linux/amd64 ghcr.io/lyy0709/cc-desk-tunnel:1.2.3' "$MOCK_LOG"
 
 # upgrade fetches the newest release, checks it, unpacks it and goes on with the script it brought. The image it
 # replaces goes; one of the administrator's own stays.

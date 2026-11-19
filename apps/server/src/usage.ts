@@ -32,7 +32,7 @@ function usageBounds(range: UsageQuery['range'], now: number): [number, number] 
   return [bounds[0], bounds[1]];
 }
 
-const windowTable = `CREATE TABLE IF NOT EXISTS usage_windows (
+const windowTable = `CREATE TABLE IF NOT EXISTS scoped_usage_windows (
   name TEXT NOT NULL, started_at INTEGER NOT NULL, resets_at INTEGER, utilization REAL, observed_at INTEGER NOT NULL,
   scope TEXT NOT NULL DEFAULT 'sdk', PRIMARY KEY(scope,name))`;
 const windowLength: Record<string, number> = { five_hour: 5 * 3600_000 };
@@ -88,32 +88,29 @@ export class UsageLog {
     if (!columns.some((column) => column.name === 'prompt_id'))
       database.exec('ALTER TABLE api_requests ADD COLUMN prompt_id TEXT');
     const mixed = !columns.some((column) => column.name === 'profile');
-    const scoped = database
-      .prepare('PRAGMA table_info(usage_windows)')
-      .all()
-      .some((column) => column.name === 'scope');
-    if (mixed || !scoped) {
-      // Old quota windows and readings can contain both accounts. Keep call records and conversation history.
+    const legacyColumns = database.prepare('PRAGMA table_info(usage_windows)').all();
+    const preview = legacyColumns.some((column) => column.name === 'scope');
+    // 0.3 writes ON CONFLICT(name) into its own table. Its readings cannot identify an account.
+    // Keep that schema available to a downgrade, and store the new windows in a different table.
+    if (mixed || legacyColumns.length) {
       database.exec('BEGIN IMMEDIATE');
       try {
         if (mixed)
           database.exec(
-            'ALTER TABLE api_requests ADD COLUMN profile TEXT; DELETE FROM usage_windows',
+            'ALTER TABLE api_requests ADD COLUMN profile TEXT; DELETE FROM scoped_usage_windows',
           );
-        if (!scoped)
-          database.exec(`ALTER TABLE usage_windows RENAME TO unscoped_windows;
-          ${windowTable};
-          INSERT INTO usage_windows(name,started_at,resets_at,utilization,observed_at)
-          SELECT name,started_at,resets_at,utilization,observed_at FROM unscoped_windows;
-          DROP TABLE unscoped_windows`);
+        if (preview)
+          database.exec(`INSERT OR IGNORE INTO scoped_usage_windows(name,started_at,resets_at,utilization,observed_at,scope)
+            SELECT name,started_at,resets_at,utilization,observed_at,scope FROM usage_windows;
+            DROP TABLE usage_windows`);
         if (
-          mixed &&
           database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get()
         ) {
           const { changes } = database
             .prepare(
               `UPDATE events SET data=json_set(data,'$.payload.rateLimits',NULL)
-            WHERE json_extract(data,'$.payload.type')='native.metrics' AND json_type(data,'$.payload.rateLimits')='object'`,
+            WHERE instr(data,'"native.metrics"') > 0 AND json_extract(data,'$.payload.type')='native.metrics'
+              AND json_type(data,'$.payload.profile') IS NULL AND json_type(data,'$.payload.rateLimits')='object'`,
             )
             .run();
           if (changes)
@@ -137,7 +134,7 @@ export class UsageLog {
       return;
     const windows = (
       this.database
-        .prepare("SELECT name, started_at, resets_at FROM usage_windows WHERE scope='sdk'")
+        .prepare("SELECT name, started_at, resets_at FROM scoped_usage_windows WHERE scope='sdk'")
         .all() as {
         name: string;
         started_at: number;
@@ -158,7 +155,7 @@ export class UsageLog {
       const resets = windows.length ? this.earlyResets(windows, now) : new Map<string, number>();
       for (const window of windows)
         this.database
-          .prepare("UPDATE usage_windows SET started_at = ? WHERE scope='sdk' AND name = ?")
+          .prepare("UPDATE scoped_usage_windows SET started_at = ? WHERE scope='sdk' AND name = ?")
           .run(
             Math.min(window.started_at, Math.max(window.expected, resets.get(window.name) ?? 0)),
             window.name,
@@ -287,7 +284,7 @@ export class UsageLog {
     for (const window of rateLimits.windows) {
       const previous = this.database
         .prepare(
-          'SELECT started_at, resets_at, utilization, observed_at FROM usage_windows WHERE name = ? AND scope = ?',
+          'SELECT started_at, resets_at, utilization, observed_at FROM scoped_usage_windows WHERE name = ? AND scope = ?',
         )
         .get(window.name, scope) as
         | {
@@ -319,7 +316,7 @@ export class UsageLog {
       // stays, so that the next period is recognised by its new reset time however little had been used.
       this.database
         .prepare(
-          `INSERT INTO usage_windows (name, started_at, resets_at, utilization, observed_at, scope) VALUES (?, ?, ?, ?, ?, ?)
+          `INSERT INTO scoped_usage_windows (name, started_at, resets_at, utilization, observed_at, scope) VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(scope,name) DO UPDATE SET started_at = excluded.started_at, resets_at = excluded.resets_at,
           utilization = excluded.utilization, observed_at = excluded.observed_at`,
         )
@@ -336,7 +333,7 @@ export class UsageLog {
   summary(now = Date.now(), scope: string | null = 'sdk'): Summary {
     const windows = this.database
       .prepare(
-        `SELECT name, started_at, resets_at, utilization, observed_at FROM usage_windows WHERE scope=?
+        `SELECT name, started_at, resets_at, utilization, observed_at FROM scoped_usage_windows WHERE scope=?
         AND (scope='sdk' OR resets_at>? OR (resets_at IS NULL AND observed_at>?)) ORDER BY rowid`,
       )
       .all(scope, now, now - 3600_000) as {
