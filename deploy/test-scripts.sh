@@ -35,6 +35,7 @@ case "$1 $2" in
       if [[ "$arg" = label=com.docker.compose.project=* ]]; then echo "${arg#label=com.docker.compose.project=}" > "$MOCK_LOG.project"; fi
     done
     echo fixture-runtime; exit ;;
+  'ps -a') printf 'proxy\nruntime\n'; exit ;;
   'network ls') echo fixture_default; exit ;;
   'network inspect')
     if [[ "$*" = *'.Labels'* ]]; then
@@ -116,6 +117,17 @@ test ! -d "$PROXY_DEPLOY_CONFIG.hardware"
 if MAC_OCCUPIED=1 manage up > "$TEMP/occupied" 2>&1; then exit 1; fi
 grep -q 'in use by another container' "$TEMP/occupied"
 ! grep -q ' up -d' "$MOCK_LOG"
+
+# A previous manager must receive this installation's image source and platform on archive handoff.
+program "$TEMP/rollback" 0.3.23
+cat > "$TEMP/rollback/deploy/manage.sh" <<'LEGACY'
+set -eu
+test "$1" = upgrade && test "$CC_DESK_TUNNEL_UNPACKED" = 1 && test "$COMPOSE_REMOVE_ORPHANS" = true
+docker pull --platform "$DOCKER_DEFAULT_PLATFORM" "${CC_DESK_TUNNEL_IMAGE:-ghcr.io/sun168567/cc-desk-tunnel}:0.3.23"
+LEGACY
+tar -czf "$TEMP/old-server.tar.gz" -C "$TEMP/rollback" deploy apps
+manage upgrade --from "$TEMP/old-server.tar.gz" >/dev/null
+grep -Fxq 'pull --platform linux/amd64 ghcr.io/lyy0709/cc-desk-tunnel:0.3.23' "$MOCK_LOG"
 
 # The prebuilt image of the program's own version.
 deployment 1.2.3

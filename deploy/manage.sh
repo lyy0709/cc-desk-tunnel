@@ -511,6 +511,10 @@ case "$command" in
       tar -tzf "$ARCHIVE" | grep -Fx 'deploy/manage.sh' >/dev/null || fail "Not a CC Desk Tunnel server archive."
       retain_hardware
       incoming="$(tar -xzOf "$ARCHIVE" apps/desktop/package.json | sed -n 's/^ *"version": "\([0-9.]*\)".*/\1/p')"
+      if [[ "$incoming" = 0.3.* ]]; then
+        # The old manager defaults to the upstream registry when this override is absent.
+        export CC_DESK_TUNNEL_IMAGE="${CC_DESK_TUNNEL_IMAGE:-ghcr.io/${REPOSITORY,,}}"
+      fi
       if [[ "$incoming" = 0.3.* && -d "$CONFIG.hardware" ]]; then
         # Let the old Compose up retire only our runtime, after its target image is ready.
         services="$(docker ps -a --filter "label=com.docker.compose.project=$PROJECT_NAME" --format '{{.Label "com.docker.compose.service"}}')"
