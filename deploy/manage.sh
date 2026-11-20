@@ -152,6 +152,14 @@ wait_healthy() {
   done
   fail "Service is not healthy. Run manage.sh logs; credentials are not printed automatically."
 }
+# The runtime shares the proxy's network namespace. It must leave before the proxy restarts, then join the new
+# namespace; restarting both concurrently can make Docker attach to an exited container.
+restart_services() {
+  dc stop runtime
+  dc restart proxy
+  dc start runtime
+  wait_healthy
+}
 # A release archive brings the Web client built, and the image uses it over any sources beside it: an archive
 # unpacked into a git checkout leaves the checkout's older client sources in place. A checkout that has moved
 # on since drops the unpacked client, so that the image builds the client from the sources again.
@@ -520,7 +528,7 @@ case "$command" in
   status) dc ps ;;
   logs) dc logs --tail=100 -f ;;
   stop) dc stop ;;
-  restart) dc restart; wait_healthy ;;
+  restart) restart_services ;;
   upgrade)
     # Data, account and configuration live outside the image; only the program is replaced. An installation from
     # a release fetches the next one; a checkout goes on with its own sources.
@@ -591,7 +599,7 @@ case "$command" in
     chmod 600 "$temp"
     [[ "$(id -u)" != 0 ]] || chown 1000:1000 "$temp"
     mv -- "$temp" "$DATA_DIR/config/service.env"
-    if running; then dc restart; wait_healthy; fi
+    if running; then restart_services; fi
     summary ;;
   release-token)
     # Read-only access to the releases of a private repository; without an argument the token is removed.
@@ -610,7 +618,7 @@ case "$command" in
     chmod 600 "$temp"
     [[ "$(id -u)" != 0 ]] || chown 1000:1000 "$temp"
     mv -- "$temp" "$DATA_DIR/config/service.env"
-    if running; then dc restart; wait_healthy; fi
+    if running; then restart_services; fi
     echo "Release token $([[ -n "$RELEASE_TOKEN" ]] && echo saved || echo removed)."
     ;;
   uninstall)
