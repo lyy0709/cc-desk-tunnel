@@ -31,6 +31,8 @@ export type NativeTool = {
   name: string;
   finished: boolean;
   denied?: boolean;
+  // The call's parameters as last recorded, laid out for reading.
+  input?: string;
 };
 export class ClaudeStream {
   emit: (event: EventPayload) => void;
@@ -64,10 +66,19 @@ export class ClaudeStream {
       toolId: id,
       name,
       input: '',
-      privateInput: true,
       target: name.startsWith('mcp__project__') ? '项目设备' : 'Linux',
     });
     return tool;
+  }
+  // The parameters of a call, recorded with the session so that the call can be read later as it was made: first
+  // what the model wrote, then what the CLI made of it where it asks about the call (a plan read from its file, say).
+  // What says nothing new is not recorded again.
+  parameters(tool: NativeTool, input: unknown) {
+    if (input === undefined || input === null) return;
+    const text = JSON.stringify(input, null, 2);
+    if (text === tool.input) return;
+    tool.input = text;
+    this.emit({ type: 'tool.input', toolId: tool.id, input: text });
   }
   accept(value: unknown) {
     const message = jsonObject.parse(value);
@@ -221,7 +232,10 @@ export class ClaudeStream {
         )
           this.emit({ type: 'thinking.delta', messageId: this.messageId, text: value.thinking });
         if (value.type === 'tool_use')
-          this.tool(z.string().parse(value.name), z.string().parse(value.id));
+          this.parameters(
+            this.tool(z.string().parse(value.name), z.string().parse(value.id)),
+            value.input,
+          );
       }
     }
     if (message.type === 'user') {
@@ -247,6 +261,7 @@ export class ClaudeStream {
       if (message.deferred_tool_use) {
         const deferred = jsonObject.parse(message.deferred_tool_use);
         const tool = this.tool(z.string().parse(deferred.name), z.string().parse(deferred.id));
+        this.parameters(tool, deferred.input);
         tool.finished = true;
         this.emit({
           type: 'tool.result',

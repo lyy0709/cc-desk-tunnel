@@ -6,11 +6,12 @@ import { PROJECT_COMMAND_SECONDS, projectOperation } from '@cc-desk-tunnel/proto
 
 const descriptions = {
   list: 'List entries in a directory. Use "." for the root and next for pagination.',
-  read: 'Read UTF-8 text at a byte offset, or a complete PNG, JPEG, WebP or GIF starting at offset 0. The revision identifies the file read. For attachments use the supplied reference.',
+  read: 'Read UTF-8 text at a byte offset, or starting at a 1-based line (which overrides offset). Metadata includes the revision for editing and next byte offset for pagination, followed by the unescaped text. PNG, JPEG, WebP and GIF are read as complete images starting at offset 0. For attachments use the supplied reference.',
   search:
     'Search for literal text in project text files. Returns relative paths and line numbers. Version control, dependency and build output directories such as node_modules are left out and named in "skipped"; give one of them as the path to search inside it.',
-  edit: 'Replace one unique exact excerpt in a previously read text file, using its revision.',
-  create: 'Create a new UTF-8 text file. Fails if the path already exists.',
+  edit: 'Replace one unique exact excerpt in a previously read text file, using its revision. Set all to replace every occurrence. Returns the new revision for the next edit.',
+  create:
+    'Create a new UTF-8 text file. Fails if the path already exists. Returns its revision for editing.',
   output: 'Read the next page of a command result by its id and offset.',
   command: `Run a command from the project directory with the local user’s session grant. A command is stopped after ${PROJECT_COMMAND_SECONDS} seconds, and its result then has timedOut set; nothing can be left running in the background.`,
 };
@@ -24,7 +25,8 @@ for (const variant of projectOperation.options) {
     {
       description: descriptions[name],
       inputSchema: shape,
-      annotations: { readOnlyHint: ['read', 'list', 'search'].includes(name) },
+      // `output` only turns the pages of a result a command already left: it runs nothing.
+      annotations: { readOnlyHint: ['read', 'list', 'search', 'output'].includes(name) },
     },
     async (args: Record<string, unknown>, extra: { signal: AbortSignal }) => {
       const request = (fields: Record<string, unknown>) =>
@@ -98,6 +100,21 @@ for (const variant of projectOperation.options) {
             ],
           };
         }
+      }
+      if (
+        !response.error &&
+        response.text &&
+        ['read', 'list', 'search', 'command', 'output'].includes(name)
+      ) {
+        const result = JSON.parse(response.text);
+        const { text, output, ...metadata } = result;
+        const body = name === 'command' || name === 'output' ? output : text;
+        return {
+          content: [
+            { type: 'text' as const, text: JSON.stringify(metadata) },
+            { type: 'text' as const, text: body ?? '' },
+          ],
+        };
       }
       return {
         isError: !!response.error,

@@ -87,3 +87,23 @@ test('pictures a tool looked at are taken out of its output', () => {
     null,
   );
 });
+
+test('text MCP blocks preserve newlines and unwrap only the historical project envelope', () => {
+  const body = 'const path = "C:\\项目";\n第二行🙂\n';
+  const legacy = JSON.stringify([
+    { type: 'text', text: JSON.stringify({ text: body, revision: 'r1', next: 42 }) },
+  ]);
+  assert.deepEqual(toolPictures(legacy, true), {
+    text: '{"revision":"r1","next":42}\n' + body,
+    pictures: [],
+  });
+  const fileJson = '{"text":"this is file content"}';
+  const current = JSON.stringify([
+    { type: 'text', text: '{"revision":"r2"}' },
+    { type: 'text', text: fileJson },
+  ]);
+  assert.equal(toolPictures(current, true).text, '{"revision":"r2"}\n' + fileJson);
+  assert.equal(toolPictures(JSON.stringify([{ type: 'text', text: body }])).text, body);
+  assert.equal(toolPictures('[]'), null);
+  assert.equal(toolPictures('[{"type":"unknown","text":"keep"}]'), null);
+});

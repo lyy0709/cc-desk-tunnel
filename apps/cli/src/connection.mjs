@@ -58,7 +58,6 @@ export class Service extends EventEmitter {
             ),
           ),
           chooseRoot: async (path) => path === (await realpath(process.cwd())),
-          confirmFile: async () => false,
         },
         environment: {},
         log,

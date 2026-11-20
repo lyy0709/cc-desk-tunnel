@@ -54,6 +54,8 @@ export type TranscriptItem =
       privateInput?: boolean;
       target: string;
       approvalId?: string;
+      // The approval may be answered for the rest of the session (see `approval.requested`).
+      rememberable?: boolean;
       approved?: boolean;
       confirmedMode?: PermissionMode;
       resolved: boolean;
@@ -130,6 +132,7 @@ export function transcript(events: SessionEvent[]): TranscriptItem[] {
       const tool = byId.get(payload.toolId);
       if (tool?.kind === 'tool') {
         tool.approvalId = payload.approvalId;
+        if (payload.rememberable) tool.rememberable = true;
         tool.status = '等待审批';
         tool.state = 'approval';
         byApproval.set(payload.approvalId, tool);

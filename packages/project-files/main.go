@@ -3,6 +3,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -20,12 +21,16 @@ import (
 )
 
 const page = 12000
+const textPage = 32000
+const textBudget = 90000
 const imagePage = 64 << 10
 const maxEdit = 4 << 20
 
 type input struct {
 	Op, Path, Query, Old, New, Identity, Revision string
 	Offset                                        int
+	Line                                          int
+	All                                           bool
 }
 type result struct {
 	Text     string   `json:"text"`
@@ -33,6 +38,7 @@ type result struct {
 	Next     int      `json:"next,omitempty"`
 	Skipped  []string `json:"skipped,omitempty"`
 	Error    string   `json:"error,omitempty"`
+	Offset   int      `json:"offset,omitempty"`
 }
 
 // Directories a search leaves out unless it is pointed at or into one: version control, installed dependencies
@@ -64,7 +70,7 @@ func run(root *os.Root, q input) (result, error) {
 	if name == "" {
 		name = "."
 	}
-	if !fs.ValidPath(name) || strings.ContainsAny(name, "\\:\x00") || !filepath.IsLocal(filepath.FromSlash(name)) || q.Offset < 0 {
+	if !fs.ValidPath(name) || strings.ContainsAny(name, "\\:\x00") || !filepath.IsLocal(filepath.FromSlash(name)) || q.Offset < 0 || q.Line < 0 {
 		return result{}, bad("invalid relative path or offset")
 	}
 	// Only a write may recover the original left by an interrupted edit.
@@ -199,7 +205,7 @@ func run(root *os.Root, q input) (result, error) {
 			return result{}, closed
 		}
 		// Publish only after writing succeeds. Link fails if an editor created the target meanwhile.
-		return result{Text: name}, root.Link(temp, name)
+		return result{Text: name, Revision: fmt.Sprintf("%x", sha256.Sum256([]byte(q.New)))}, root.Link(temp, name)
 	case "read", "image", "edit":
 		f, e := root.Open(name)
 		if e != nil {
@@ -240,27 +246,76 @@ func run(root *os.Root, q input) (result, error) {
 			return r, nil
 		}
 		if q.Op == "read" {
-			_, e = f.Seek(int64(q.Offset), 0)
-			if e != nil {
-				return result{}, e
-			}
-			b, e := io.ReadAll(io.LimitReader(f, page+1))
-			if e != nil {
-				return result{}, e
-			}
-			out := result{Revision: revision}
-			if len(b) > page {
-				b = b[:page]
-				for len(b) > 0 && !utf8.Valid(b) {
-					if len(b) < page-3 {
-						return result{}, bad("UTF-8 text only")
+			offset := min(int64(q.Offset), info.Size())
+			if q.Line > 0 {
+				offset = 0
+				reader := bufio.NewReader(f)
+				for line := 1; line < q.Line; {
+					part, err := reader.ReadSlice('\n')
+					offset += int64(len(part))
+					if err == io.EOF {
+						break
 					}
-					b = b[:len(b)-1]
+					if err != nil && err != bufio.ErrBufferFull {
+						return result{}, err
+					}
+					if err == nil {
+						line++
+					}
 				}
-				out.Next = q.Offset + len(b)
 			}
-			if !utf8.Valid(b) || strings.IndexByte(string(b), 0) >= 0 {
+			// A byte offset may point into a multibyte character. Start at that character, never in its middle.
+			for back := 0; offset > 0 && offset < info.Size() && back < utf8.UTFMax; back++ {
+				one := []byte{0}
+				if _, e = f.ReadAt(one, offset); e != nil {
+					return result{}, e
+				}
+				if utf8.RuneStart(one[0]) {
+					break
+				}
+				offset--
+			}
+			b := make([]byte, textPage+utf8.UTFMax)
+			n, e := f.ReadAt(b, offset)
+			if e != nil && e != io.EOF {
+				return result{}, e
+			}
+			b = b[:n]
+			end := min(len(b), textPage)
+			for end < len(b) && end > 0 && !utf8.RuneStart(b[end]) {
+				end--
+			}
+			b = b[:end]
+			if !utf8.Valid(b) || bytes.IndexByte(b, 0) >= 0 {
 				return result{}, bad("UTF-8 text only")
+			}
+			// Keep the JSON-escaped reply within the transport limit, including control characters and HTML escapes.
+			cost := 0
+			for at, r := range string(b) {
+				size := utf8.RuneLen(r)
+				switch r {
+				case '\n', '\r', '\t', '\b', '\f', '"', '\\':
+					size = 2
+				case '<', '>', '&', '\u2028', '\u2029':
+					size = 6
+				default:
+					if r < 32 {
+						size = 6
+					}
+				}
+				if cost+size > textBudget {
+					b = b[:at]
+					break
+				}
+				cost += size
+			}
+			out := result{Revision: revision, Offset: int(offset)}
+			if offset+int64(len(b)) < info.Size() {
+				// Complete lines make the page easier to use as an exact edit excerpt.
+				if at := bytes.LastIndexByte(b, '\n'); at >= 0 {
+					b = b[:at+1]
+				}
+				out.Next = int(offset) + len(b)
 			}
 			out.Text = string(b)
 			return out, nil
@@ -269,13 +324,22 @@ func run(root *os.Root, q input) (result, error) {
 		if e != nil {
 			return result{}, e
 		}
-		if q.Revision != fmt.Sprintf("%x", sha256.Sum256(b)) || len(b) > maxEdit || !utf8.Valid(b) || q.Old == "" || strings.Count(string(b), q.Old) != 1 {
+		count := strings.Count(string(b), q.Old)
+		if q.Revision != fmt.Sprintf("%x", sha256.Sum256(b)) || len(b) > maxEdit || !utf8.Valid(b) || q.Old == "" || count == 0 || (count != 1 && !q.All) {
 			return result{}, bad("edit conflict: read the current file and select unique text")
 		}
 		link, e := root.Lstat(name)
 		if e != nil || !os.SameFile(info, link) {
 			return result{}, bad("edit conflict")
 		}
+		if !q.All {
+			count = 1
+		}
+		// Check expansion before allocating: replacing a short repeated excerpt can otherwise exhaust memory.
+		if len(b)+count*(len(q.New)-len(q.Old)) > maxEdit {
+			return result{}, bad("edited file exceeds 4 MiB")
+		}
+		next := strings.Replace(string(b), q.Old, q.New, count)
 		temp, e := tempName(name)
 		if e != nil {
 			return result{}, e
@@ -285,7 +349,7 @@ func run(root *os.Root, q input) (result, error) {
 			return result{}, e
 		}
 		defer root.Remove(temp)
-		_, e = io.WriteString(tmp, strings.Replace(string(b), q.Old, q.New, 1))
+		_, e = io.WriteString(tmp, next)
 		if e == nil {
 			e = tmp.Chmod(info.Mode().Perm())
 		}
@@ -299,7 +363,7 @@ func run(root *os.Root, q input) (result, error) {
 		if e = lockEdit(f); e != nil {
 			return result{}, bad("edit conflict: file is busy")
 		}
-		return result{Text: name}, publishEdit(root, name, temp, f, info, q.Revision)
+		return result{Text: name, Revision: fmt.Sprintf("%x", sha256.Sum256([]byte(next)))}, publishEdit(root, name, temp, f, info, q.Revision)
 	}
 	return result{}, bad("unknown file operation")
 }

@@ -2,12 +2,14 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 )
 
 func TestProjectBoundary(t *testing.T) {
@@ -62,6 +64,86 @@ func TestProjectBoundary(t *testing.T) {
 	second, e2 := call(input{Op: "read", Path: "large", Offset: first.Next})
 	if e != nil || e2 != nil || len(first.Text) != first.Next || first.Next == 0 || !strings.HasPrefix(second.Text, "页") {
 		t.Fatalf("invalid pages %v %v", e, e2)
+	}
+}
+
+func TestTextPagesAndEditRevisions(t *testing.T) {
+	base := t.TempDir()
+	root, err := os.OpenRoot(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer root.Close()
+	id, err := run(root, input{Op: "bind"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := func(q input) result {
+		t.Helper()
+		q.Identity = id.Text
+		r, err := run(root, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r
+	}
+	created := call(input{Op: "create", Path: "edit.txt", New: "first\r\n重复\r\n重复\r\n"})
+	read := call(input{Op: "read", Path: "edit.txt", Line: 2, Offset: 1})
+	if read.Text != "重复\r\n重复\r\n" || read.Offset != 7 || read.Revision != created.Revision {
+		t.Fatalf("line read: %+v", read)
+	}
+	if _, err = run(root, input{Op: "edit", Path: "edit.txt", Old: "重复", New: "changed", Revision: created.Revision, Identity: id.Text}); err == nil {
+		t.Fatal("ambiguous edit accepted without all")
+	}
+	edited := call(input{Op: "edit", Path: "edit.txt", Old: "重复", New: "changed", All: true, Revision: created.Revision})
+	call(input{Op: "edit", Path: "edit.txt", Old: "first", New: "FIRST", Revision: edited.Revision})
+	if got := call(input{Op: "read", Path: "edit.txt"}); got.Text != "FIRST\r\nchanged\r\nchanged\r\n" {
+		t.Fatal(got)
+	}
+	if _, err = run(root, input{Op: "edit", Path: "edit.txt", Old: "changed", New: "stale", All: true, Revision: edited.Revision, Identity: id.Text}); err == nil {
+		t.Fatal("stale revision accepted with all")
+	}
+	if got := call(input{Op: "read", Path: "edit.txt", Line: 99}); got.Text != "" || got.Next != 0 {
+		t.Fatal(got)
+	}
+	limited := call(input{Op: "create", Path: "limit.txt", New: strings.Repeat("a", 2000)})
+	if _, err = run(root, input{Op: "edit", Path: "limit.txt", Old: "a", New: strings.Repeat("b", 3000), All: true, Revision: limited.Revision, Identity: id.Text}); err == nil || !strings.Contains(err.Error(), "4 MiB") {
+		t.Fatalf("unbounded replacement: %v", err)
+	}
+	if got := call(input{Op: "read", Path: "limit.txt"}); got.Revision != limited.Revision {
+		t.Fatal("oversized edit changed the file")
+	}
+	for _, content := range []string{strings.Repeat("页🙂", 10000), strings.Repeat("line\r\n", 10000), strings.Repeat("\x01<&", 16000)} {
+		if err = os.WriteFile(filepath.Join(base, "pages.txt"), []byte(content), 0600); err != nil {
+			t.Fatal(err)
+		}
+		var whole strings.Builder
+		offset := 0
+		for {
+			part := call(input{Op: "read", Path: "pages.txt", Offset: offset})
+			encoded, err := json.Marshal(part)
+			if err != nil || len(encoded) >= 120000 || !utf8.ValidString(part.Text) {
+				t.Fatalf("invalid page: bytes=%d err=%v", len(encoded), err)
+			}
+			whole.WriteString(part.Text)
+			if part.Next == 0 {
+				break
+			}
+			if part.Next <= offset {
+				t.Fatal("pagination did not advance")
+			}
+			offset = part.Next
+		}
+		if whole.String() != content {
+			t.Fatal("paged text changed")
+		}
+	}
+	call(input{Op: "create", Path: "utf8.txt", New: "中🙂文"})
+	for _, offset := range []int{1, 2} {
+		got := call(input{Op: "read", Path: "utf8.txt", Offset: offset})
+		if got.Text != "中🙂文" || got.Offset != 0 {
+			t.Fatal(got)
+		}
 	}
 }
 

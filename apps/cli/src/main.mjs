@@ -21,7 +21,6 @@ const HELP = `ccdt：在自己的终端里使用 CC Desk Tunnel 服务端上的�
 用法：
   ccdt                   接着当前目录这个项目最近的会话；没有就新建
   ccdt -r                从当前项目的会话里选一个打开（加 --all 从全部会话里选）
-  ccdt --allow-commands  授权当前目录的本次会话以当前用户身份执行命令
   ccdt new [标题]        在当前目录新建会话
   ccdt sessions [--all]  列出当前项目的会话；--all 列出全部
   ccdt usage             订阅额度与本周期调用统计（图形客户端与终端合计）
@@ -560,21 +559,14 @@ function usage(summary) {
 // Shows the session's terminal until it ends, taking it up again after the connection is lost. Closing the window
 // ends it too, as it would a local CLI.
 async function show(config, values, service, session, fresh) {
-  if (!session.projectAccess) {
-    if (
-      (await readLine('旧会话可能含用户名和绝对路径。输入 YES 同意继续使用旧上下文：')) !== 'YES'
-    ) {
-      await service.close();
-      return 1;
-    }
-    if (sameDirectory(session.projectPath, process.cwd()))
-      await service.request({
-        type: 'session.move',
-        sessionId: session.id,
-        projectPath: process.cwd(),
-      });
-    await service.request({ type: 'session.acceptHistory', sessionId: session.id });
-  }
+  // A session from before projects were bound is bound to this directory, where it is; the service takes it up from
+  // there with the history it has.
+  if (!session.projectAccess && sameDirectory(session.projectPath, process.cwd()))
+    await service.request({
+      type: 'session.move',
+      sessionId: session.id,
+      projectPath: process.cwd(),
+    });
   const shown = {};
   let closing = false;
   const close = async () => {
@@ -625,10 +617,6 @@ async function show(config, values, service, session, fresh) {
       let result;
       try {
         await service.channel();
-        if (values['allow-commands'] && sameDirectory(session.projectPath, process.cwd())) {
-          service.bridge.projects.commands(session.id, true);
-          values['allow-commands'] = false;
-        }
         result = await relay(service, session.id, shown);
       } catch (error) {
         // Nothing to show, such as a terminal the service would not open: the connection is let go, for ccdt to end.
@@ -670,6 +658,7 @@ export async function main(argv) {
       args: argv,
       allowPositionals: true,
       options: {
+        // Taken and ignored: until 0.4.1 it granted what a session now has by its project being bound here.
         'allow-commands': { type: 'boolean' },
         resume: { type: 'boolean', short: 'r' },
         server: { type: 'string' },

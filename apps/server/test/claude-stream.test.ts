@@ -84,7 +84,7 @@ test('native partial text/thinking are not duplicated by complete assistant even
   assert.equal(events.filter((event) => event.type === 'thinking.delta').length, 1);
   assert.equal(stream.result?.failed, false);
 });
-test('native tool identity and results stay correlated without retaining complete or streamed inputs', () => {
+test('native tool identity and results stay correlated, and the parameters are recorded once the call is whole', () => {
   const events: EventPayload[] = [];
   const stream = new ClaudeStream((event) => events.push(event));
   const toolId = 'call_native_not_uuid';
@@ -119,8 +119,22 @@ test('native tool identity and results stay correlated without retaining complet
     },
   });
   assert.equal(stream.tool('Bash', toolId).id, toolId);
-  assert.ok(!JSON.stringify(events).includes('echo private-fixture'));
-  assert.ok(events.some((e) => e.type === 'tool.requested' && e.privateInput && e.input === ''));
+  // The call is announced with nothing, and its parameters follow as the whole message has them: once, not in the
+  // pieces they were streamed in.
+  assert.ok(events.some((e) => e.type === 'tool.requested' && !e.privateInput && e.input === ''));
+  const recorded = () => events.filter((event) => event.type === 'tool.input');
+  assert.deepEqual(recorded(), [
+    {
+      type: 'tool.input',
+      toolId,
+      input: JSON.stringify({ command: 'echo private-fixture' }, null, 2),
+    },
+  ]);
+  // What the CLI makes of them when it asks about the call is recorded where it says something new.
+  stream.parameters(stream.tool('Bash', toolId), { command: 'echo private-fixture' });
+  assert.equal(recorded().length, 1);
+  stream.parameters(stream.tool('Bash', toolId), { command: 'echo private-fixture', timeout: 5 });
+  assert.equal(recorded().length, 2);
   stream.accept({
     type: 'user',
     message: {
@@ -221,7 +235,7 @@ test("a call waiting on a foreground task names it; a background task or another
   );
 });
 
-test('a deferred native tool ends in its own state without mirroring its input', () => {
+test('a deferred native tool ends in its own state, with the parameters it was asked with', () => {
   const events: EventPayload[] = [];
   const stream = new ClaudeStream((event) => events.push(event));
   stream.accept({
@@ -241,7 +255,16 @@ test('a deferred native tool ends in its own state without mirroring its input',
     output: '',
     exitCode: null,
   });
-  assert.ok(!JSON.stringify(events).includes('private replacement'));
+  assert.deepEqual(
+    events.filter((event) => event.type === 'tool.input'),
+    [
+      {
+        type: 'tool.input',
+        toolId: 'deferred-1',
+        input: JSON.stringify({ new: 'private replacement' }, null, 2),
+      },
+    ],
+  );
 });
 
 test('requested and effective native approval modes remain distinct', () => {

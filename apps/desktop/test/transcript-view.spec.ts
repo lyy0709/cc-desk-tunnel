@@ -71,8 +71,21 @@ test('commands share one readable surface, preserve exact copy and keep native r
     requested('live', 'Bash', JSON.stringify({ command: 'node scripts/watch.mjs' })),
     event({ type: 'tool.output', toolId: 'live', stream: 'stdout', text: '开始读取日志\n' }),
     requested('partial', 'Bash', '{"command":'),
+    requested('project-text', 'mcp__project__read', '{"path":"src/中文.ts"}'),
+    result(
+      'project-text',
+      JSON.stringify([
+        {
+          type: 'text',
+          text: JSON.stringify({ text: '第一行\nconst value = "中文";\n', revision: 'r1' }),
+        },
+      ]),
+      null,
+    ),
+    requested('project-command', 'mcp__project__command', '{"command":"echo fixture"}'),
   ];
   const requests: string[] = [];
+  const replies: Record<string, unknown>[] = [];
   let publish = (_payload: unknown) => {};
   await page.addInitScript(() =>
     Object.defineProperty(navigator.clipboard, 'writeText', {
@@ -97,6 +110,7 @@ test('commands share one readable surface, preserve exact copy and keep native r
           sessions: [session],
         });
       requests.push(message.type);
+      if (message.type === 'approval.reply') replies.push(message);
       if (message.type === 'session.subscribe')
         send({
           type: 'session.snapshot',
@@ -186,6 +200,33 @@ test('commands share one readable surface, preserve exact copy and keep native r
   await expect(page.locator('.find-count')).toHaveText('1 / 1');
   await expect(long.locator('.command-content')).toHaveClass(/expanded/);
   expect(requests).not.toContain('message.send');
+  await page.getByLabel('查找对话内容', { exact: true }).fill('');
+  const projectText = tools.nth(6);
+  await projectText.locator('> summary').click();
+  expect(await projectText.locator('.tool-output').textContent()).toBe(
+    '{"revision":"r1"}\n第一行\nconst value = "中文";\n',
+  );
+  await expect(projectText.getByLabel('含图片')).toHaveCount(0);
+  await expect(projectText.locator('.tool-pictures')).toHaveCount(0);
+  await projectText.getByRole('button', { name: '复制工具输出', exact: true }).click();
+  expect(await page.evaluate(() => (window as unknown as { copied: string }).copied)).toContain(
+    '第一行\nconst value = "中文";\n',
+  );
+  const rememberId = randomUUID();
+  publish({
+    type: 'approval.requested',
+    approvalId: rememberId,
+    toolId: 'project-command',
+    rememberable: true,
+  });
+  await tools.nth(7).getByRole('button', { name: '本会话不再询问', exact: true }).click();
+  expect(replies).toHaveLength(1);
+  expect(replies[0]).toMatchObject({
+    type: 'approval.reply',
+    allowed: true,
+    remember: true,
+    approvalId: rememberId,
+  });
 });
 
 const planText = `# 计划阅读与执行流程

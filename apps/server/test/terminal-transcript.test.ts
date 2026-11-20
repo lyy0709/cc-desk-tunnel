@@ -74,14 +74,20 @@ test('a terminal turn comes back as the events of a chat run, without what was t
   );
   assert.deepEqual(
     events.map((event) => event.type),
-    ['message.user', 'text.delta', 'tool.requested', 'tool.result', 'text.delta'],
+    ['message.user', 'text.delta', 'tool.requested', 'tool.input', 'tool.result', 'text.delta'],
   );
-  const [prompt, first, tool, result, second] = events as never[] as Record<string, unknown>[];
+  const [prompt, first, tool, input, result, second] = events as never[] as Record<
+    string,
+    unknown
+  >[];
   assert.equal(prompt.text, '终端里问的');
   assert.equal(first.text, '先看看');
   assert.equal(tool.name, 'Bash');
   assert.equal(tool.input, '');
-  assert.equal(tool.privateInput, true);
+  assert.equal(tool.privateInput, undefined);
+  // The call's parameters are recorded with it, as the record holds them.
+  assert.equal(input.toolId, 'toolu_1');
+  assert.equal(input.input, JSON.stringify({ command: 'ls' }, null, 2));
   assert.equal(result.status, 'completed');
   assert.equal(result.output, 'a.txt');
   assert.equal(second.text, '有一个文件');
@@ -229,6 +235,7 @@ test('the record is read as the CLI writes it, and a turn shows part by part as 
     'message.user 看看目录',
     'text.delta 先看看',
     'tool.requested',
+    'tool.input',
     'tool.result',
   ]);
   assert.equal(transcript.cacheTtl(), '1h');

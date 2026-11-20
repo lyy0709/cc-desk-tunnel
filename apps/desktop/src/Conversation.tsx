@@ -96,6 +96,8 @@ type Live = {
     allowed: boolean,
     answers?: Record<string, string>,
     executionMode?: PlanExecutionMode,
+    // Allows the calls like this one for the rest of the session too, where the approval's detail offers it.
+    remember?: boolean,
   ) => void;
   // The foreground task a running call waits on, while this window may act on it: 'sent' once it has, until
   // the call returns.
@@ -448,7 +450,7 @@ function CommandBody({
             {output}
           </pre>
         )}
-        {pictures && (
+        {!!pictures?.pictures.length && (
           <div className="tool-pictures">
             {pictures.pictures.map((picture, index) => (
               <Picture key={index} src={pictureUrl(picture)} alt={`图片 ${index + 1}`} />
@@ -534,24 +536,43 @@ function PendingTool({ tool, active, live }: ToolRowProps) {
         </button>
       </div>
     );
+  // While the approval lasts, what was fetched for it is shown as the call's own parameters would be.
+  const shown = { ...tool, input: detail.input, privateInput: false };
+  // A plan, a question and a command show a part of their parameters in a form of their own, so the whole is kept
+  // beside it; any other call shows all of them itself.
+  const partial =
+    ['ExitPlanMode', 'AskUserQuestion'].includes(tool.name) || !!describe(shown, active).command;
   return (
     <div className="approval-preview">
       {detail.title && <strong>{detail.title}</strong>}
       {detail.description && <p>{detail.description}</p>}
-      <details>
-        <summary>查看完整工具参数</summary>
-        <pre className="tool-input">{detail.input}</pre>
-      </details>
-      <ToolContent tool={{ ...tool, input: detail.input }} active={active} live={live} />
+      {partial && (
+        <details>
+          <summary>查看完整工具参数</summary>
+          <pre className="tool-input">{detail.input}</pre>
+        </details>
+      )}
+      <ToolContent tool={shown} active={active} live={live} rememberable={detail.rememberable} />
     </div>
   );
 }
 
-function ToolContent({ tool, active, live }: ToolRowProps) {
+function ToolContent({
+  tool,
+  active,
+  live,
+  rememberable = false,
+}: ToolRowProps & {
+  // The approval may be answered for the rest of the session.
+  rememberable?: boolean;
+}) {
   const { category, command, description, verb, subject, added, removed, running, failed } =
     describe(tool, active);
   const Icon = icons[category];
-  const pictures = useMemo(() => (tool.output ? toolPictures(tool.output) : null), [tool.output]);
+  const pictures = useMemo(
+    () => (tool.output ? toolPictures(tool.output, tool.name.startsWith('mcp__project__')) : null),
+    [tool.output, tool.name],
+  );
   const approval = live.canApprove(tool);
   const control = live.taskControl(tool);
   // A question Claude asks is answered, not allowed or denied.
@@ -586,7 +607,9 @@ function ToolContent({ tool, active, live }: ToolRowProps) {
           <span className="tool-subject" title={command || subject}>
             {subject}
           </span>
-          {pictures && <ImageIcon className="tool-picture-mark" aria-label="含图片" />}
+          {!!pictures?.pictures.length && (
+            <ImageIcon className="tool-picture-mark" aria-label="含图片" />
+          )}
           {(added > 0 || removed > 0) && (
             <span className="tool-diff">
               <ins>+{added}</ins>
@@ -639,11 +662,13 @@ function ToolContent({ tool, active, live }: ToolRowProps) {
                       </pre>
                     </>
                   )}
-                  <div className="tool-pictures">
-                    {pictures.pictures.map((picture, index) => (
-                      <Picture key={index} src={pictureUrl(picture)} alt={`图片 ${index + 1}`} />
-                    ))}
-                  </div>
+                  {!!pictures.pictures.length && (
+                    <div className="tool-pictures">
+                      {pictures.pictures.map((picture, index) => (
+                        <Picture key={index} src={pictureUrl(picture)} alt={`图片 ${index + 1}`} />
+                      ))}
+                    </div>
+                  )}
                 </>
               ) : (
                 tool.output && (
@@ -671,6 +696,17 @@ function ToolContent({ tool, active, live }: ToolRowProps) {
                 <X />
                 拒绝
               </button>
+              {(rememberable || tool.rememberable) && (
+                <button
+                  type="button"
+                  className="button secondary"
+                  disabled={live.busy || live.answered(tool)}
+                  title="允许这条命令，本会话之后的本机命令也不再逐条询问；这台电脑的连接断开或服务重启后恢复询问"
+                  onClick={() => live.reply(tool, true, undefined, undefined, true)}
+                >
+                  本会话不再询问
+                </button>
+              )}
               <button
                 type="button"
                 className="button primary"
@@ -1100,6 +1136,7 @@ export default function Conversation({
     allowed: boolean,
     answers?: Record<string, string>,
     executionMode?: PlanExecutionMode,
+    remember?: boolean,
     // Whether the answer reached the service.
   ) => Promise<boolean>;
   edit?: (
@@ -1251,13 +1288,13 @@ export default function Conversation({
       answered: (tool) => !!tool.approvalId && answered.has(tool.approvalId),
       canApprove: (tool) =>
         connected && ownsRun && activeRun === tool.runId && !tool.resolved && !!tool.approvalId,
-      reply: (tool, allowed, answers, executionMode) => {
+      reply: (tool, allowed, answers, executionMode, remember) => {
         const id = tool.approvalId!;
         if (answering.current.has(id)) return;
         answering.current.add(id);
         setAnswered((value) => new Set(value).add(id));
         void actions.current
-          .replyApproval(tool.runId, id, allowed, answers, executionMode)
+          .replyApproval(tool.runId, id, allowed, answers, executionMode, remember)
           .then((sent) => {
             if (sent) return;
             answering.current.delete(id);

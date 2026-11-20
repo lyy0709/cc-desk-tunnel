@@ -14,8 +14,8 @@ function fenced(text: string) {
 }
 
 // A picture a tool looked at is named by its type and size, not written out as its data.
-function toolOutput(output: string) {
-  const pictures = toolPictures(output);
+function toolOutput(output: string, name: string) {
+  const pictures = toolPictures(output, name.startsWith('mcp__project__'));
   return pictures
     ? [pictures.text, ...pictures.pictures.map(pictureNote)].filter(Boolean).join('\n')
     : output;
@@ -35,7 +35,7 @@ function turnMarkdown(turns: Turn[], offset = 0) {
     if (item.kind !== 'work') return [];
     return item.items.map((work) =>
       work.kind === 'tool'
-        ? `<details>\n<summary>工具 ${work.name} · ${work.status}</summary>\n\n${fenced(work.input)}\n\n${work.output || work.liveOutput ? fenced(toolOutput(work.output ?? work.liveOutput!)) : ''}\n</details>`
+        ? `<details>\n<summary>工具 ${work.name} · ${work.status}</summary>\n\n${fenced(work.input)}\n\n${work.output || work.liveOutput ? fenced(toolOutput(work.output ?? work.liveOutput!, work.name)) : ''}\n</details>`
         : `<details>\n<summary>思考</summary>\n\n${work.text}\n</details>`,
     );
   };

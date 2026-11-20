@@ -114,19 +114,7 @@ test('configured provider: account metrics, Windows execution, running input, na
     await settled(page);
     const marker = `PRO-STREAM-${Date.now()}`;
     await rename(page, marker);
-    await app.evaluate(({ dialog }, folder) => {
-      const original = dialog.showMessageBox.bind(dialog);
-      dialog.showMessageBox = (...args: any[]) => {
-        const options = args.at(-1);
-        if (
-          options.message === '允许本会话运行本机命令？' &&
-          options.detail?.startsWith(folder + '\n')
-        )
-          return Promise.resolve({ response: 1, checkboxChecked: false });
-        return (original as (...args: any[]) => ReturnType<typeof original>)(...args);
-      };
-    }, project);
-    await page.getByRole('button', { name: '本会话命令权限' }).click();
+    await expect(page.getByRole('button', { name: '本会话命令权限', exact: true })).toHaveCount(0);
 
     await page.getByRole('button', { name: '设置与账号', exact: true }).click();
     await page.getByRole('menuitem', { name: /^账号/ }).click();

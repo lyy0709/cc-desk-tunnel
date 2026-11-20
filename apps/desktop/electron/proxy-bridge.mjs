@@ -6,7 +6,11 @@ import { connect } from 'node:tls';
 import { join } from 'node:path';
 import { pipeline } from 'node:stream/promises';
 import { WebSocket, WebSocketServer } from 'ws';
-import { serverMessageSchema, MAX_FRAME_BYTES } from '@cc-desk-tunnel/protocol';
+import {
+  serverMessageSchema,
+  MAX_FRAME_BYTES,
+  PROJECT_REPLY_CHARS,
+} from '@cc-desk-tunnel/protocol';
 import { findGitBash } from './git-bash.mjs';
 import { basename } from 'node:path';
 import { resolvePosixShell } from './shell-environment.mjs';
@@ -320,7 +324,20 @@ export async function openProxyBridge(
             (error) => ({ ...result, error: true, text: error.message }),
           )
           .then((reply) => {
-            if (!closed && remote.readyState === WebSocket.OPEN) remote.send(JSON.stringify(reply));
+            if (closed || remote.readyState !== WebSocket.OPEN) return;
+            // A result larger than the service takes would end this connection, and leave the call waiting for an
+            // answer that never comes: it is answered with why instead.
+            const frame = JSON.stringify(reply);
+            remote.send(
+              reply.text.length > PROJECT_REPLY_CHARS ||
+                Buffer.byteLength(frame) > MAX_FRAME_BYTES - 1024
+                ? JSON.stringify({
+                    ...result,
+                    error: true,
+                    text: '结果超过单次传输的上限，没有传回。请缩小范围，或分段读取。',
+                  })
+                : frame,
+            );
           });
         return;
       }

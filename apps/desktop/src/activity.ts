@@ -17,6 +17,13 @@ const categories: Record<string, Category> = {
   WebSearch: 'web',
   Agent: 'agent',
   Task: 'agent',
+  // The tools of a project on a device (the service's project-mcp.ts), which stand in for the built-in ones there.
+  mcp__project__command: 'command',
+  mcp__project__edit: 'edit',
+  mcp__project__create: 'edit',
+  mcp__project__read: 'read',
+  mcp__project__list: 'read',
+  mcp__project__search: 'search',
 };
 // [while running, once done, group phrase while running, group phrase once done]
 const words: Record<Category, [string, string, string, (count: number) => string]> = {
@@ -65,13 +72,14 @@ export function describe(tool: Tool, active: boolean) {
   if (category === 'command')
     subject = command?.trim().split('\n')[0] || description || tool.input.trim().split('\n')[0];
   else if (category === 'edit') {
-    subject = fileName(input.file_path ?? input.notebook_path);
+    // The project tools call the file `path` and the text taken out and put in `old` and `new`.
+    subject = fileName(input.file_path ?? input.notebook_path ?? input.path);
     const edits = Array.isArray(input.edits) ? (input.edits as Record<string, unknown>[]) : [input];
     for (const edit of edits) {
-      added += lineCount(edit.new_string ?? edit.content ?? edit.new_source);
-      removed += lineCount(edit.old_string);
+      added += lineCount(edit.new_string ?? edit.content ?? edit.new_source ?? edit.new);
+      removed += lineCount(edit.old_string ?? edit.old);
     }
-  } else if (category === 'read') subject = fileName(input.file_path);
+  } else if (category === 'read') subject = fileName(input.file_path ?? input.path);
   else if (category === 'search') subject = text(input.pattern) || text(input.query);
   else if (category === 'web') subject = text(input.url) || text(input.query);
   else if (category === 'agent') subject = text(input.description);

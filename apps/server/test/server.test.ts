@@ -93,7 +93,7 @@ test(
         const controller = new AbortController();
         run.emit({type:'tool.requested', toolId:id, name, input:'{}', target:'Linux'});
         const result = run.approve(id, name === 'AskUserQuestion' ? 'question' : 'approval', name,
-          AbortSignal.any([controller.signal, run.signal]));
+          AbortSignal.any([controller.signal, run.signal]), {input:'{}'});
         return {controller, result};
       };
       fixture.first = fixture.request('first', 'Bash');

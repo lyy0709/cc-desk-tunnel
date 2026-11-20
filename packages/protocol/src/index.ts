@@ -6,7 +6,7 @@ import { webCertificateStateSchema } from './web-certificate.ts';
 export * from './web.ts';
 export * from './web-certificate.ts';
 
-export const PROTOCOL_VERSION = 37;
+export const PROTOCOL_VERSION = 38;
 // The release each protocol version began with, from 0.2.4 on: a client newer than its service signs in with
 // the service's number to have it upgrade (see the README). A new number adds its line here.
 export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
@@ -35,6 +35,7 @@ export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
   '0.3.23': 32,
   '0.4.0': 36,
   '0.4.1': 37,
+  '0.4.2': 38,
 };
 export const MAX_FRAME_BYTES = 256 * 1024;
 export const APPROVAL_PAGE_CHARS = 16000;
@@ -482,7 +483,13 @@ export const eventPayloadSchema = z.discriminatedUnion('type', [
     toolUses: z.number().int().nonnegative().optional(),
     summary: z.string().max(300).optional(),
   }),
-  z.object({ type: z.literal('approval.requested'), approvalId: id, toolId: z.string().min(1) }),
+  z.object({
+    type: z.literal('approval.requested'),
+    approvalId: id,
+    toolId: z.string().min(1),
+    // The answer may be `remember`: to allow the calls like this one for the rest of the session without asking.
+    rememberable: z.literal(true).optional(),
+  }),
   z.object({
     type: z.literal('approval.resolved'),
     approvalId: id,
@@ -946,6 +953,9 @@ export const commandSchema = z.discriminatedUnion('type', [
       approvalId: id,
       allowed: z.boolean(),
       executionMode: planExecutionModeSchema.optional(),
+      // Allows this call and, for the rest of the session, the ones like it without asking: only where the approval's
+      // detail said `rememberable`.
+      remember: z.literal(true).optional(),
       // The answers to a question Claude asked, keyed by the question's text.
       answers: z.record(z.string().max(2000), z.string().max(4000)).optional(),
     })
@@ -1023,6 +1033,9 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
       next: z.number().int().positive().optional(),
       title: z.string().max(512).optional(),
       description: z.string().max(2048).optional(),
+      // The user may answer with `remember`: a command on the project's computer, which that computer has already
+      // granted this session.
+      rememberable: z.literal(true).optional(),
     })
     .strict(),
   z.object({ type: z.literal('project.cancel'), requestId: id }),

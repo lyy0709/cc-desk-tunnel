@@ -174,27 +174,6 @@ handle('project:choose', async (event) => {
   }
   return folder ?? null;
 });
-handle('project:revoke', (_event, id) => bridge?.projects?.revokeCommands(id));
-handle('project:commands', async (event, id) => {
-  const projects = bridge?.projects;
-  if (!projects) throw new Error('设备未连接。');
-  const enabled = projects.grants.has(id);
-  const folder = projects.byId(projects.sessions.get(id) ?? '')?.path;
-  if (!folder) throw new Error('请先在本机绑定项目。');
-  const result = await dialog.showMessageBox(BrowserWindow.fromWebContents(event.sender), {
-    message: enabled ? '撤销本次会话的本机命令权限？' : '允许本会话运行本机命令？',
-    detail: folder + '\n命令以当前系统用户身份运行。断开设备连接后需重新授权。',
-    buttons: ['取消', enabled ? '撤销' : '允许'],
-    defaultId: 0,
-    cancelId: 0,
-  });
-  if (
-    result.response === 1 &&
-    projects === bridge?.projects &&
-    folder === projects.byId(projects.sessions.get(id) ?? '')?.path
-  )
-    projects.commands(id, !enabled);
-});
 handle('project:spelling', (_event, written) => asOnDisk(String(written)));
 // Which of these folders are on this computer: a session that names no computer is here when its folder is.
 handle('folders:exist', (_event, folders) =>
@@ -583,16 +562,6 @@ handle('proxy:connect', async (event, config) => {
           });
           return !result.canceled && result.filePaths[0] === folder;
         },
-        confirmFile: async (file) =>
-          (
-            await dialog.showMessageBox(BrowserWindow.fromWebContents(event.sender), {
-              message: '仅允许本会话读取此附件？',
-              detail: file,
-              buttons: ['取消', '允许读取'],
-              defaultId: 0,
-              cancelId: 0,
-            })
-          ).response === 1,
       },
       scriptDirectory: app.isPackaged
         ? path.join(process.resourcesPath, 'app.asar.unpacked/electron')

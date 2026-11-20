@@ -336,14 +336,6 @@ export function App({
   }, [unplaced]);
   const onThis = (session: Session) => !browser && isHere(session, state.device, absent);
   const localProject = window.desktop && selected && onThis(selected) ? selected.projectPath : null;
-  useEffect(() => {
-    if (selected?.id && window.desktop?.revokeSessionCommands) {
-      const id = selected.id;
-      return () => {
-        void window.desktop?.revokeSessionCommands(id);
-      };
-    }
-  }, [selected?.id]);
   const [existingProject, setExistingProject] = useState<string | null>(null);
   useEffect(() => {
     setChangesProject(null);
@@ -1254,6 +1246,16 @@ export function App({
       show(response.sessionId);
     });
   }
+  // A session from before projects were bound names its folder by its path. On the computer the folder is on, it is
+  // bound as the session goes on: the same folder, which this computer asks for once where it was never chosen.
+  async function bindLegacy(session: Session) {
+    if (!nativeMode || session.projectAccess || !window.desktop || !onThis(session)) return;
+    await client.request({
+      type: 'session.move',
+      sessionId: session.id,
+      projectPath: session.projectPath,
+    });
+  }
   async function sendQueued(sessionId: string, messageId: string, priority: MessagePriority) {
     if (queueFlight.current || busy || !connected) return;
     const session = client.state.sessions.find((item) => item.id === sessionId);
@@ -1270,6 +1272,7 @@ export function App({
       ),
     }));
     try {
+      await bindLegacy(session);
       await changes.send({
         type: 'message.send',
         sessionId,
@@ -1370,6 +1373,7 @@ export function App({
         setDraft(sessionId, command.body);
         if (!command.body) return;
       }
+      await bindLegacy(selected);
       await changes.send({
         type: 'message.send',
         sessionId,
@@ -1384,9 +1388,10 @@ export function App({
   // Takes up the last turn, which was stopped or cut off, without the user writing anything.
   function resume() {
     if (!selected) return;
-    const sessionId = selected.id;
+    const session = selected;
     void act(async () => {
-      await changes.send({ type: 'run.continue', sessionId });
+      await bindLegacy(session);
+      await changes.send({ type: 'run.continue', sessionId: session.id });
     });
   }
   async function compact() {
@@ -1394,6 +1399,7 @@ export function App({
     setSlashOpen(false);
     setDraft(selected.id, '');
     await act(async () => {
+      await bindLegacy(selected);
       await client.request({ type: 'session.compact', sessionId: selected.id });
     });
   }
@@ -2291,7 +2297,14 @@ export function App({
                     });
                   }}
                   stop={stopRun}
-                  replyApproval={async (runId, approvalId, allowed, answers, executionMode) => {
+                  replyApproval={async (
+                    runId,
+                    approvalId,
+                    allowed,
+                    answers,
+                    executionMode,
+                    remember,
+                  ) => {
                     let sent = false;
                     await act(async () => {
                       await client.request({
@@ -2301,6 +2314,7 @@ export function App({
                         approvalId,
                         allowed,
                         ...(executionMode ? { executionMode } : {}),
+                        ...(remember ? { remember: true as const } : {}),
                         ...(answers ? { answers } : {}),
                       });
                       sent = true;
@@ -2483,46 +2497,6 @@ export function App({
                     configure={configure}
                     stop={stopRun}
                   />
-                )}
-                {selected && !selected.projectAccess && nativeMode && (
-                  <button
-                    type="button"
-                    className="button secondary"
-                    onClick={() =>
-                      void act(async () => {
-                        if (
-                          !window.confirm(
-                            '旧会话的原生历史可能包含用户名和绝对路径，续聊将重新使用这些内容。继续？',
-                          )
-                        )
-                          return;
-                        if (localProject && window.desktop) {
-                          const path = await window.desktop.chooseProject();
-                          if (!path) return;
-                          await client.request({
-                            type: 'session.move',
-                            sessionId: selected.id,
-                            projectPath: path,
-                          });
-                        }
-                        await client.request({
-                          type: 'session.acceptHistory',
-                          sessionId: selected.id,
-                        });
-                      })
-                    }
-                  >
-                    确认使用旧上下文
-                  </button>
-                )}
-                {selected && localProject && nativeMode && (
-                  <button
-                    type="button"
-                    className="button secondary"
-                    onClick={() => void act(() => window.desktop!.sessionCommands(selected.id))}
-                  >
-                    本会话命令权限
-                  </button>
                 )}
                 {selected && (!away || (browser && remote)) && (
                   <SessionBar

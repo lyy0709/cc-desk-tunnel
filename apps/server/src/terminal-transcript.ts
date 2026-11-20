@@ -305,6 +305,7 @@ export function terminalSettings(
   statusPath?: string,
   ownSettingsPath = userSettingsPath(),
   idle?: IdleCompaction,
+  ownFiles?: { node: string; script: string; directories: string[] },
 ) {
   const settings = settingsPath ? JSON.parse(readFileSync(settingsPath, 'utf8')) : {};
   const hooks = settings.hooks && typeof settings.hooks === 'object' ? settings.hooks : {};
@@ -313,6 +314,22 @@ export function terminalSettings(
     hooks[name] = [
       ...(Array.isArray(hooks[name]) ? hooks[name] : []),
       { hooks: [{ type: 'command', command: `{ cat; echo; } >> ${quote(hooksPath)}` }] },
+    ];
+  if (ownFiles)
+    hooks.PreToolUse = [
+      ...(Array.isArray(hooks.PreToolUse) ? hooks.PreToolUse : []),
+      {
+        matcher: 'Read|Write|Edit',
+        hooks: [
+          {
+            type: 'command',
+            onFailure: 'block',
+            command: [ownFiles.node, ownFiles.script, '--guard-own-files', ...ownFiles.directories]
+              .map(quote)
+              .join(' '),
+          },
+        ],
+      },
     ];
   let statusLine = settings.statusLine;
   if (statusPath) {

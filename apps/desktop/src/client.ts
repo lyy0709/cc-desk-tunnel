@@ -1338,6 +1338,8 @@ export class ProxyClient {
   ) => {
     let offset = 0;
     let title: string | undefined, description: string | undefined;
+    // Whether the answer may be to allow calls like this one for the rest of the session.
+    let rememberable = false;
     const parts: string[] = [];
     for (;;) {
       const page = await this.fetch(
@@ -1347,9 +1349,11 @@ export class ProxyClient {
       if (!offset) {
         title = page.title;
         description = page.description;
+        rememberable = !!page.rememberable;
       }
       parts.push(page.input);
-      if (page.next === undefined) return { input: parts.join(''), title, description };
+      if (page.next === undefined)
+        return { input: parts.join(''), title, description, rememberable };
       if (page.next !== offset + page.input.length || !page.input.length)
         throw new Error('审批参数分页无效。');
       offset = page.next;

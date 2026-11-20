@@ -22,8 +22,6 @@ import { accountQuota, useQuota } from './quota.ts';
 import { setPrefs, usePrefs } from './prefs.ts';
 import { copyText } from './copy.tsx';
 
-const usagePage = 'https://claude.ai/settings/usage';
-
 // What the date a stored claude.ai sign-in ends means for the user. Renewing the access token does not move it; the
 // CLI starts warning ten days before it.
 function loginExpiry(expiresAt: string, now = Date.now()) {
@@ -416,19 +414,6 @@ export default function AccountPanel({
                 : '尚无额度数据')}
           </p>
         )}
-        <a
-          href={usagePage}
-          target="_blank"
-          rel="noreferrer"
-          onClick={(event) => {
-            if (window.desktop) {
-              event.preventDefault();
-              void window.desktop.openExternal(usagePage);
-            }
-          }}
-        >
-          完整订阅用量（含按模型额度）
-        </a>
         <Row
           title="运行中每分钟读取一次额度"
           detail="让服务端在有任务运行时每分钟向官方读取一次 5 小时与每周额度，各会话、各设备共用这一次读取；关闭后只记录回复和 ccdt 终端状态栏里自带的额度，上方的刷新仍会读取"

@@ -16,6 +16,8 @@ export const projectOperation = z.discriminatedUnion('op', [
     op: z.literal('read'),
     path: z.string().min(1).max(2048),
     offset: z.number().int().nonnegative().default(0),
+    // A line to begin at, counted from 1, in place of the byte offset.
+    line: z.number().int().positive().optional(),
   }),
   z.object({
     op: z.literal('create'),
@@ -28,6 +30,8 @@ export const projectOperation = z.discriminatedUnion('op', [
     old: z.string().min(1).max(12000),
     new: z.string().max(24000),
     revision: z.string().min(1).max(120),
+    // Every occurrence of `old`, where it occurs more than once.
+    all: z.boolean().optional(),
   }),
   z.object({ op: z.literal('output'), id: z.uuid(), offset: z.number().int().nonnegative() }),
   z.object({
@@ -55,12 +59,14 @@ export const projectCall = z.object({
   project: z.string().max(2048),
   operation: projectOperation,
 });
+// The longest result a device sends back for one operation; the device answers with an error past it.
+export const PROJECT_REPLY_CHARS = 120000;
 export const projectReply = z
   .object({
     type: z.literal('project.result'),
     requestId: z.uuid(),
     sessionId: z.uuid(),
-    text: z.string().max(120000),
+    text: z.string().max(PROJECT_REPLY_CHARS),
     error: z.boolean().optional(),
   })
   .strict();

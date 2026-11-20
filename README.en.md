@@ -121,7 +121,7 @@ The script downloads the newest release, checks it against `SHA256SUMS`, install
 
 ### 3. Sign in to Claude and choose a project
 
-Open Settings → Account and quota and choose normal sign-in: open the official authorization page in your browser, then paste back the code it shows, as with the official `claude auth login`. In `ccdt` you can run `ccdt auth login` instead. The desktop client and `ccdt` share this one sign-in and its subscription quota. To use an API key or a supported cloud provider instead, put it in `config/provider.json` in the server's data directory. Select the project folder on the desktop. To enable commands for one session, use the desktop session permission control or start `ccdt --allow-commands` in the project directory.
+Open Settings → Account and quota and choose normal sign-in: open the official authorization page in your browser, then paste back the code it shows, as with the official `claude auth login`. In `ccdt` you can run `ccdt auth login` instead. The desktop client and `ccdt` share this one sign-in and its subscription quota. To use an API key or a supported cloud provider instead, put it in `config/provider.json` in the server's data directory. Select the project folder on the desktop, or run `ccdt` in it. Bound sessions can read files and run commands as the local user without a separate grant. The approval mode still controls individual prompts; the desktop command approval can remember your answer for the session until the device disconnects or the service restarts.
 
 ## Security
 

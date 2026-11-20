@@ -41,7 +41,6 @@ export class ProjectAccess {
     service,
     helper,
     chooseRoot,
-    confirmFile,
     powershell,
     scriptDirectory,
     environment,
@@ -56,7 +55,6 @@ export class ProjectAccess {
       service,
       helper,
       chooseRoot,
-      confirmFile,
       powershell,
       scriptDirectory,
       environment,
@@ -75,7 +73,8 @@ export class ProjectAccess {
     const known = this.byPath(path);
     // A path chosen again keeps its project, and so its sessions, also when the directory there is another one by
     // now: a volume whose device number changes with every mount, a folder restored from a copy. The user has just
-    // named it. What an earlier choice allowed to run there is taken back.
+    // named it. What was running in the directory that was there is stopped, and the project's sessions go on in
+    // the one chosen now.
     this.db
       .prepare(
         'INSERT INTO projects VALUES(?,?,?,?) ON CONFLICT(service,path) DO UPDATE SET identity=excluded.identity',
@@ -83,7 +82,10 @@ export class ProjectAccess {
       .run(this.service, path, 'project:' + randomUUID(), identity);
     if (known && known.identity !== identity)
       for (const [sessionId, project] of [...this.grants])
-        if (project === known.id) this.revokeCommands(sessionId);
+        if (project === known.id) {
+          this.revokeCommands(sessionId);
+          this.commands(sessionId, true);
+        }
     return this.byPath(path).id;
   }
   byPath(path) {
@@ -105,7 +107,14 @@ export class ProjectAccess {
     const old = this.sessions.get(session.id);
     if (old && old !== session.projectPath) this.revoke(session.id);
     this.sessions.set(session.id, session.projectPath);
-    return { ...session, projectPath: this.byId(session.projectPath)?.path ?? session.projectPath };
+    const bound = this.byId(session.projectPath);
+    // Binding a directory on this computer is what lets the sessions of its project run commands in it: nothing
+    // more is asked for each session.
+    if (bound && this.grants.get(session.id) !== session.projectPath) {
+      this.grants.set(session.id, session.projectPath);
+      this.onCommandsChanged?.(session.id, session.projectPath, true);
+    }
+    return { ...session, projectPath: bound?.path ?? session.projectPath };
   }
   revokeCommands(id) {
     const project = this.grants.get(id);
@@ -136,9 +145,10 @@ export class ProjectAccess {
     const rel = relative(root.path, full);
     if (rel && !isAbsolute(rel) && rel !== '..' && !rel.startsWith('..' + sep))
       return { ...file, path: 'project:/' + rel.split(sep).join('/') };
+    // A file outside the project was picked for this message by the user, which is all the say it needs: the bytes
+    // read now are what the session gets, and nothing else of the file's place.
     const selected = await lstat(full, { bigint: true });
     if (!selected.isFile()) throw new Error('只接受普通附件。');
-    if (!(await this.confirmFile(full))) throw new Error('未授权项目外附件。');
     const handle = await open(
       full,
       constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
@@ -183,7 +193,7 @@ export class ProjectAccess {
     try {
       if (operation.op === 'command') {
         if (this.grants.get(sessionId) !== project)
-          throw new Error('请在项目所在电脑为本次会话开启命令权限。');
+          throw new Error('当前会话的命令工具不可用，请确认项目设备已连接并重新打开会话。');
         if (
           (await files(this.helper, root.path, { op: 'bind' }, controller.signal)).text !==
           root.identity
@@ -215,14 +225,39 @@ export class ProjectAccess {
         if (operation.op !== 'read' || file?.sessionId !== sessionId)
           throw new Error('附件引用无效。');
         const image = imagePath.test(file.ext);
-        const end = Math.min(file.bytes.length, operation.offset + (image ? 64 * 1024 : 12000));
+        if (image && operation.line !== undefined)
+          throw new Error('图片不支持按行读取，请从偏移量 0 读取。');
+        let offset = Math.min(operation.offset ?? 0, file.bytes.length);
+        if (!image && operation.line !== undefined) {
+          offset = 0;
+          for (let line = 1; line < operation.line && offset < file.bytes.length; line++) {
+            const at = file.bytes.indexOf(10, offset);
+            offset = at < 0 ? file.bytes.length : at + 1;
+          }
+        }
+        const continuation = (at) => (file.bytes[at] & 0xc0) === 0x80;
+        if (!image)
+          while (offset > 0 && offset < file.bytes.length && continuation(offset)) offset--;
+        let end = Math.min(file.bytes.length, offset + (image ? 64 * 1024 : 12000));
+        if (!image) while (end < file.bytes.length && end > offset && continuation(end)) end--;
+        const bytes = file.bytes.subarray(offset, end);
+        let text;
+        if (!image) {
+          try {
+            text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+          } catch {
+            throw new Error('附件不是有效的 UTF-8 文本。');
+          }
+          if (text.includes('\0')) throw new Error('附件不是 UTF-8 文本文件。');
+        }
         return JSON.stringify({
-          base64: file.bytes.subarray(operation.offset, end).toString('base64'),
-          ext: file.ext,
+          ...(image ? { base64: bytes.toString('base64'), ext: file.ext } : { text, offset }),
           next: end < file.bytes.length ? end : undefined,
         });
       }
       const image = operation.op === 'read' && imagePath.test(operation.path);
+      if (image && operation.line !== undefined)
+        throw new Error('图片不支持按行读取，请从偏移量 0 读取。');
       const result = await files(
         this.helper,
         root.path,
@@ -244,7 +279,15 @@ export class ProjectAccess {
   output(session, id, offset) {
     const held = this.outputs.get(session)?.get(id);
     if (!held) throw new Error('此命令的输出已释放。');
-    const end = Math.min(offset + 10000, held.output.length);
+    // JavaScript offsets count UTF-16 units; keep both halves of an emoji in the same page.
+    if (
+      offset > 0 &&
+      /[\uDC00-\uDFFF]/.test(held.output[offset] ?? '') &&
+      /[\uD800-\uDBFF]/.test(held.output[offset - 1])
+    )
+      offset--;
+    let end = Math.min(offset + 10000, held.output.length);
+    if (end < held.output.length && /[\uD800-\uDBFF]/.test(held.output[end - 1])) end--;
     return JSON.stringify({
       id,
       output: held.output.slice(offset, end),

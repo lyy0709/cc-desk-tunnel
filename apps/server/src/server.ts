@@ -2,6 +2,8 @@ import {
   projectBuiltinTools,
   projectTools,
   projectPrompt,
+  ownDirectories,
+  ownFilesPrompt,
   readSessionTools,
   writeSessionTools,
 } from './project-tools.ts';
@@ -18,7 +20,7 @@ import {
 } from 'node:fs';
 import { createServer } from 'node:http';
 import { totalmem, homedir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { IncomingMessage, RequestListener } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
@@ -83,7 +85,7 @@ import { loginOf } from './native-controls.ts';
 import { accountLogout, accountStatus, completeOnboarding } from './native-account.ts';
 import { NativeLogin } from './native-login.ts';
 import { ACCOUNT_LAUNCH, ignoredProviderSettings } from './runtime-environment.ts';
-import { readNativeSettings, updateNativeSettings } from './native-settings.ts';
+import { personalConfig, readNativeSettings, updateNativeSettings } from './native-settings.ts';
 import { readInstructions, writeInstructions } from './native-instructions.ts';
 import type { NativeTerminal } from './native-terminal.ts';
 import {
@@ -351,9 +353,17 @@ export function createProxyServer(options: ServerOptions) {
       },
     };
   }
+  // A session from before projects were bound goes on as it is, its native history with it, once its project is
+  // bound on the computer it is on; a session of the service's own has nothing to bind.
   function checkHistory(session: Session) {
-    if (options.claude && !session.projectAccess)
-      throw new DomainError('history_consent', '旧会话可能包含绝对路径和用户名，请先确认续聊。');
+    if (!options.claude || session.projectAccess) return;
+    if (session.device?.id !== serverDevice.id && !session.projectPath.startsWith('project:'))
+      throw new DomainError(
+        'project_binding',
+        '这个会话的项目还没有在它所在的电脑上绑定，请在那台电脑上打开这个会话再继续。',
+      );
+    store.acceptHistory(session.id);
+    updated(session.id);
   }
   quotas.wanted = () => [...peers].some((peer) => peer.quotaWanted);
   // One run or one terminal per session, each a CLI process of its own in the session's directory. What reads
@@ -362,6 +372,9 @@ export function createProxyServer(options: ServerOptions) {
   const runs = new Map<string, Run>();
   const mutations = new Map<string, 'status' | 'session'>();
   const terminals = new Map<string, Terminal>();
+  // Sessions whose user chose, answering an approval, not to be asked again about commands on the project's computer.
+  // It holds as long as that computer's grant of them does, and only in memory: after a restart the session asks again.
+  const unasked = new Set<string>();
   // The official sign-in the GUI started (see NativeLogin), and the one ccdt shows in a terminal of its own, which has
   // no conversation, transcript or screen replay. One at a time; each belongs to the connection that started it.
   let login: { process: NativeLogin; owner: Peer; url?: string } | undefined;
@@ -836,6 +849,9 @@ export function createProxyServer(options: ServerOptions) {
         emit: (event) => emit(run, event),
         approve: (toolId, waiting, toolName, signal, preview) => {
           if (signal.aborted) return Promise.resolve({ allowed: false });
+          // The user has answered for these already: nothing is asked and no approval is recorded.
+          if (preview.rememberable && unasked.has(run.sessionId))
+            return Promise.resolve({ allowed: true });
           const approvalId = randomUUID();
           if (waiting === 'question') run.questions.add(approvalId);
           return new Promise((resolve) => {
@@ -867,7 +883,12 @@ export function createProxyServer(options: ServerOptions) {
               },
             });
             signal.addEventListener('abort', abort, { once: true });
-            emit(run, { type: 'approval.requested', approvalId, toolId });
+            emit(run, {
+              type: 'approval.requested',
+              approvalId,
+              toolId,
+              ...(preview.rememberable && { rememberable: true as const }),
+            });
             emit(run, {
               type: 'run.status',
               status: 'awaiting_approval',
@@ -1159,6 +1180,7 @@ export function createProxyServer(options: ServerOptions) {
       current.continued.known = new Set(messages.map((message) => message.uuid));
       current.continued.last = messages.at(-1)?.uuid;
       mkdirSync(join(directory, 'events'), { recursive: true, mode: 0o700 });
+      if (device !== serverDevice.id) tools = await openTools(session, peer.id);
       terminalSettings(
         current.continued.settingsPath,
         current.continued.hooksPath,
@@ -1166,10 +1188,16 @@ export function createProxyServer(options: ServerOptions) {
         current.continued.statusPath,
         undefined,
         compactions.settings,
+        tools
+          ? {
+              node: tools.config.command === process.execPath ? process.execPath : 'node',
+              script: join(dirname(tools.config.args[0]), 'project-tools.ts'),
+              directories: ownDirectories(personalConfig().directory, cwd),
+            }
+          : undefined,
       );
       if (closing || peer.socket.readyState !== WebSocket.OPEN)
         throw new Error('Connection closed');
-      if (device !== serverDevice.id) tools = await openTools(session, peer.id);
       const args = terminalArguments(options.claude, session, {
         resume,
         settingsPath: current.continued.settingsPath,
@@ -1177,14 +1205,14 @@ export function createProxyServer(options: ServerOptions) {
       if (tools)
         args.push(
           '--tools',
-          projectBuiltinTools(sessionTools).join(','),
+          projectBuiltinTools(sessionTools, true).join(','),
           '--setting-sources',
           'user',
           '--strict-mcp-config',
           '--mcp-config',
           JSON.stringify({ mcpServers: { project: tools.config } }),
           '--append-system-prompt',
-          projectPrompt,
+          `${projectPrompt} ${ownFilesPrompt}`,
         );
       current.process = new NativeTerminal(
         options.claude.executable,
@@ -1529,6 +1557,7 @@ export function createProxyServer(options: ServerOptions) {
       }
       if (command.type === 'session.delete') {
         store.delete(command.sessionId);
+        unasked.delete(command.sessionId);
         broadcast({ type: 'session.deleted', sessionId: command.sessionId });
         for (const other of peers) other.subscriptions.delete(command.sessionId);
       } else {
@@ -1748,6 +1777,12 @@ export function createProxyServer(options: ServerOptions) {
       (!command.allowed || run.approvals.get(command.approvalId)?.toolName !== 'ExitPlanMode')
     )
       throw new DomainError('invalid_approval_mode', '只有批准执行计划时可以选择执行模式。');
+    if (
+      command.type === 'approval.reply' &&
+      command.remember &&
+      (!command.allowed || !run.approvals.get(command.approvalId)?.preview.rememberable)
+    )
+      throw new DomainError('invalid_approval_remember', '这项审批不能设为本会话不再询问。');
     if (command.type === 'run.task.stop') {
       if (!run.controls.stopTask) return;
       // The CLI reports the task gone through its task list; a task already over is not an error.
@@ -1790,6 +1825,13 @@ export function createProxyServer(options: ServerOptions) {
         )
       )
         throw new DomainError('approval_inactive', '审批已失效。');
+      if (command.remember) {
+        unasked.add(run.sessionId);
+        // The turn's other commands that wait for the same answer have it too.
+        for (const [approvalId, approval] of [...run.approvals])
+          if (approval.preview.rememberable)
+            answerApproval(run, approvalId, true, undefined, undefined, peer.id);
+      }
       return;
     }
     if (!run.decide || run.approvalId !== command.approvalId)
@@ -2077,6 +2119,7 @@ export function createProxyServer(options: ServerOptions) {
           input: preview.input.slice(command.offset, end),
           ...(end < preview.input.length && { next: end }),
           ...(command.offset === 0 && { title: preview.title, description: preview.description }),
+          ...(command.offset === 0 && preview.rememberable && { rememberable: true as const }),
         });
         return session.id;
       }
@@ -2572,6 +2615,8 @@ export function createProxyServer(options: ServerOptions) {
         if (grant.success) {
           if (!peer.browser && peer.files && peer.device) {
             const { sessionId, project, enabled } = grant.data;
+            // A grant taken back or given anew starts over: the commands it allows are asked about again.
+            unasked.delete(sessionId);
             if (enabled) {
               try {
                 const { session } = store.get(sessionId);
@@ -2677,6 +2722,8 @@ export function createProxyServer(options: ServerOptions) {
       socket.on('close', (code) => {
         for (const call of pendingFiles.values())
           if (call.peer === peer) call.settle(false, '设备连接中断，操作结果未知。');
+        // With the connection goes its grant of commands, and what was remembered under it.
+        for (const sessionId of peer.commandGrants.keys()) unasked.delete(sessionId);
         clearTimeout(authTimer);
         clearInterval(heartbeat);
         if (!signedIn) gate.leave(address);

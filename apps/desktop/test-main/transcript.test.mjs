@@ -77,6 +77,31 @@ test('Markdown export retains large tool bodies containing many backticks', () =
   assert.match(text, /```\n`x /);
 });
 
+test('Markdown export renders historical project text without JSON escaping', () => {
+  const body = '第一行\nconst answer = "中文";\n';
+  const result = markdown({ title: 'MCP', projectPath: '/tmp' }, [
+    event('run', 0, {
+      type: 'tool.requested',
+      toolId: 'read',
+      name: 'mcp__project__read',
+      target: '项目设备',
+      input: '{"path":"file.ts"}',
+    }),
+    event('run', 1, {
+      type: 'tool.result',
+      toolId: 'read',
+      status: 'completed',
+      exitCode: null,
+      output: JSON.stringify([
+        { type: 'text', text: JSON.stringify({ text: body, revision: 'r1' }) },
+      ]),
+    }),
+  ]);
+  assert.ok(result.includes(body));
+  assert.ok(!result.includes('\\\\n'));
+  assert.ok(result.includes('"revision":"r1"'));
+});
+
 test('an automatic compaction is one mark among the steps, with what came after it under it', () => {
   const turns = conversation([
     event('run', 0, { type: 'message.user', messageId: 'question', text: '做事' }),

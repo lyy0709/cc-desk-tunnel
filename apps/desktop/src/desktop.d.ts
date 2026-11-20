@@ -27,8 +27,6 @@ declare global {
       forgetAccount: (id: string) => Promise<import('./shared.ts').Account[]>;
       // A sign-in page in a window of its own, as starting the program again opens.
       newLoginWindow: () => Promise<void>;
-      revokeSessionCommands: (id: string) => Promise<void>;
-      sessionCommands: (id: string) => Promise<void>;
       chooseProject: () => Promise<string | null>;
       asOnDisk: (path: string) => Promise<string>;
       // Whether each folder is on this computer, in the order given.

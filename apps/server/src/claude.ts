@@ -1,8 +1,17 @@
-import { projectBuiltinTools, projectPrompt } from './project-tools.ts';
+import {
+  OWN_FILE_TOOLS,
+  OWN_FILES_REFUSAL,
+  ownDirectories,
+  ownFile,
+  ownFilesPrompt,
+  projectBuiltinTools,
+  projectPrompt,
+} from './project-tools.ts';
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { query, getSessionInfo } from '@anthropic-ai/claude-agent-sdk';
 import type {
+  HookCallback,
   PermissionResult,
   Query,
   SDKSessionInfo,
@@ -27,8 +36,30 @@ import {
   Quotas,
 } from './native-controls.ts';
 import type { NativeInput } from './native-input.ts';
-import { readNativeSettings } from './native-settings.ts';
+import { personalConfig, readNativeSettings } from './native-settings.ts';
 import { questionTally } from './question.ts';
+
+// Looks at every call of a built-in file tool before the CLI decides on it, whatever the approval mode: a file that
+// is not Claude Code's own for the session is refused (see `ownFile`).
+function guardOwnFiles(directories: string[], stored: string[]): HookCallback {
+  return async (input) => {
+    if (input.hook_event_name !== 'PreToolUse' || !OWN_FILE_TOOLS.includes(input.tool_name))
+      return {};
+    let reason = OWN_FILES_REFUSAL;
+    try {
+      if (ownFile(input.tool_input, directories, stored)) return {};
+    } catch (error) {
+      reason = `File access check failed: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PreToolUse',
+        permissionDecision: 'deny',
+        permissionDecisionReason: reason,
+      },
+    };
+  };
+}
 
 // Whether the native session is on record once a run or a terminal let it go, for the clients to offer compacting it.
 // It is recorded last, so that the page of history a client opens the session with holds it.
@@ -115,7 +146,27 @@ export type ClaudeRun = {
   };
 };
 export type Unanswered = 'skipped' | 'replied_in_chat';
-export type ApprovalPreview = { input: string; title?: string; description?: string };
+export type ApprovalPreview = {
+  input: string;
+  title?: string;
+  description?: string;
+  // The user may choose not to be asked about calls like this one for the rest of the session.
+  rememberable?: boolean;
+};
+// A command on the project's computer is the one call a user may stop being asked about: that computer has already
+// granted the session its commands, and takes the grant back whenever its user says. Not where the CLI wants every
+// ask to be a deliberate one.
+export function rememberableCall(
+  name: string,
+  context: { suppressAlwaysAllowRule?: boolean; defaultToNo?: boolean; matchedAskRule?: unknown },
+) {
+  return (
+    name === 'mcp__project__command' &&
+    !context.suppressAlwaysAllowRule &&
+    !context.defaultToNo &&
+    !context.matchedAskRule
+  );
+}
 // User decisions are returned through the SDK's permission callback, including a plan's execution mode.
 export function toolPermission(
   name: string,
@@ -186,6 +237,12 @@ export async function runClaude(
   if (process.platform === 'win32') throw new Error('Native adapter must run on Linux.');
   const mapper = new ClaudeStream(run.emit, run.permissionMode, run.effort);
   const cwd = prepareNativeDirectory(options, run.dataDir, run.nativeRoot);
+  // Where the built-in file tools may work in a session whose project is on a device: nowhere but there.
+  const ownFiles = run.projectTools ? ownDirectories(personalConfig().directory, cwd) : undefined;
+  const storedFiles =
+    ownFiles && process.env.CCDT_PERSONAL_HOME && process.env.CLAUDE_CONFIG_DIR
+      ? [ownFiles[0], ownDirectories(process.env.CLAUDE_CONFIG_DIR, cwd)[1]]
+      : ownFiles;
   if (run.resume && !(await getSessionInfo(run.sessionId, { dir: cwd }))) {
     run.emit({
       type: 'run.error',
@@ -249,7 +306,7 @@ export async function runClaude(
         // The SDK takes the mode that asks about nothing only with this said as well.
         allowDangerouslySkipPermissions: run.permissionMode === 'bypassPermissions',
         ...(run.projectTools && {
-          tools: projectBuiltinTools({ subagents: !!run.subagents }),
+          tools: projectBuiltinTools({ subagents: !!run.subagents }, true),
           mcpServers: { project: run.projectTools },
           mcpServersDelivery: 'initialize',
           strictMcpConfig: true,
@@ -258,7 +315,7 @@ export async function runClaude(
         systemPrompt: {
           type: 'preset',
           preset: 'claude_code',
-          ...(run.projectTools && { append: projectPrompt }),
+          ...(run.projectTools && { append: `${projectPrompt} ${ownFilesPrompt}` }),
           snapshot: false,
         },
         ...(run.resume ? { resume: run.sessionId } : { sessionId: run.sessionId }),
@@ -283,6 +340,11 @@ export async function runClaude(
               ],
             },
           ],
+          ...(ownFiles && {
+            PreToolUse: [
+              { hooks: [guardOwnFiles(ownFiles, storedFiles!)], onFailure: 'block' as const },
+            ],
+          }),
         },
         maxTurns: options.maxTurns,
         env: {
@@ -297,6 +359,13 @@ export async function runClaude(
         },
         canUseTool: async (name, input, context) => {
           const tool = mapper.tool(name, context.toolUseID);
+          // The call as the CLI took it, which says more than the model wrote where the CLI read a plan from its file.
+          mapper.parameters(tool, input);
+          // The hook above has refused these already; this is for a CLI that asks all the same.
+          if (ownFiles && OWN_FILE_TOOLS.includes(name) && !ownFile(input, ownFiles, storedFiles)) {
+            tool.denied = true;
+            return { behavior: 'deny', message: OWN_FILES_REFUSAL };
+          }
           const question = name === 'AskUserQuestion';
           const signal = AbortSignal.any([context.signal, run.signal]);
           const { allowed, answers, unanswered, executionMode } = signal.aborted
@@ -305,6 +374,8 @@ export async function runClaude(
                 input: JSON.stringify(input, null, 2),
                 title: context.title?.slice(0, 512),
                 description: context.description?.slice(0, 2048),
+                // Only the service's own project server: a server of that name from other configuration is not it.
+                ...(run.projectTools && rememberableCall(name, context) && { rememberable: true }),
               });
           if (signal.aborted) {
             return { behavior: 'deny', message: 'The permission request was cancelled.' };

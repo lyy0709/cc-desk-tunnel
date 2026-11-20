@@ -95,10 +95,8 @@ test('one subscription quota from the service and the sessions, watched per pref
   await expect(page.getByText('68.2% 已用 · 31.8% 剩余')).toBeVisible();
   await expect(page.getByText('5% 已用 · 95% 剩余')).toBeVisible();
   await expect(page.getByRole('button', { name: /本周期 321 次请求/ })).toBeVisible();
-  await expect(page.getByRole('link', { name: /完整订阅用量/ })).toHaveAttribute(
-    'href',
-    'https://claude.ai/settings/usage',
-  );
+  // The panel shows every window the plan reports, the per-model ones included: it links nowhere else for them.
+  await expect(page.getByRole('link', { name: /订阅用量/ })).toHaveCount(0);
   await page.screenshot({ path: join(screenshots, 'subscription-overview.png') });
   // There is one quota, that of the sign-in the GUI and ccdt share.
   await expect(page.getByRole('button', { name: '模型服务', exact: true })).toHaveCount(0);
