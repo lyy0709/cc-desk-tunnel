@@ -1,4 +1,3 @@
-import { randomUUID } from 'node:crypto';
 import { createServer } from 'node:http';
 import type { DatabaseSync } from 'node:sqlite';
 import { USAGE_SLICE_MINUTES, type Command, type ServerMessage } from '@cc-desk-tunnel/protocol';
@@ -34,7 +33,7 @@ function usageBounds(range: UsageQuery['range'], now: number): [number, number] 
 
 const windowTable = `CREATE TABLE IF NOT EXISTS scoped_usage_windows (
   name TEXT NOT NULL, started_at INTEGER NOT NULL, resets_at INTEGER, utilization REAL, observed_at INTEGER NOT NULL,
-  scope TEXT NOT NULL DEFAULT 'sdk', PRIMARY KEY(scope,name))`;
+  scope TEXT NOT NULL, PRIMARY KEY(scope,name))`;
 const windowLength: Record<string, number> = { five_hour: 5 * 3600_000 };
 const lengthOf = (name: string) =>
   windowLength[name] ?? (name.startsWith('seven_day') ? 7 * 24 * 3600_000 : undefined);
@@ -87,40 +86,30 @@ export class UsageLog {
     const columns = database.prepare('PRAGMA table_info(api_requests)').all() as { name: string }[];
     if (!columns.some((column) => column.name === 'prompt_id'))
       database.exec('ALTER TABLE api_requests ADD COLUMN prompt_id TEXT');
-    const mixed = !columns.some((column) => column.name === 'profile');
-    const legacyColumns = database.prepare('PRAGMA table_info(usage_windows)').all();
-    const preview = legacyColumns.some((column) => column.name === 'scope');
-    // 0.3 writes ON CONFLICT(name) into its own table. Its readings cannot identify an account.
-    // Keep that schema available to a downgrade, and store the new windows in a different table.
-    if (mixed || legacyColumns.length) {
-      database.exec('BEGIN IMMEDIATE');
-      try {
-        if (mixed)
-          database.exec(
-            'ALTER TABLE api_requests ADD COLUMN profile TEXT; DELETE FROM scoped_usage_windows',
-          );
-        if (preview)
-          database.exec(`INSERT OR IGNORE INTO scoped_usage_windows(name,started_at,resets_at,utilization,observed_at,scope)
-            SELECT name,started_at,resets_at,utilization,observed_at,scope FROM usage_windows;
-            DROP TABLE usage_windows`);
-        if (
-          database.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name='events'").get()
-        ) {
-          const { changes } = database
-            .prepare(
-              `UPDATE events SET data=json_set(data,'$.payload.rateLimits',NULL)
-            WHERE instr(data,'"native.metrics"') > 0 AND json_extract(data,'$.payload.type')='native.metrics'
-              AND json_type(data,'$.payload.profile') IS NULL AND json_type(data,'$.payload.rateLimits')='object'`,
-            )
-            .run();
-          if (changes)
-            database.prepare("UPDATE history_meta SET value=? WHERE key='id'").run(randomUUID());
-        }
-        database.exec('COMMIT');
-      } catch (error) {
-        database.exec('ROLLBACK');
-        throw error;
-      }
+    // Which of the two surfaces made a request: the GUI's runs or a terminal. Older records say nothing.
+    if (!columns.some((column) => column.name === 'profile'))
+      database.exec('ALTER TABLE api_requests ADD COLUMN profile TEXT');
+    // A 0.3 window has no owner; leave it for rollback and keep its calls in the general log.
+    if (!columns.some((column) => column.name === 'owner_scope')) {
+      database.exec('ALTER TABLE api_requests ADD COLUMN owner_scope TEXT');
+    }
+    database.exec(
+      "UPDATE api_requests SET owner_scope=profile WHERE owner_scope IS NULL AND profile GLOB 'terminal:*'",
+    );
+    database.exec(
+      'CREATE TABLE IF NOT EXISTS usage_identity (id INTEGER PRIMARY KEY CHECK(id=1), scope TEXT)',
+    );
+    // Preserve only owned readings from earlier preview schemas; 0.3 needs its original primary key on rollback.
+    if (
+      database
+        .prepare('PRAGMA table_info(usage_windows)')
+        .all()
+        .some((c) => c.name === 'scope')
+    ) {
+      database.exec(`BEGIN IMMEDIATE;
+        INSERT OR IGNORE INTO scoped_usage_windows(name,started_at,resets_at,utilization,observed_at,scope)
+        SELECT name,started_at,resets_at,utilization,observed_at,scope FROM usage_windows WHERE scope GLOB 'terminal:*';
+        DROP TABLE usage_windows; COMMIT`);
     }
     database.exec('CREATE INDEX IF NOT EXISTS api_requests_prompt ON api_requests(prompt_id)');
     database.exec('CREATE INDEX IF NOT EXISTS api_requests_session ON api_requests(session_id)');
@@ -134,8 +123,11 @@ export class UsageLog {
       return;
     const windows = (
       this.database
-        .prepare("SELECT name, started_at, resets_at FROM scoped_usage_windows WHERE scope='sdk'")
+        .prepare(
+          "SELECT scope, name, started_at, resets_at FROM scoped_usage_windows WHERE scope GLOB 'terminal:*'",
+        )
         .all() as {
+        scope: string;
         name: string;
         started_at: number;
         resets_at: number | null;
@@ -155,9 +147,10 @@ export class UsageLog {
       const resets = windows.length ? this.earlyResets(windows, now) : new Map<string, number>();
       for (const window of windows)
         this.database
-          .prepare("UPDATE scoped_usage_windows SET started_at = ? WHERE scope='sdk' AND name = ?")
+          .prepare('UPDATE scoped_usage_windows SET started_at = ? WHERE scope = ? AND name = ?')
           .run(
             Math.min(window.started_at, Math.max(window.expected, resets.get(window.name) ?? 0)),
+            window.scope,
             window.name,
           );
       this.database.prepare("INSERT INTO migrations VALUES ('usage-window-start')").run();
@@ -216,10 +209,10 @@ export class UsageLog {
     return resets;
   }
   // Accepts one OTLP/HTTP JSON log export and keeps only the model request records.
-  ingest(body: unknown, profile: 'sdk' | 'terminal' = 'sdk') {
+  ingest(body: unknown, profile: 'sdk' | 'terminal' = 'sdk', verifiedOwner?: string | null) {
     const insert = this.database.prepare(`INSERT OR IGNORE INTO api_requests
-      (at, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, duration_ms, ttft_ms, source, request_id, prompt_id, profile)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
+      (at, session_id, model, input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd, duration_ms, ttft_ms, source, request_id, prompt_id, profile, owner_scope)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     let stored = 0;
     for (const resource of asArray((body as { resourceLogs?: unknown })?.resourceLogs))
       for (const scope of asArray(resource?.scopeLogs))
@@ -246,6 +239,7 @@ export class UsageLog {
             Date.parse(String(fields.get('event.timestamp'))) ||
             Math.floor(Number(record.timeUnixNano) / 1e6) ||
             Date.now();
+          const owner = subscriptionScope(text('user.email'), text('organization.id'));
           stored += Number(
             insert.run(
               at,
@@ -261,25 +255,18 @@ export class UsageLog {
               text('query_source'),
               text('request_id'),
               text('prompt.id'),
-              profile === 'terminal'
-                ? (subscriptionScope(text('user.email'), text('organization.id')) ?? 'terminal')
-                : profile,
+              profile,
+              verifiedOwner === undefined || owner === verifiedOwner ? owner : null,
             ).changes,
           );
         }
     return stored;
   }
-  terminalScopeAt(session: string, since: number, until: number) {
-    return this.database
-      .prepare(
-        `SELECT profile FROM api_requests WHERE session_id=? AND at BETWEEN ? AND ?
-      AND (profile='terminal' OR profile GLOB 'terminal:*') ORDER BY at DESC, id DESC LIMIT 1`,
-      )
-      .get(session, since, until)?.profile;
-  }
   // Statistics follow the official quota periods. A period ends when the reported reset time moves or the utilization
   // falls by more than the jitter between readings, which also covers resets granted outside the normal schedule.
-  observe(rateLimits: RateLimits, now = Date.now(), scope = 'sdk') {
+  // Chat runs and terminals report the same account's quota.
+  observe(rateLimits: RateLimits, now: number, scope: string | null) {
+    if (!scope) return;
     const measuredAt = (rateLimits.measuredAt && Date.parse(rateLimits.measuredAt)) || now;
     for (const window of rateLimits.windows) {
       const previous = this.database
@@ -323,20 +310,23 @@ export class UsageLog {
         .run(
           window.name,
           startedAt,
-          scope === 'sdk' ? (resetsAt ?? previous?.resets_at ?? null) : resetsAt,
+          resetsAt ?? previous?.resets_at ?? null,
           window.utilization,
           measuredAt,
           scope,
         );
     }
   }
-  summary(now = Date.now(), scope: string | null = 'sdk'): Summary {
+  // Each period of the account's quota, with the requests made since it began by chat runs and terminals alike. One
+  // past its reset counts what came after it, until a reading starts the next; one never said to reset is shown for an
+  // hour after it was read.
+  summary(now: number, scope: string | null): Summary {
     const windows = this.database
       .prepare(
         `SELECT name, started_at, resets_at, utilization, observed_at FROM scoped_usage_windows WHERE scope=?
-        AND (scope='sdk' OR resets_at>? OR (resets_at IS NULL AND observed_at>?)) ORDER BY rowid`,
+        AND (resets_at IS NOT NULL OR observed_at>?) ORDER BY rowid`,
       )
-      .all(scope, now, now - 3600_000) as {
+      .all(scope, now - 3600_000) as {
       name: string;
       started_at: number;
       resets_at: number | null;
@@ -362,8 +352,8 @@ export class UsageLog {
           resetsAt: window.resets_at && !expired ? new Date(window.resets_at).toISOString() : null,
           utilization: expired ? null : window.utilization,
           ...(this.database
-            .prepare(`SELECT ${totals} FROM api_requests WHERE profile = ? AND at >= ?`)
-            .get(scope, startedAt) as Omit<
+            .prepare(`SELECT ${totals} FROM api_requests WHERE at >= ? AND owner_scope=?`)
+            .get(startedAt, scope) as Omit<
             Summary['windows'][number],
             'name' | 'startedAt' | 'resetsAt' | 'utilization'
           >),
@@ -375,14 +365,14 @@ export class UsageLog {
     query: UsageQuery,
     title: (sessionId: string) => string | null,
     now = Date.now(),
-    terminalScope: string | null = null,
+    owner: string | null = null,
   ): Page {
     const conditions = ['at >= ?', 'at < ?'];
     const range = usageBounds(query.range, now);
     const scoped: (number | string | null)[] = [...range];
-    if (query.profile) {
-      conditions.push('profile = ?');
-      scoped.push(query.profile === 'sdk' ? 'sdk' : terminalScope);
+    if (query.accountPeriod) {
+      conditions.push('owner_scope = ?');
+      scoped.push(owner);
     }
     const filtered = [...conditions, ...(query.model ? ['model = ?'] : [])].join(' AND ');
     const values = [...scoped, ...(query.model ? [query.model] : [])];
@@ -532,7 +522,7 @@ function asArray(value: unknown): any[] {
 }
 
 // Loopback only: the CLI processes on this host are the only senders.
-export function createUsageReceiver(log: UsageLog) {
+export function createUsageReceiver(log: UsageLog, currentScope: () => string | null) {
   const server = createServer((request, response) => {
     const terminal = request.url === '/terminal/v1/logs';
     if (request.method !== 'POST' || (!terminal && request.url !== '/v1/logs')) {
@@ -551,6 +541,7 @@ export function createUsageReceiver(log: UsageLog) {
         log.ingest(
           JSON.parse(Buffer.concat(chunks).toString('utf8')),
           terminal ? 'terminal' : 'sdk',
+          currentScope(),
         );
         response.writeHead(200, { 'Content-Type': 'application/json' }).end('{}');
       } catch {

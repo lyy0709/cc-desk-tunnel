@@ -3,9 +3,9 @@ import { Page } from './ui.tsx';
 
 const topics: { title: string; lines: string[] }[] = [
   {
-    title: '模型凭据与本机项目',
+    title: 'Claude 登录与本机项目',
     lines: [
-      '在服务器的 config/provider.json 配置自己的 Console API key 或官方支持的云提供方。账号与额度页面显示配置状态，个人订阅登录由你在独立的原版 CLI 中完成。',
+      '图形客户端和 ccdt 使用服务器上同一个 Claude Code 登录。在“账号与额度”点“普通登录”，在浏览器打开官方授权页，把页面最后显示的代码粘贴回来；在 ccdt 里也可以运行 ccdt auth login。要改用 API key 或云提供方，写进服务器的 config/provider.json。',
       '在本机选择目录后，文件工具使用项目相对路径。运行测试前使用“本会话命令权限”授权，也可以在项目目录运行 ccdt --allow-commands。断线、换项目或撤销后重新授权。',
       '会话的上下文与记忆保存在云端的 Claude Code 里；这里显示的是它的镜像，关闭客户端不会丢失会话。',
     ],

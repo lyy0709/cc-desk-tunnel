@@ -78,7 +78,12 @@ echo 'different Docker Engine' > "$PROXY_DEPLOY_CONFIG.hardware/engine"
 if bash "$root/deploy/manage.sh" up > "$work/refused" 2>&1; then exit 1; fi
 grep -q 'Docker Engine, CPU count' "$work/refused"
 test "$id" = "$("${compose[@]}" -f "$PROXY_COMPOSE_FILE" ps -q runtime)"
-mv "$work/engine" "$PROXY_DEPLOY_CONFIG.hardware/engine"
+# The record is made again from the running containers, which keep their hostname, MAC and allocation.
+bash "$root/deploy/manage.sh" hardware --reset
+cmp "$work/engine" "$PROXY_DEPLOY_CONFIG.hardware/engine"
+bash "$root/deploy/manage.sh" up
+probe runtime > "$work/recorded"
+cmp "$work/original" "$work/recorded"
 cp "$work/legacy.yml" "$PROXY_COMPOSE_FILE"
 printf "PROXY_IMAGE='%s'\n" "$image" >> "$PROXY_DEPLOY_CONFIG"
 # As in 0.3.x, the deployment config supplies the single Compose file. The image is already installed.

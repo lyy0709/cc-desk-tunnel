@@ -28,10 +28,19 @@ type input struct {
 	Offset                                        int
 }
 type result struct {
-	Text     string `json:"text"`
-	Revision string `json:"revision,omitempty"`
-	Next     int    `json:"next,omitempty"`
-	Error    string `json:"error,omitempty"`
+	Text     string   `json:"text"`
+	Revision string   `json:"revision,omitempty"`
+	Next     int      `json:"next,omitempty"`
+	Skipped  []string `json:"skipped,omitempty"`
+	Error    string   `json:"error,omitempty"`
+}
+
+// Directories a search leaves out unless it is pointed at or into one: version control, installed dependencies
+// and build output. Reading every file of them takes longer than a search may, and what they hold is seldom what
+// is looked for. The result names the ones left out.
+var unsearched = map[string]bool{
+	".git": true, "node_modules": true, ".venv": true, "venv": true, "__pycache__": true,
+	"target": true, "dist": true, ".next": true, ".gradle": true, ".cache": true,
 }
 
 func bad(message string) error { return errors.New(message) }
@@ -80,8 +89,12 @@ func run(root *os.Root, q input) (result, error) {
 		if q.Op == "search" && q.Query == "" {
 			return result{}, bad("empty search")
 		}
-		var lines []string
+		var lines, skipped []string
 		consumed, count := 0, 0
+		inside := false
+		for _, part := range strings.Split(name, "/") {
+			inside = inside || unsearched[part]
+		}
 		add := func(line string) error {
 			if count >= q.Offset {
 				if consumed+len(line) > page && len(lines) > 0 {
@@ -98,7 +111,14 @@ func run(root *os.Root, q input) (result, error) {
 		}
 		err = fs.WalkDir(root.FS(), name, func(p string, d fs.DirEntry, e error) error {
 			if e != nil {
-				return e
+				// The directory asked for has to be readable. One below it that is not is left out.
+				if p == name {
+					return e
+				}
+				if d != nil && d.IsDir() {
+					return fs.SkipDir
+				}
+				return nil
 			}
 			if d.Type()&fs.ModeSymlink != 0 {
 				return nil
@@ -117,7 +137,10 @@ func run(root *os.Root, q input) (result, error) {
 				return nil
 			}
 			if d.IsDir() {
-				if d.Name() == ".git" {
+				if p != name && !inside && unsearched[d.Name()] {
+					if len(skipped) < 20 {
+						skipped = append(skipped, p)
+					}
 					return fs.SkipDir
 				}
 				return nil
@@ -125,21 +148,19 @@ func run(root *os.Root, q input) (result, error) {
 			if !d.Type().IsRegular() {
 				return nil
 			}
+			// A file that cannot be opened or read, or went away meanwhile, does not end the search.
 			f, e := root.Open(p)
 			if e != nil {
-				return e
+				return nil
 			}
 			defer f.Close()
 			info, e := f.Stat()
-			if e != nil {
-				return e
-			}
-			if !info.Mode().IsRegular() || info.Size() > maxEdit {
+			if e != nil || !info.Mode().IsRegular() || info.Size() > maxEdit {
 				return nil
 			}
 			b, e := io.ReadAll(io.LimitReader(f, maxEdit+1))
 			if e != nil {
-				return e
+				return nil
 			}
 			if !utf8.Valid(b) || strings.IndexByte(string(b), 0) >= 0 {
 				return nil
@@ -153,7 +174,7 @@ func run(root *os.Root, q input) (result, error) {
 			}
 			return nil
 		})
-		out := result{Text: strings.Join(lines, "\n")}
+		out := result{Text: strings.Join(lines, "\n"), Skipped: skipped}
 		if errors.Is(err, io.EOF) {
 			out.Next = count
 			err = nil

@@ -123,10 +123,10 @@ test('packaged exe runs without development dependencies and operates on a proje
       await expect(page.locator('.connection-status')).toContainText('已连接', { timeout: 45000 });
       await page.getByRole('button', { name: '设置与账号', exact: true }).click();
       await page.getByRole('menuitem', { name: /^账号/ }).click();
-      await expect(page.locator('.account-identity')).toContainText(
-        /GUI 模型服务(已登录|尚未登录)/,
-        { timeout: 25000 },
-      );
+      // The account page reads the service's one Claude Code sign-in, whichever state it is in.
+      await expect(
+        page.getByRole('region', { name: '账号信息' }).locator('.setting-value').first(),
+      ).toHaveText(/^(?!未读取$).+/, { timeout: 25000 });
       await page.screenshot({ path: join(directory, 'packaged-account.png') });
       await application.close();
     } else {

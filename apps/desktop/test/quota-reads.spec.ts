@@ -5,7 +5,7 @@ import { PROTOCOL_VERSION } from '@cc-desk-tunnel/protocol';
 import type { Session } from '@cc-desk-tunnel/protocol';
 import { screenshots } from './helpers.ts';
 
-test('quota display watches per preference, refreshes on request and expires while idle', async ({
+test('one subscription quota from the service and the sessions, watched per preference and expiring while idle', async ({
   page,
 }) => {
   const now = new Date().toISOString();
@@ -44,7 +44,7 @@ test('quota display watches per preference, refreshes on request and expires whi
           sessions: [session],
         });
       requests.push(message);
-      if (message.type === 'usage.summary' && message.profile === 'terminal')
+      if (message.type === 'usage.summary')
         send({
           type: 'usage.summary',
           requestId: message.requestId,
@@ -78,14 +78,6 @@ test('quota display watches per preference, refreshes on request and expires whi
             },
           ],
         });
-      if (message.type === 'usage.summary' && !message.profile)
-        send({
-          type: 'usage.summary',
-          requestId: message.requestId,
-          retentionDays: 35,
-          firstRecordAt: null,
-          windows: [],
-        });
       send({ type: 'response', requestId: message.requestId, ok: true });
     });
   });
@@ -108,11 +100,12 @@ test('quota display watches per preference, refreshes on request and expires whi
     'https://claude.ai/settings/usage',
   );
   await page.screenshot({ path: join(screenshots, 'subscription-overview.png') });
-  await page.getByRole('button', { name: '模型服务', exact: true }).click();
+  // There is one quota, that of the sign-in the GUI and ccdt share.
+  await expect(page.getByRole('button', { name: '模型服务', exact: true })).toHaveCount(0);
   const watch = page.getByRole('switch', { name: '运行中每分钟读取一次额度', exact: true });
   await expect(watch).toBeChecked();
   expect(requests.some((message) => message.type === 'quota.watch' && message.active)).toBe(true);
-  await expect(page.getByText('尚无额度数据', { exact: true })).toBeVisible();
+  // A newer reading a session brings takes the place of its window; the others stay as the service holds them.
   publish({
     type: 'session.event',
     event: {
@@ -126,7 +119,7 @@ test('quota display watches per preference, refreshes on request and expires whi
         usage: null,
         rateLimits: {
           available: true,
-          measuredAt: now,
+          measuredAt: new Date(Date.parse(now) + 1000).toISOString(),
           windows: [
             {
               name: 'five_hour',
@@ -139,6 +132,9 @@ test('quota display watches per preference, refreshes on request and expires whi
     },
   });
   await expect(page.getByText('37% 已用 · 63% 剩余')).toBeVisible();
+  await expect(page.getByText('68.2% 已用', { exact: false })).toHaveCount(0);
+  await expect(page.getByText('5% 已用 · 95% 剩余')).toBeVisible();
+  // A terminal's turn carries no quota and changes nothing of it.
   publish({
     type: 'session.event',
     event: {
@@ -155,6 +151,7 @@ test('quota display watches per preference, refreshes on request and expires whi
       },
     },
   });
+  await expect(page.getByText('37% 已用 · 63% 剩余')).toBeVisible();
   await expect(page.locator('.account-updated')).toContainText('更新于');
   await page.screenshot({ path: join(screenshots, 'quota-observed-light.png') });
   await page.emulateMedia({ colorScheme: 'dark' });
@@ -163,8 +160,10 @@ test('quota display watches per preference, refreshes on request and expires whi
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   const count = requests.length;
   await page.clock.fastForward('02:01');
-  await expect(page.getByText('尚无额度数据', { exact: true })).toBeVisible();
+  await expect(page.getByText('37% 已用 · 63% 剩余')).toHaveCount(0);
+  await expect(page.getByText('5% 已用 · 95% 剩余')).toBeVisible();
   await page.screenshot({ path: join(screenshots, 'quota-expired-dark-narrow.png') });
+  // Expiry is the page's own timer: nothing is asked of the service or the model meanwhile.
   expect(requests.slice(count).filter((message) => message.type !== 'usage.summary')).toEqual([]);
   await watch.click();
   await expect(watch).not.toBeChecked();

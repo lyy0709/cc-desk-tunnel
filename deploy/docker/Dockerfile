@@ -50,7 +50,7 @@ RUN cd /opt/runtime && sha256sum -c claude.sha256
 COPY --from=build --chown=root:root /app /app
 COPY --from=build /tmp/ccdt-guard /usr/local/bin/ccdt-guard
 COPY --from=web-build --chown=root:root /app/apps/server/web /app/apps/server/web
-RUN chmod 755 /app/apps/server/src/runtime-relay.mjs && ln -s /app/apps/server/src/runtime-relay.mjs /usr/local/bin/ccdt-runtime
+RUN ln -s /usr/local/bin/ccdt-guard /usr/local/bin/ccdt-project-mcp && chmod 755 /app/apps/server/src/runtime-relay.mjs && ln -s /app/apps/server/src/runtime-relay.mjs /usr/local/bin/ccdt-runtime
 COPY deploy/docker/program.sh /usr/local/lib/cc-desk-tunnel/program.sh
 COPY deploy/docker/entrypoint.sh /usr/local/bin/proxy-entrypoint
 COPY deploy/docker/healthcheck.mjs /app/healthcheck.mjs

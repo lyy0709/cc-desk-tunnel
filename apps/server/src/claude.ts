@@ -1,4 +1,4 @@
-import { projectPrompt } from './project-tools.ts';
+import { projectBuiltinTools, projectPrompt } from './project-tools.ts';
 import { mkdirSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { query, getSessionInfo } from '@anthropic-ai/claude-agent-sdk';
@@ -54,6 +54,8 @@ export type ClaudeOptions = {
   executable: string;
   model?: string;
   settingsPath?: string;
+  // The deployment's provider file, read only for the names in it that the application runtime does not take.
+  providerPath?: string;
   maxTurns?: number;
   contextRetentionDays?: number;
   // Added to the CLI's inherited environment; set by the service for its usage collector.
@@ -88,6 +90,8 @@ export type ClaudeRun = {
   }>;
   // Absent only for a session owned by the service itself.
   projectTools?: { type: 'stdio'; command: string; args: string[] };
+  // Whether Claude may start subagents in a run with project tools: the service's setting as the run began.
+  subagents?: boolean;
   // Told when Claude has finished its turn and the run goes on only for background tasks, and when it resumes.
   waiting: (background: boolean) => void;
   // Told when a turn ends: the figures so far for the user message the turn answered. A turn that a background task
@@ -245,7 +249,7 @@ export async function runClaude(
         // The SDK takes the mode that asks about nothing only with this said as well.
         allowDangerouslySkipPermissions: run.permissionMode === 'bypassPermissions',
         ...(run.projectTools && {
-          tools: ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'],
+          tools: projectBuiltinTools({ subagents: !!run.subagents }),
           mcpServers: { project: run.projectTools },
           mcpServersDelivery: 'initialize',
           strictMcpConfig: true,

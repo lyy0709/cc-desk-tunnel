@@ -18,7 +18,7 @@ import {
 import { createInterface } from 'node:readline';
 import { join, resolve, relative, isAbsolute, dirname, basename } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { providerEnvironment, runtimeEnvironment } from './native-account.ts';
+import { providerEnvironment, runtimeEnvironment } from './runtime-environment.ts';
 
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/;
 
@@ -36,25 +36,17 @@ function directory(path: string, uid: number, mode: number) {
   }
 }
 
-function sessionHome(session: string | undefined, interactive: boolean, cwd?: string) {
+// Every launch is the same Claude Code, in the personal home: a chat run, a terminal and a command about the sign-in
+// alike use its settings and its one sign-in, as one user's CLI does on any machine. Only the transcripts stay apart:
+// they are kept in the service's store, and a launch sees its own project's alone, linked into the overlay.
+const PERSONAL_HOME = '/data/home';
+function sessionHome(session: string | undefined, cwd?: string) {
   if (cwd && (!session || !uuid.test(session))) throw new Error('Invalid runtime session');
   const shared = process.env.CLAUDE_CONFIG_DIR!;
-  const appHome = process.env.HOME!;
-  const home = interactive
-    ? '/data/home'
-    : session
-      ? join(appHome, 'sessions', session, 'sdk')
-      : join(appHome, 'account-status');
   directory(shared, 1000, 0o700);
-  if (!interactive && session)
-    for (const parent of [dirname(dirname(home)), dirname(home)]) {
-      directory(parent, 0, 0o751);
-      chmodSync(parent, 0o751);
-    }
-  const config = join(home, '.claude');
-  directory(home, 1000, 0o700);
+  const config = join(PERSONAL_HOME, '.claude');
+  directory(PERSONAL_HOME, 1000, 0o700);
   directory(config, 1000, 0o700);
-  const names = interactive ? [] : ['settings.json', 'CLAUDE.md'];
   let history: string | undefined;
   if (cwd) {
     const projects = join(shared, 'projects');
@@ -63,43 +55,39 @@ function sessionHome(session: string | undefined, interactive: boolean, cwd?: st
     const projectName = cwd.replaceAll('/', '-');
     history = join(projects, projectName);
     directory(history, 1000, 0o700);
+    // Compose overlays only this directory. Never install links into a user's original history.
     const localProjects = join(config, 'projects');
-    if (!interactive) {
-      if (lstatSync(localProjects, { throwIfNoEntry: false })?.isSymbolicLink()) {
-        if (readlinkSync(localProjects) !== projects) throw new Error('Unexpected history link');
-        rmSync(localProjects);
-      }
-      directory(localProjects, 1000, 0o700);
-    } else {
-      // Compose overlays only this directory. Never install links into a user's original history.
-      const overlay = lstatSync(localProjects);
-      if (
-        !overlay.isDirectory() ||
-        overlay.uid !== 0 ||
-        (overlay.mode & 0o022) !== 0 ||
-        overlay.dev === lstatSync(config).dev
-      )
-        throw new Error('Missing private terminal history mount');
-    }
-    names.push(join('projects', projectName));
-  }
-  for (const name of names) {
-    const source = join(shared, name),
-      link = join(config, name);
+    const overlay = lstatSync(localProjects);
+    if (
+      !overlay.isDirectory() ||
+      overlay.uid !== 0 ||
+      (overlay.mode & 0o022) !== 0 ||
+      overlay.dev === lstatSync(config).dev
+    )
+      throw new Error('Missing private terminal history mount');
+    const link = join(localProjects, projectName);
     try {
-      symlinkSync(source, link);
+      symlinkSync(history, link);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'EEXIST' || readlinkSync(link) !== source)
+      if ((err as NodeJS.ErrnoException).code !== 'EEXIST' || readlinkSync(link) !== history)
         throw err;
     }
   }
   return {
-    HOME: home,
-    ...(!interactive && { CLAUDE_CONFIG_DIR: config }),
+    HOME: PERSONAL_HOME,
     CCDT_SHARED_CONFIG: shared,
     ...(history && { CCDT_HISTORY: history }),
   };
 }
+// The commands about the sign-in, which belong to no session: reading it, the official sign-in in a terminal (the
+// GUI's and ccdt's alike) and signing out.
+const accountCommands = {
+  tty: [['auth', 'login']],
+  pipe: [
+    ['auth', 'status', '--json'],
+    ['auth', 'logout'],
+  ],
+};
 // Runs inside the isolated volume and PID namespace. No executable or credential path is accepted on the wire.
 export function serveRuntime(path: string, executable: string, root: string, provider: string) {
   // The supervisor owns both directories. Only the broker group can create or list project sockets.
@@ -152,14 +140,14 @@ export function serveRuntime(path: string, executable: string, root: string, pro
           const account = frame.profile !== undefined;
           if (account) {
             if (
-              !['sdk', 'terminal'].includes(frame.profile) ||
+              frame.profile !== 'personal' ||
               frame.session ||
               frame.projectSocket ||
-              (frame.tty && frame.profile !== 'terminal') ||
-              JSON.stringify(frame.args) !==
-                JSON.stringify(frame.tty ? ['auth', 'login'] : ['auth', 'status', '--json'])
+              !accountCommands[frame.tty ? 'tty' : 'pipe'].some(
+                (args) => JSON.stringify(args) === JSON.stringify(frame.args),
+              )
             )
-              throw new Error('Invalid account status request');
+              throw new Error('Invalid account request');
           } else {
             const rel = relative(root, frame.cwd);
             if (
@@ -199,14 +187,13 @@ export function serveRuntime(path: string, executable: string, root: string, pro
             chmodSync(frame.projectSocket, 0o660);
           }
           started = true;
-          const interactive = frame.tty || frame.profile === 'terminal';
-          const home = sessionHome(frame.session, interactive, account ? undefined : frame.cwd);
+          const home = sessionHome(frame.session, account ? undefined : frame.cwd);
           const env: Record<string, string> = {
             ...home,
             PATH: process.env.PATH!,
             LANG: 'C.UTF-8',
             DISABLE_AUTOUPDATER: '1',
-            ...(!interactive && providerEnvironment(provider, {})),
+            ...providerEnvironment(provider, {}),
             ...(terminal && { CCDT_TERMINAL: terminal }),
             ...runtimeEnvironment(frame.env ?? {}),
           };

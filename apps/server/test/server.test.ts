@@ -10,9 +10,12 @@ import { WebSocket } from 'ws';
 import { PROTOCOL_VERSION, serverMessageSchema } from '@cc-desk-tunnel/protocol';
 import type { ServerMessage, Session, SessionEvent } from '@cc-desk-tunnel/protocol';
 import { readIdleCompaction } from '../src/idle-compaction.ts';
+import { readSessionTools } from '../src/project-tools.ts';
 import { createProxyServer, upgradeHeld } from '../src/server.ts';
 import { SessionStore } from '../src/store.ts';
 import { serviceVersion } from '../src/updates.ts';
+import { UsageLog } from '../src/usage.ts';
+import { subscriptionScope } from '../src/native-account.ts';
 import { quotas } from '../src/claude.ts';
 
 const token = 'offline-test-' + randomUUID();
@@ -1521,6 +1524,177 @@ test('the idle compaction setting is read, changed for every window and kept wit
   // Kept with the sessions, for the service as it starts again.
   assert.equal(readIdleCompaction(f.directory).minTokens, 150_000);
 });
+
+test('subagents in device sessions are off until the setting says otherwise, for every window, and kept', async (t) => {
+  const f = await fixture(t);
+  const client = await f.connect();
+  const other = await f.connect({ id: randomUUID(), name: '另一台' });
+  await client.request({ type: 'tools.get' });
+  const read = await client.wait((message) => message.type === 'tools.state');
+  assert.ok(read.type === 'tools.state');
+  assert.deepEqual(read.values, { subagents: false });
+  const changed = await client.request({ type: 'tools.update', values: { subagents: true } });
+  assert.ok(changed.type === 'response' && changed.ok);
+  const told = await other.wait((message) => message.type === 'tools.state');
+  assert.ok(told.type === 'tools.state');
+  assert.deepEqual(told.values, { subagents: true });
+  // Only a boolean is taken, and nothing changes otherwise.
+  other.send({ type: 'tools.update', requestId: randomUUID(), values: { subagents: 'yes' } });
+  assert.equal(
+    (await other.wait((message) => message.type === 'connection.error')).type,
+    'connection.error',
+  );
+  // Kept with the sessions, for the service as it starts again.
+  assert.deepEqual(readSessionTools(f.directory), { subagents: true });
+});
+
+test(
+  'the GUI signs the one Claude Code in through the official command and out again',
+  {
+    skip:
+      process.platform === 'win32' &&
+      'The official sign-in runs in a POSIX terminal on the server.',
+  },
+  async (t) => {
+    const directory = mkdtempSync(join(tmpdir(), 'ccdt-account-'));
+    const home = join(directory, 'home');
+    mkdirSync(join(home, '.claude'), { recursive: true });
+    writeFileSync(join(home, '.claude.json'), JSON.stringify({ hasCompletedOnboarding: false }));
+    const original = process.env.CCDT_PERSONAL_HOME;
+    process.env.CCDT_PERSONAL_HOME = home;
+    // The official CLI as far as its sign-in goes: the link, the code typed back, its own store, logout.
+    const executable = join(directory, 'claude.mjs');
+    writeFileSync(
+      executable,
+      `#!${process.execPath}
+import { existsSync, rmSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { createInterface } from 'node:readline';
+const store = join(process.env.CCDT_PERSONAL_HOME, '.claude', '.credentials.json');
+const args = process.argv.slice(2).join(' ');
+if (process.env.CCDT_ACCOUNT_PROFILE !== 'personal') process.exit(2);
+if (args === 'auth status --json') {
+  const loggedIn = existsSync(store);
+  console.log(JSON.stringify(loggedIn ? { loggedIn, authMethod: 'claude.ai', email: 'owner@example.test', orgId: 'org-fixture' }
+    : { loggedIn, authMethod: 'none' }));
+  process.exit(loggedIn ? 0 : 1);
+}
+if (args === 'auth logout') {
+  rmSync(store, { force: true });
+  process.exit(0);
+}
+if (args === 'auth login') {
+  console.log('If the browser did not open, visit: https://claude.ai/oauth/authorize?fixture=1');
+  for await (const line of createInterface({ input: process.stdin })) {
+    if (line.trim() !== 'fixture#state') {
+      console.log('Invalid code. Please try again.');
+      continue;
+    }
+    writeFileSync(store, JSON.stringify({ claudeAiOauth: { accessToken: 'test-only' } }));
+    console.log('Login successful.');
+    process.exit(0);
+  }
+}
+process.exit(3);
+`,
+      { mode: 0o755 },
+    );
+    const server = createProxyServer({
+      token,
+      dataDir: join(directory, 'state'),
+      claude: { executable },
+      reverseProxy: true,
+    });
+    const serverUrl = await server.listen(0);
+    const client = new Client(serverUrl);
+    t.after(async () => {
+      client.socket.terminate();
+      await server.close();
+      quotas.clear();
+      if (original === undefined) delete process.env.CCDT_PERSONAL_HOME;
+      else process.env.CCDT_PERSONAL_HOME = original;
+      rmSync(directory, { recursive: true, force: true });
+    });
+    await client.open();
+    const state = () => client.wait((message) => message.type === 'account.state');
+    assert.equal((await client.request({ type: 'account.status' })).type, 'response');
+    const signedOut = await state();
+    assert.ok(signedOut.type === 'account.state' && !signedOut.loggedIn && !signedOut.login);
+    const code = await client.request({ type: 'account.code', code: 'fixture#state' });
+    assert.ok(code.type === 'response' && !code.ok && code.code === 'login_inactive');
+    // A reading of the quota taken before the sign-in.
+    const session = server.store.create(randomUUID(), '旧额度', '/fixture', device);
+    server.store.append(session.id, randomUUID(), {
+      type: 'native.metrics',
+      context: null,
+      usage: null,
+      rateLimits: {
+        available: true,
+        windows: [{ name: 'five_hour', utilization: 100, resetsAt: null }],
+      },
+    });
+
+    // The link the official command printed, then the code the page gave, typed back as it was.
+    assert.ok((await client.request({ type: 'account.login' })).type === 'response');
+    const waiting = await state();
+    assert.ok(waiting.type === 'account.state' && !waiting.loggedIn);
+    assert.equal(waiting.login?.url, 'https://claude.ai/oauth/authorize?fixture=1');
+    await client.request({ type: 'account.code', code: 'not-the-code' });
+    const told = await state();
+    assert.ok(told.type === 'account.state' && told.notice === 'Invalid code. Please try again.');
+    assert.equal(told.login?.url, waiting.login?.url);
+    const other = new Client(serverUrl);
+    await other.open();
+    try {
+      await other.request({ type: 'account.status' });
+      const otherState = await other.wait((m) => m.type === 'account.state');
+      assert.ok(otherState.type === 'account.state' && !otherState.login);
+      for (const attempt of [
+        { type: 'account.cancel' },
+        { type: 'account.code', code: 'fixture#state' },
+      ] as const) {
+        const denied = await other.request(attempt);
+        assert.ok(denied.type === 'response' && !denied.ok && denied.code === 'native_busy');
+      }
+    } finally {
+      other.socket.terminate();
+    }
+    await client.request({ type: 'account.code', code: 'fixture#state' });
+    const signedIn = await state();
+    assert.ok(signedIn.type === 'account.state' && signedIn.loggedIn && !signedIn.login);
+    assert.equal(signedIn.email, 'owner@example.test');
+    // The terminal will not ask for the sign-in again, and the old account's quota no longer shows.
+    assert.equal(
+      JSON.parse(readFileSync(join(home, '.claude.json'), 'utf8')).hasCompletedOnboarding,
+      true,
+    );
+    assert.equal(server.store.lastQuota(session.id)?.available, false);
+
+    // Signing out also takes away a setup token an earlier release saved, and nothing else.
+    writeFileSync(
+      join(home, '.claude', 'settings.json'),
+      JSON.stringify({ env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-only-old' }, language: 'chinese' }),
+    );
+    const owner = subscriptionScope('owner@example.test', 'org-fixture');
+    new UsageLog(server.store.database).observe(
+      { windows: [{ name: 'five_hour', utilization: 73, resetsAt: null }] },
+      Date.now(),
+      owner,
+    );
+    await client.request({ type: 'usage.summary' });
+    const beforeLogout = await client.wait((m) => m.type === 'usage.summary');
+    assert.ok(beforeLogout.type === 'usage.summary' && beforeLogout.windows[0]?.utilization === 73);
+    assert.ok((await client.request({ type: 'account.logout' })).type === 'response');
+    const out = await state();
+    assert.ok(out.type === 'account.state' && !out.loggedIn);
+    await client.request({ type: 'usage.summary' });
+    const afterLogout = await client.wait((m) => m.type === 'usage.summary');
+    assert.ok(afterLogout.type === 'usage.summary' && afterLogout.windows.length === 0);
+    assert.deepEqual(JSON.parse(readFileSync(join(home, '.claude', 'settings.json'), 'utf8')), {
+      language: 'chinese',
+    });
+  },
+);
 
 test('an upgrade is held back only by what is at work, and says what that is', () => {
   const now = new Date().toISOString();

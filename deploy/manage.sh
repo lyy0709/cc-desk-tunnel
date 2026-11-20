@@ -16,7 +16,9 @@ Usage:
     [--data ABSOLUTE_PATH] [--control-port 8787]
     [--cert FULLCHAIN --key PRIVATE_KEY] [--url wss://DOMAIN/ws] [--token SECRET]
   manage.sh pull|build|up|status|logs|stop|restart|uninstall|connection|summary
-  manage.sh hardware                        retain the live server's hardware before its first stop or backup
+  manage.sh hardware [--reset]              retain the live server's hardware before its first stop or backup;
+                                            --reset records the machine as it is now, after its kernel, size or
+                                            Docker Engine changed or when the previous container is gone
   manage.sh upgrade [--from SERVER_ARCHIVE]   install the newest release (or the archive) and replace the container
   manage.sh client INSTALLER_EXE              offer a Windows installer to connected clients
   manage.sh token [SECRET]                    replace the service token (random when omitted) and restart
@@ -26,7 +28,8 @@ Usage:
   manage.sh certificate FULLCHAIN PRIVATE_KEY
   manage.sh renew
 
-Requires Docker Engine + Compose with per-network mac_address support (v2.23.2+), Bash, OpenSSL, curl, tar.
+Requires a Linux kernel with Landlock ABI 3 (6.2 or newer), Docker Engine + Compose with per-network
+mac_address support (v2.23.2+), Bash, OpenSSL, curl, tar.
 Use sudo if your user cannot access Docker. Config defaults to .local/docker.env;
 set PROXY_DEPLOY_CONFIG to manage a different isolated installation.
 Set PROXY_COMPOSE_FILE when managing an image-only standalone compose.yml.
@@ -54,15 +57,31 @@ valid_port() { [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1024 && 10#$1 <= 65535)); }
 safe_value() { [[ "$1" != *"'"* && "$1" != *$'\n'* && "$1" != *$'\r'* && "$1" != *'$'* && "$1" != *'`'* ]]; }
 write_var() { safe_value "$2" || fail "Unsupported characters in $1"; printf "%s='%s'\n" "$1" "$2"; }
 source "$ROOT/deploy/hardware.sh"
+# What the image about to be started needs of this machine, asked before any container is replaced: a failure here
+# leaves the running service as it is. An image from before the runtime container has no guard and is not asked.
+preflight() {
+  local version
+  version="$(docker compose version --short 2>/dev/null || true)"
+  [[ "$version" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]] \
+    && (( 10#${BASH_REMATCH[1]} > 2 || ( 10#${BASH_REMATCH[1]} == 2 && ( 10#${BASH_REMATCH[2]} > 23 || ( 10#${BASH_REMATCH[2]} == 23 && 10#${BASH_REMATCH[3]} >= 2 ) ) ) )) \
+    || fail "需要 Docker Compose 2.23.2 或更新版本（当前：${version:-读不到版本}）。未替换任何容器，正在运行的服务不受影响。"
+  docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges \
+    --entrypoint /bin/sh "$PROXY_IMAGE" -ec 'if [ -x /usr/local/bin/ccdt-guard ]; then exec /usr/local/bin/ccdt-guard --check; fi' >/dev/null \
+    || fail "这台服务器无法运行 CC 运行容器：需要 Linux Landlock ABI 3（内核 6.2 或更新，启用 Landlock，且 Docker 的 seccomp 配置允许它）。当前内核：$(uname -r)。未替换任何容器，正在运行的服务不受影响；升级宿主机内核后重新执行本命令。"
+}
 dc() {
   local -a files=(-f "$COMPOSE")
   if [[ "${1:-}" = up ]]; then
     retain_hardware
     if [[ -d "$CONFIG.hardware" ]]; then
       [[ "$(image_platform "$PROXY_IMAGE")" = "$(cat "$CONFIG.hardware/platform")" ]] || fail "The target server image uses a different architecture."
+      # The kernel names the processor's flags, so the list also changes when only the host kernel is upgraded.
       local cpu
-      cpu="$(cpu_capabilities "$PROXY_IMAGE")" && [[ -n "$cpu" && "$cpu" = "$(cat "$CONFIG.hardware/cpu")" ]] || fail "Server CPU capabilities changed. The running service was not replaced."
+      cpu="$(cpu_capabilities "$PROXY_IMAGE")" || cpu=''
+      [[ -n "$cpu" && "$cpu" = "$(cat "$CONFIG.hardware/cpu")" ]] \
+        || echo "注意：CPU 特性列表与保存的硬件记录不同（内核升级或云主机迁移后常见），服务照常继续。运行 $(self) hardware --reset 可按当前环境重新记录。" >&2
     fi
+    preflight
     # Bind sources must exist before Compose creates either container (otherwise Docker makes them root-owned).
     for part in app-home cc-runner state/native state/terminals state/project-sockets; do
       if [[ ! -e "$DATA_DIR/$part" ]]; then
@@ -84,7 +103,9 @@ load() {
   # This file is a private, locally generated deployment configuration.
   source "$CONFIG"
   if [[ "$COMPOSE" = "$CONFIG.hardware/legacy.yml" ]]; then
-    COMPOSE="${PROXY_COMPOSE_FILE:-$(cat "$CONFIG.hardware/base")}"
+    # A record removed by hand leaves the Compose file this program came with.
+    COMPOSE="${PROXY_COMPOSE_FILE:-$(cat "$CONFIG.hardware/base" 2>/dev/null || true)}"
+    [[ -n "$COMPOSE" ]] || COMPOSE="$ROOT/deploy/compose.yml"
   fi
   [[ "$DATA_DIR" = /* && -f "$DATA_DIR/.cc-desk-tunnel-data" ]] || fail "Invalid managed data directory."
   DATA_DIR="$(realpath -- "$DATA_DIR")"
@@ -253,8 +274,8 @@ summary() {
   echo "下一步"
   echo "  1. 云防火墙只放行上面“需放行端口”一项；本项目不需要其他入站端口。"
   echo "  2. Windows 客户端填入服务地址、指纹和凭据并连接。"
-  echo "  3. 在服务器 config/provider.json 配置你自己的 API key 或云提供方。"
-  echo "  模型提供方配置位于 $DATA_DIR/config/provider.json 后执行 sudo $(self) restart。"
+  echo "  3. 在客户端“设置 → 账号与额度”登录 Claude 账号。"
+  echo "  改用 API key 或云提供方时编辑 $DATA_DIR/config/provider.json 后执行 sudo $(self) restart。"
   echo "  日常管理：sudo $(self) status | logs | upgrade | help"
   echo "以上凭据等同于服务器登录权限，请勿外传。"
   echo "======================================================="
@@ -484,7 +505,12 @@ if [[ "$command" = backup || "$command" = restore ]]; then
   source "$ROOT/deploy/docker/program.sh"
 fi
 case "$command" in
-  hardware) retain_hardware existing; echo "Server hardware retained in $CONFIG.hardware." ;;
+  hardware)
+    case "${1:-}" in
+      '') retain_hardware existing; echo "Server hardware retained in $CONFIG.hardware." ;;
+      --reset) [[ $# = 1 ]] || fail "hardware --reset takes no further arguments."; reset_hardware ;;
+      *) fail "hardware takes no arguments besides --reset." ;;
+    esac ;;
   build) build_image ;;
   pull) pull_image ;;
   up)

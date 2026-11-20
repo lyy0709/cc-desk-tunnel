@@ -37,6 +37,9 @@ export const projectOperation = z.discriminatedUnion('op', [
   }),
 ]);
 export type ProjectOperation = z.infer<typeof projectOperation>;
+// The longest a command runs on a project device before it is stopped there. The tool's description tells Claude of
+// it, and the service waits a little longer than this for the device's answer.
+export const PROJECT_COMMAND_SECONDS = 120;
 export const projectCommands = z
   .object({
     type: z.literal('project.commands'),

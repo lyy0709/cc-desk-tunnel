@@ -14,6 +14,7 @@ const every = [
   '通知',
   '快捷键',
   '上下文与缓存',
+  '项目工具',
   '浏览器访问',
   '账号与额度',
   'CLI 设置',
@@ -121,6 +122,8 @@ async function serve(page: Page, url: string, shells?: string[], chosen: unknown
           requestId,
           values: { enabled: false, afterMinutes: 50, minTokens: 100_000 },
         });
+      if (message.type === 'tools.get')
+        send({ type: 'tools.state', requestId, values: { subagents: false } });
       if (message.type === 'instructions.get')
         send({
           type: 'instructions.state',

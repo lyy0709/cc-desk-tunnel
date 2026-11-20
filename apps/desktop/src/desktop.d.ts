@@ -67,6 +67,7 @@ declare global {
         directory: string,
         scope: import('./ChangesPanel.tsx').GitScope,
         file: string,
+        moreContext?: boolean,
       ) => Promise<import('./ChangesPanel.tsx').FileDiff>;
       copyText: (text: string) => Promise<void>;
       openExternal: (url: string) => Promise<void>;
@@ -167,13 +168,13 @@ declare global {
       }) => Promise<{ version?: string; error?: string; code?: string }>;
       // Opens the session in ccdt, the terminal client, signed in to this window's service with its token; says
       // instead when ccdt is not installed, or not of this client's release.
-      openInCcdt: (
-        request: {
-          url: string;
-          fingerprint: string;
-          token: string;
-        } & ({ sessionId: string; projectPath?: string } | { login: true }),
-      ) => Promise<{ status: 'opened' | 'missing' } | { status: 'outdated'; installed: string }>;
+      openInCcdt: (request: {
+        url: string;
+        fingerprint: string;
+        token: string;
+        sessionId: string;
+        projectPath?: string;
+      }) => Promise<{ status: 'opened' | 'missing' } | { status: 'outdated'; installed: string }>;
       onServiceUpgrade: (
         callback: (update: import('@cc-desk-tunnel/protocol').ServiceUpdate) => void,
       ) => () => void;

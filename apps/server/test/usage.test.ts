@@ -3,8 +3,9 @@ import { test } from 'node:test';
 import { DatabaseSync } from 'node:sqlite';
 import { UsageLog, createUsageReceiver, telemetryEnvironment } from '../src/usage.ts';
 import { terminalEnvironment } from '../src/native-terminal.ts';
-import { subscriptionScope } from '../src/native-account.ts';
 
+import { subscriptionScope } from '../src/native-account.ts';
+const owner = subscriptionScope('user@example.invalid', 'org-A')!;
 const hour = 3600_000;
 const base = Date.parse('2026-10-06T00:00:00.000Z');
 const recordedRange = {
@@ -19,6 +20,7 @@ function record(at: number, values: Record<string, string | number>, name = 'api
       'event.name': name,
       'event.timestamp': new Date(at).toISOString(),
       'user.email': 'user@example.invalid',
+      'organization.id': 'org-A',
       ...values,
     }).map(([key, value]) => ({
       key,
@@ -209,33 +211,35 @@ test('period statistics follow the official windows, including early resets and 
   });
   const weekEnd = base + 5 * 24 * hour;
   log.ingest(batch(request(base - 3 * 24 * hour, 'old'), request(base + hour, 'w1')));
-  log.observe(limits([20, base + 5 * hour], [30, weekEnd]), base + hour + 1);
+  log.observe(limits([20, base + 5 * hour], [30, weekEnd]), base + hour + 1, owner);
   const count = (now: number) =>
-    Object.fromEntries(log.summary(now).windows.map((window) => [window.name, window.requests]));
+    Object.fromEntries(
+      log.summary(now, owner).windows.map((window) => [window.name, window.requests]),
+    );
   // First observation: the period start is derived from the reported reset time.
   assert.deepEqual(count(base + hour + 2), { five_hour: 1, seven_day: 1 });
   assert.equal(
-    log.summary(base + hour + 2).windows[1].startedAt,
+    log.summary(base + hour + 2, owner).windows[1].startedAt,
     new Date(weekEnd - 7 * 24 * hour).toISOString(),
   );
 
   // Sub-second jitter in the reported reset time is not a new period.
   log.ingest(batch(request(base + 2 * hour, 'w2')));
-  log.observe(limits([40, base + 5 * hour + 900], [31, weekEnd - 700]), base + 2 * hour + 1);
+  log.observe(limits([40, base + 5 * hour + 900], [31, weekEnd - 700]), base + 2 * hour + 1, owner);
   assert.deepEqual(count(base + 2 * hour + 2), { five_hour: 2, seven_day: 2 });
 
   // Past the reset time and before any new report, the old period's requests no longer count.
   assert.deepEqual(count(base + 6 * hour), { five_hour: 0, seven_day: 2 });
-  assert.equal(log.summary(base + 6 * hour).windows[0].utilization, null);
+  assert.equal(log.summary(base + 6 * hour, owner).windows[0].utilization, null);
 
   // A new five-hour window starts with the first request after expiry.
   log.ingest(batch(request(base + 7 * hour, 'w3')));
-  log.observe(limits([5, base + 12 * hour], [32, weekEnd]), base + 7 * hour + 1);
+  log.observe(limits([5, base + 12 * hour], [32, weekEnd]), base + 7 * hour + 1, owner);
   assert.deepEqual(count(base + 7 * hour + 2), { five_hour: 1, seven_day: 3 });
 
   // A reset granted early clears the weekly utilization while its reset time stays; statistics restart too.
   log.ingest(batch(request(base + 8 * hour, 'w4')));
-  log.observe(limits([10, base + 12 * hour], [0, weekEnd]), base + 8 * hour + 1);
+  log.observe(limits([10, base + 12 * hour], [0, weekEnd]), base + 8 * hour + 1, owner);
   assert.deepEqual(count(base + 8 * hour + 2), { five_hour: 2, seven_day: 1 });
 });
 
@@ -254,22 +258,22 @@ test('a period survives jitter and repeated readings, and a cut-short one is res
       },
     ],
   });
-  const started = () => log.summary(base + 3 * hour).windows[0].startedAt;
+  const started = () => log.summary(base + 3 * hour, owner).windows[0].startedAt;
   log.ingest(batch(request(base, 'j1')));
-  log.observe(reading(45, base + hour));
+  log.observe(reading(45, base + hour), Date.now(), owner);
   // Two readings a few milliseconds apart, the later one a point lower.
-  log.observe(reading(44, base + hour + 36));
+  log.observe(reading(44, base + hour + 36), Date.now(), owner);
   assert.equal(started(), weekStart);
   // Another session's long turn emits the reading it took earlier once more.
-  log.observe(reading(47, base + 2 * hour));
-  log.observe(reading(30, base + hour + 10), base + 2 * hour + 5);
+  log.observe(reading(47, base + 2 * hour), Date.now(), owner);
+  log.observe(reading(30, base + hour + 10), base + 2 * hour + 5, owner);
   assert.equal(started(), weekStart);
-  assert.equal(log.summary(base + 3 * hour).windows[0].utilization, 47);
-  assert.equal(log.summary(base + 3 * hour).windows[0].requests, 1);
+  assert.equal(log.summary(base + 3 * hour, owner).windows[0].utilization, 47);
+  assert.equal(log.summary(base + 3 * hour, owner).windows[0].requests, 1);
   // A reset granted early leaves the reset time alone, and something has been used again by the next reading.
-  log.observe(reading(3, base + 2 * hour + 100));
+  log.observe(reading(3, base + 2 * hour + 100), Date.now(), owner);
   assert.equal(started(), new Date(base + 2 * hour).toISOString());
-  assert.equal(log.summary(base + 3 * hour).windows[0].requests, 0);
+  assert.equal(log.summary(base + 3 * hour, owner).windows[0].requests, 0);
 
   // An expired window is reported empty and without a reset time; its next period is told by the new one.
   const five = (utilization: number, at: number, resetsAt: number | null) => ({
@@ -283,10 +287,11 @@ test('a period survives jitter and repeated readings, and a cut-short one is res
     ],
   });
   const fiveStart = () =>
-    log.summary(base + 9 * hour).windows.find((window) => window.name === 'five_hour')!.startedAt;
-  log.observe(five(2, base + hour, base + 5 * hour));
-  log.observe(five(0, base + 6 * hour, null));
-  log.observe(five(1, base + 7 * hour, base + 11.5 * hour));
+    log.summary(base + 9 * hour, owner).windows.find((window) => window.name === 'five_hour')!
+      .startedAt;
+  log.observe(five(2, base + hour, base + 5 * hour), Date.now(), owner);
+  log.observe(five(0, base + 6 * hour, null), Date.now(), owner);
+  log.observe(five(1, base + 7 * hour, base + 11.5 * hour), Date.now(), owner);
   assert.equal(fiveStart(), new Date(base + 6.5 * hour).toISOString());
 
   // A database written before the fix: the start is put back once, and the records stay.
@@ -296,11 +301,11 @@ test('a period survives jitter and repeated readings, and a cut-short one is res
   old.exec("DELETE FROM migrations WHERE name = 'usage-window-start'");
   old
     .prepare(
-      'INSERT INTO scoped_usage_windows(name,started_at,resets_at,utilization,observed_at) VALUES (?, ?, ?, ?, ?)',
+      'INSERT INTO scoped_usage_windows(scope,name,started_at,resets_at,utilization,observed_at) VALUES (?, ?, ?, ?, ?, ?)',
     )
-    .run('seven_day', Date.now() - 60_000, resetsAt, 51, Date.now() - 1000);
+    .run(owner, 'seven_day', Date.now() - 60_000, resetsAt, 51, Date.now() - 1000);
   const records = old.prepare('SELECT * FROM api_requests ORDER BY id').all();
-  const restored = new UsageLog(old).summary().windows[0];
+  const restored = new UsageLog(old).summary(Date.now(), owner).windows[0];
   assert.equal(restored.startedAt, new Date(resetsAt - 7 * 24 * hour).toISOString());
   assert.equal(restored.requests, 1);
   assert.deepEqual(old.prepare('SELECT * FROM api_requests ORDER BY id').all(), records);
@@ -323,8 +328,8 @@ test('period recovery preserves an early reset recorded in the original quota ev
     "DELETE FROM migrations WHERE name = 'usage-window-start'; CREATE TABLE events (data TEXT NOT NULL)",
   );
   db.prepare(
-    'INSERT INTO scoped_usage_windows(name,started_at,resets_at,utilization,observed_at) VALUES (?, ?, ?, ?, ?)',
-  ).run('seven_day', now - 60000, end, 20, now);
+    'INSERT INTO scoped_usage_windows(scope,name,started_at,resets_at,utilization,observed_at) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(owner, 'seven_day', now - 60000, end, 20, now);
   const insert = db.prepare('INSERT INTO events VALUES (?)');
   for (const [at, utilization] of [
     [now - 3 * hour, 60],
@@ -347,30 +352,36 @@ test('period recovery preserves an early reset recorded in the original quota ev
   }
   const records = db.prepare('SELECT * FROM api_requests ORDER BY id').all();
   const events = db.prepare('SELECT * FROM events').all();
-  const recovered = new UsageLog(db).summary().windows[0];
+  const recovered = new UsageLog(db).summary(Date.now(), owner).windows[0];
   assert.equal(recovered.requests, 1);
   assert.equal(recovered.startedAt, new Date(now - 3 * hour).toISOString());
   assert.deepEqual(db.prepare('SELECT * FROM api_requests ORDER BY id').all(), records);
   assert.deepEqual(db.prepare('SELECT * FROM events').all(), events);
 });
 
-test('upgrading discards unattributable quota readings and retains historical calls and session context', () => {
+test('legacy calls remain in history but unidentified 0.3 windows cannot overwrite the signed-in account', () => {
   const db = new DatabaseSync(':memory:');
   const now = Date.now();
-  const log = new UsageLog(db);
-  log.ingest(batch(request(now - 1000, 'legacy')));
-  log.observe(
-    {
-      windows: [
-        { name: 'five_hour', utilization: 100, resetsAt: new Date(now + hour).toISOString() },
-      ],
-    },
-    now,
+  // A 0.3 database: its own table of periods, calls that do not say which surface made them, no new table yet.
+  db.exec(`CREATE TABLE api_requests (
+      id INTEGER PRIMARY KEY, at INTEGER NOT NULL, session_id TEXT, model TEXT NOT NULL,
+      input_tokens INTEGER NOT NULL, output_tokens INTEGER NOT NULL,
+      cache_read_tokens INTEGER NOT NULL, cache_creation_tokens INTEGER NOT NULL,
+      cost_usd REAL NOT NULL, duration_ms INTEGER NOT NULL, ttft_ms INTEGER, source TEXT, request_id TEXT UNIQUE,
+      prompt_id TEXT);
+    CREATE TABLE usage_windows(name TEXT PRIMARY KEY,started_at INTEGER NOT NULL,resets_at INTEGER,utilization REAL,observed_at INTEGER NOT NULL);
+    CREATE TABLE migrations (name TEXT PRIMARY KEY);
+    INSERT INTO migrations VALUES ('usage-window-start');
+    CREATE TABLE events(data TEXT);`);
+  db.prepare("INSERT INTO usage_windows VALUES ('five_hour', ?, ?, 40, ?)").run(
+    now - 2 * hour,
+    now + 3 * hour,
+    now - 60_000,
   );
-  db.exec(`ALTER TABLE api_requests DROP COLUMN profile;
-    CREATE TABLE events(data TEXT);
-    CREATE TABLE history_meta(key TEXT PRIMARY KEY, value TEXT);
-    INSERT INTO history_meta VALUES ('id','legacy-cache')`);
+  db.prepare(
+    `INSERT INTO api_requests(at,model,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,cost_usd,
+      duration_ms,request_id) VALUES (?,'fixture',1,0,0,0,0.1,1,'legacy')`,
+  ).run(now - hour);
   const payload = {
     type: 'native.metrics',
     context: { usedTokens: 42 },
@@ -378,49 +389,32 @@ test('upgrading discards unattributable quota readings and retains historical ca
     rateLimits: { available: true, windows: [] },
   };
   db.prepare('INSERT INTO events VALUES (?)').run(JSON.stringify({ payload }));
-  const legacyWrite = `INSERT INTO usage_windows VALUES ('five_hour', 1, NULL, 100, 1)
-    ON CONFLICT(name) DO UPDATE SET utilization=excluded.utilization`;
-  db.exec(
-    `CREATE TABLE usage_windows(name TEXT PRIMARY KEY,started_at INTEGER NOT NULL,resets_at INTEGER,utilization REAL,observed_at INTEGER NOT NULL);${legacyWrite}`,
-  );
-  const updated = new UsageLog(db);
-  assert.deepEqual(updated.summary(now).windows, []);
-  assert.deepEqual(JSON.parse(String(db.prepare('SELECT data FROM events').get()!.data)).payload, {
-    ...payload,
-    rateLimits: null,
-  });
-  assert.notEqual(db.prepare('SELECT value FROM history_meta').get()!.value, 'legacy-cache');
+  const events = db.prepare('SELECT data FROM events').all();
+  const log = new UsageLog(db);
+  assert.deepEqual(log.summary(now, owner).windows, []);
+  // The account's readings in the sessions stay as they were, and so does 0.3's table, for a downgrade.
+  assert.deepEqual(db.prepare('SELECT data FROM events').all(), events);
+  assert.ok(db.prepare("SELECT 1 FROM usage_windows WHERE name = 'five_hour'").get());
+  // A reading here is newer than 0.3's: starting again takes over nothing older.
+  const resetsAt = new Date(now + 3 * hour).toISOString();
+  log.observe({ windows: [{ name: 'five_hour', utilization: 45, resetsAt }] }, now, owner);
+  assert.equal(new UsageLog(db).summary(now, owner).windows[0].utilization, 45);
+  // 0.3 started again on this data reads later; back on this release, its reading is taken over.
+  db.prepare(
+    "UPDATE usage_windows SET utilization = 60, observed_at = ? WHERE name = 'five_hour'",
+  ).run(now + 1000);
+  const again = new UsageLog(db);
+  assert.equal(again.summary(now + 2000, owner).windows[0].utilization, 45);
   const range = {
-    from: new Date(now - hour).toISOString(),
+    from: new Date(now - 2 * hour).toISOString(),
     to: new Date(now + hour).toISOString(),
   };
-  assert.equal(updated.query({ range, limit: 10 }, () => null).totals.requests, 1);
-  assert.equal(updated.query({ range, limit: 10, profile: 'sdk' }, () => null).totals.requests, 0);
-  updated.observe(
-    {
-      windows: [
-        { name: 'five_hour', utilization: 1, resetsAt: new Date(now + hour).toISOString() },
-      ],
-    },
-    now,
-  );
-  // An old binary can write again and its mixed readings still cannot enter the SDK after re-upgrade.
-  db.exec(legacyWrite);
-  db.prepare('INSERT INTO events VALUES (?)').run(JSON.stringify({ payload }));
-  db.prepare('INSERT INTO events VALUES (?)').run(
-    JSON.stringify({ payload: { ...payload, profile: 'sdk' } }),
-  );
-  assert.equal(new UsageLog(db).summary(now).windows[0].utilization, 1);
-  const restoredEvents = db
-    .prepare('SELECT data FROM events ORDER BY rowid')
-    .all()
-    .map((row) => JSON.parse(String(row.data)).payload.rateLimits);
-  assert.deepEqual(restoredEvents, [null, null, payload.rateLimits]);
+  assert.equal(again.query({ range, limit: 10 }, () => null).totals.requests, 1);
 });
 
-test('loopback receiver counts only SDK calls towards the SDK window and retains both surfaces in the log', async () => {
+test('loopback receiver counts the calls of chat runs and terminals alike towards the account periods', async () => {
   const log = new UsageLog(new DatabaseSync(':memory:'));
-  const receiver = createUsageReceiver(log);
+  const receiver = createUsageReceiver(log, () => owner);
   const endpoint = await receiver.listen();
   try {
     assert.match(endpoint, /^http:\/\/127\.0\.0\.1:\d+\/v1\/logs$/);
@@ -449,55 +443,57 @@ test('loopback receiver counts only SDK calls towards the SDK window and retains
       body: JSON.stringify(batch(request(base, 'terminal', { 'organization.id': 'org-A' }))),
     });
     assert.equal(response.status, 200);
-    log.observe(
-      {
-        windows: [
-          { name: 'five_hour', utilization: 3, resetsAt: new Date(base + hour).toISOString() },
-        ],
-      },
-      base,
+    // The log keeps which surface made each call, and nothing of the account.
+    assert.deepEqual(
+      log.database
+        .prepare('SELECT profile FROM api_requests ORDER BY id')
+        .all()
+        .map((row) => row.profile),
+      ['sdk', 'terminal'],
     );
-    assert.equal(log.summary(base).windows[0].requests, 1);
-    const filter = { limit: 10, range: recordedRange };
-    assert.equal(log.query(filter, () => null).totals.requests, 2);
-    const sdk = log.query({ ...filter, profile: 'sdk' }, () => null);
-    assert.equal(sdk.totals.requests, 1);
-    assert.equal(sdk.byModel[0].requests, 1);
-    const owner = subscriptionScope('user@example.invalid', 'org-A')!;
-    const other = subscriptionScope('user@example.invalid', 'org-B')!;
+    const resetsAt = new Date(base + hour).toISOString();
+    log.observe({ windows: [{ name: 'five_hour', utilization: 3, resetsAt }] }, base, owner);
+    assert.deepEqual(
+      log.summary(base, owner).windows.map((w) => [w.utilization, w.requests]),
+      [[3, 2]],
+    );
+    assert.equal(log.query({ limit: 10, range: recordedRange }, () => null).totals.requests, 2);
+    // A terminal's status line reports the same account's window, and a later reading of it is the one shown.
     log.observe(
       {
-        windows: [
-          { name: 'five_hour', utilization: 100, resetsAt: new Date(base + hour).toISOString() },
-        ],
+        windows: [{ name: 'five_hour', utilization: 9, resetsAt }],
+        measuredAt: new Date(base + 1000).toISOString(),
       },
-      base,
+      base + 1000,
       owner,
     );
     assert.deepEqual(
-      log.summary(base, owner).windows.map((w) => [w.utilization, w.requests]),
-      [[100, 1]],
-    );
-    assert.deepEqual(
-      log.summary(base).windows.map((w) => [w.utilization, w.requests]),
-      [[3, 1]],
-    );
-    assert.deepEqual(log.summary(base, other).windows, []);
-    assert.deepEqual(log.summary(base, null).windows, []);
-    assert.deepEqual(log.summary(base + hour, owner).windows, []);
-    assert.equal(
-      log.query({ ...filter, profile: 'terminal' }, () => null, base, owner).totals.requests,
-      1,
-    );
-    assert.equal(
-      log.query({ ...filter, profile: 'terminal' }, () => null, base, other).totals.requests,
-      0,
+      log.summary(base + 2000, owner).windows.map((w) => [w.utilization, w.requests]),
+      [[9, 2]],
     );
   } finally {
     await receiver.close();
   }
 });
 
+test('subscription periods join desktop and terminal calls only for the signed-in organization', () => {
+  const log = new UsageLog(new DatabaseSync(':memory:'));
+  const other = subscriptionScope('user@example.invalid', 'org-B')!;
+  log.ingest(batch(request(base, 'a')));
+  log.ingest(batch(request(base, 'b', { 'organization.id': 'org-B' })), 'terminal');
+  log.ingest(batch(request(base, 'unknown', { 'organization.id': '' })));
+  log.ingest(batch(request(base, 'api-key')), 'sdk', null);
+  log.observe({ windows: [{ name: 'five_hour', utilization: 73, resetsAt: null }] }, base, owner);
+  assert.deepEqual(log.summary(base, null).windows, []);
+  assert.deepEqual(log.summary(base, other).windows, []);
+  assert.equal(log.summary(base, owner).windows[0].requests, 1);
+  assert.equal(
+    log.query({ range: recordedRange, limit: 10, accountPeriod: true }, () => null, base, other)
+      .totals.requests,
+    1,
+  );
+  assert.equal(log.query({ range: recordedRange, limit: 10 }, () => null, base).totals.requests, 4);
+});
 test('a turn is summed over its time window with the figures the call log shows', () => {
   const log = new UsageLog(new DatabaseSync(':memory:'));
   const session = '4f0c9d0e-1111-4222-8333-444455556666';

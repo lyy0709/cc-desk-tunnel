@@ -2,16 +2,17 @@ import { createConnection } from 'node:net';
 import { createInterface } from 'node:readline';
 import { McpServer, type RegisteredTool } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
-import { projectOperation } from '@cc-desk-tunnel/protocol';
+import { PROJECT_COMMAND_SECONDS, projectOperation } from '@cc-desk-tunnel/protocol';
 
 const descriptions = {
   list: 'List entries in a directory. Use "." for the root and next for pagination.',
   read: 'Read UTF-8 text at a byte offset, or a complete PNG, JPEG, WebP or GIF starting at offset 0. The revision identifies the file read. For attachments use the supplied reference.',
-  search: 'Search for literal text in project text files. Returns relative paths and line numbers.',
+  search:
+    'Search for literal text in project text files. Returns relative paths and line numbers. Version control, dependency and build output directories such as node_modules are left out and named in "skipped"; give one of them as the path to search inside it.',
   edit: 'Replace one unique exact excerpt in a previously read text file, using its revision.',
   create: 'Create a new UTF-8 text file. Fails if the path already exists.',
   output: 'Read the next page of a command result by its id and offset.',
-  command: 'Run a command from the project directory with the local user’s session grant.',
+  command: `Run a command from the project directory with the local user’s session grant. A command is stopped after ${PROJECT_COMMAND_SECONDS} seconds, and its result then has timedOut set; nothing can be left running in the background.`,
 };
 const server = new McpServer({ name: 'project', version: '1' });
 let commandTool: RegisteredTool;

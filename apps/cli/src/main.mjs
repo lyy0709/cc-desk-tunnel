@@ -24,7 +24,7 @@ const HELP = `ccdt：在自己的终端里使用 CC Desk Tunnel 服务端上的�
   ccdt --allow-commands  授权当前目录的本次会话以当前用户身份执行命令
   ccdt new [标题]        在当前目录新建会话
   ccdt sessions [--all]  列出当前项目的会话；--all 列出全部
-  ccdt usage             个人订阅额度与终端周期调用统计
+  ccdt usage             订阅额度与本周期调用统计（图形客户端与终端合计）
   ccdt config            查看和修改设置：在终端里用方向键逐项选择
   ccdt config 名称 [值]  查看或修改一项，供脚本使用；值写 default 恢复默认
   ccdt server            已登录的服务端：选一个作为默认连接的，或登录新的
@@ -550,7 +550,7 @@ function usage(summary) {
     const reset = window.resetsAt ? `，${when(window.resetsAt)} 重置` : '';
     return `${(names[window.name] ?? window.name).padEnd(8)} 已用 ${used}${reset} · ${window.requests} 次请求 · 约 $${window.costUsd.toFixed(2)}`;
   });
-  if (!lines.length) return '暂无当前订阅的终端读数。原版终端的 /usage 和官方用量页提供完整明细。';
+  if (!lines.length) return '暂无订阅额度读数。原版终端的 /usage 和官方用量页提供完整明细。';
   return [
     ...lines,
     dim('金额是按 API 价格估算的等价消耗，不是订阅账单。完整的图表在图形客户端的统计页。'),
@@ -730,7 +730,7 @@ export async function main(argv) {
       return 0;
     }
     if (command === 'usage') {
-      say(usage(await service.request({ type: 'usage.summary', profile: 'terminal' })));
+      say(usage(await service.request({ type: 'usage.summary' })));
       await service.close();
       return 0;
     }

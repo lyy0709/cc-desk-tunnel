@@ -1,7 +1,34 @@
-import type { NativeMetrics } from '@cc-desk-tunnel/protocol';
+import type { NativeMetrics, UsageSummary } from '@cc-desk-tunnel/protocol';
 import { useEffect, useState } from 'react';
 
 type Limits = NativeMetrics['rateLimits'] | undefined;
+// The account's quota as the service keeps it, from chat runs and terminals alike, with what a reading newer than that
+// says in place of its windows: a session's events can bring one before the service is asked again. A period past its
+// reset, of which nothing has been read since, is left out.
+export function accountQuota(summary: UsageSummary | null, live: Limits): Limits {
+  const stored: Limits =
+    summary?.measuredAt && summary.windows.some((window) => window.utilization !== null)
+      ? {
+          available: true,
+          measuredAt: summary.measuredAt,
+          windows: summary.windows
+            .filter((window) => window.utilization !== null)
+            .map(({ name, utilization, resetsAt }) => ({ name, utilization, resetsAt })),
+        }
+      : null;
+  if (!live?.available) return stored ?? live ?? null;
+  if (!stored) return live;
+  if ((live.measuredAt ?? '') <= stored.measuredAt!) return stored;
+  const fresh = new Map(live.windows.map((window) => [window.name, window]));
+  return {
+    available: true,
+    measuredAt: live.measuredAt,
+    windows: [
+      ...stored.windows.map((window) => fresh.get(window.name) ?? window),
+      ...live.windows.filter((window) => !stored.windows.some((row) => row.name === window.name)),
+    ],
+  };
+}
 export function currentQuota(limits: Limits, now = Date.now()) {
   if (!limits?.available) return null;
   const windows = limits.windows.filter(

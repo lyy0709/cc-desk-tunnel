@@ -1063,18 +1063,14 @@ export function App({
     visit({ page, section, sessionId: client.state.selectedId });
   };
   // The session in ccdt, signed in as this window is; the window says how to install ccdt where it is missing.
-  async function openInCcdt(session?: Session) {
+  async function openInCcdt(session: Session) {
     await act(async () => {
       const opened = await window.desktop!.openInCcdt({
         url: form.url,
         fingerprint: form.fingerprint,
         token: form.token,
-        ...(session
-          ? {
-              sessionId: session.id,
-              projectPath: onThis(session) ? session.projectPath : undefined,
-            }
-          : { login: true }),
+        sessionId: session.id,
+        projectPath: onThis(session) ? session.projectPath : undefined,
       });
       if (opened.status !== 'opened')
         setCcdtNeeded(opened.status === 'outdated' ? { installed: opened.installed } : {});
@@ -2135,24 +2131,19 @@ export function App({
                 inBrowser && !state.sessions.length ? '开始会话后可读取额度' : undefined
               }
               account={nativeMode ? state.account : null}
-              openTerminal={
-                nativeMode && connected && window.desktop?.openInCcdt
-                  ? () => void openInCcdt()
-                  : undefined
-              }
               capabilities={signedOut ? null : capabilities}
               metrics={signedOut ? null : accountMetrics}
               refreshing={refreshing}
               disabled={!connected || refreshing}
               error={inBrowser ? quotaError : currentError}
-              refresh={(sdkQuota) => {
-                if (inBrowser) {
-                  if (sdkQuota) refreshQuota();
-                } else {
+              refresh={() => {
+                if (inBrowser) refreshQuota();
+                else {
                   void act(async () => {
                     await client.request({ type: 'account.status' });
                   });
-                  if (sdkQuota && quotaSession && !signedOut) void refreshStatus(undefined, true);
+                  // A session's CLI reads the plan quota anew; without one the page shows what the service holds.
+                  if (quotaSession && !signedOut) void refreshStatus(undefined, true);
                 }
               }}
             />

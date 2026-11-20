@@ -6,7 +6,7 @@ import { webCertificateStateSchema } from './web-certificate.ts';
 export * from './web.ts';
 export * from './web-certificate.ts';
 
-export const PROTOCOL_VERSION = 36;
+export const PROTOCOL_VERSION = 37;
 // The release each protocol version began with, from 0.2.4 on: a client newer than its service signs in with
 // the service's number to have it upgrade (see the README). A new number adds its line here.
 export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
@@ -34,6 +34,7 @@ export const PROTOCOL_HISTORY: Readonly<Record<string, number>> = {
   '0.3.21': 31,
   '0.3.23': 32,
   '0.4.0': 36,
+  '0.4.1': 37,
 };
 export const MAX_FRAME_BYTES = 256 * 1024;
 export const APPROVAL_PAGE_CHARS = 16000;
@@ -128,16 +129,9 @@ export const nativeAccountSchema = z.object({
   apiKeySource: z.string().optional(),
   tokenSource: z.string().optional(),
 });
+// The one Claude Code sign-in on the service, which chat runs and terminals alike use.
 export const accountStateSchema = z.object({
   loggedIn: z.boolean(),
-  terminal: z
-    .object({
-      loggedIn: z.boolean(),
-      authMethod: z.string().optional(),
-      email: z.string().optional(),
-      organization: z.string().optional(),
-    })
-    .optional(),
   authMethod: z.string().optional(),
   email: z.string().optional(),
   organization: z.string().optional(),
@@ -145,6 +139,8 @@ export const accountStateSchema = z.object({
   // When a stored claude.ai sign-in ends for good (ISO 8601), as `claude auth status` reads it: renewing the access
   // token does not move it, and the real end can be up to three days earlier. Absent for any other credential.
   loginExpiresAt: z.string().optional(),
+  // Present while the official sign-in command waits for the code shown after browser authorization.
+  login: z.object({ url: z.url() }).nullable().optional(),
   notice: z.string().optional(),
 });
 export type AccountState = z.infer<typeof accountStateSchema>;
@@ -194,6 +190,11 @@ export const idleCompactionSchema = z.object({
   minTokens: z.number().int().min(20_000).max(1_000_000),
 });
 export type IdleCompaction = z.infer<typeof idleCompactionSchema>;
+// The service's own setting too: the optional built-in tools of a session whose project is on a device. With
+// `subagents`, Claude may hand parts of a task to subagents, which have the session's project and web tools and make
+// model requests of their own. It applies from the next run or terminal.
+export const sessionToolsSchema = z.object({ subagents: z.boolean() });
+export type SessionTools = z.infer<typeof sessionToolsSchema>;
 export const contextUsageSchema = z.object({
   model: z.string(),
   usedTokens: z.number().nonnegative(),
@@ -689,9 +690,25 @@ export const commandSchema = z.discriminatedUnion('type', [
       offset: z.number().int().nonnegative(),
     })
     .strict(),
+  // The official `claude auth login`, run by the service: the client shows its link and passes back the code the
+  // browser page gives. The CLI keeps the sign-in itself.
+  z.object({ type: z.literal('account.login'), ...request }).strict(),
   z
     .object({
-      type: z.literal('account.login'),
+      type: z.literal('account.code'),
+      ...request,
+      code: z
+        .string()
+        .trim()
+        .regex(/^[\x21-\x7e]{1,2048}$/),
+    })
+    .strict(),
+  z.object({ type: z.literal('account.cancel'), ...request }).strict(),
+  z.object({ type: z.literal('account.logout'), ...request }).strict(),
+  // The same command in a terminal of its own, for ccdt: its screen and keys go as a terminal's do.
+  z
+    .object({
+      type: z.literal('account.terminal'),
       ...request,
       sessionId: id,
       cols: z.number().int().min(20).max(400),
@@ -714,6 +731,14 @@ export const commandSchema = z.discriminatedUnion('type', [
       values: idleCompactionSchema.partial().strict(),
     })
     .strict(),
+  z.object({ type: z.literal('tools.get'), ...request }).strict(),
+  z
+    .object({
+      type: z.literal('tools.update'),
+      ...request,
+      values: sessionToolsSchema.partial().strict(),
+    })
+    .strict(),
   // The shell the user prefers Claude to run scripts in on the computer of this connection; null leaves it to Claude.
   z
     .object({ type: z.literal('device.shell'), ...request, shell: deviceShellSchema.nullable() })
@@ -728,13 +753,7 @@ export const commandSchema = z.discriminatedUnion('type', [
       version: z.string().max(100),
     })
     .strict(),
-  z
-    .object({
-      type: z.literal('usage.summary'),
-      ...request,
-      profile: z.literal('terminal').optional(),
-    })
-    .strict(),
+  z.object({ type: z.literal('usage.summary'), ...request }).strict(),
   z.object({ type: z.literal('session.stats'), ...request, sessionId: id }).strict(),
   z.object({ type: z.literal('service.update.check'), ...request }).strict(),
   z
@@ -749,9 +768,9 @@ export const commandSchema = z.discriminatedUnion('type', [
   z
     .object({
       type: z.literal('usage.query'),
+      accountPeriod: z.literal(true).optional(),
       ...request,
       range: usageRange,
-      profile: z.enum(['sdk', 'terminal']).optional(),
       model: z.string().min(1).max(200).optional(),
       beforeId: z.number().int().positive().optional(),
       // Rows to skip from the newest, for a page of a range whose end is fixed.
@@ -1070,6 +1089,11 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     type: z.literal('compaction.state'),
     requestId: id.optional(),
     values: idleCompactionSchema,
+  }),
+  z.object({
+    type: z.literal('tools.state'),
+    requestId: id.optional(),
+    values: sessionToolsSchema,
   }),
   z.object({
     type: z.literal('instructions.state'),

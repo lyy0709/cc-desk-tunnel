@@ -4,7 +4,7 @@
 
 ## 部署选择
 
-Compose 运行 `proxy` 与 `runtime` 两个容器。只有代理开放服务端口。运行容器的启动进程通过私有 Unix socket 接收启动请求，交互和 SDK 入口共用镜像内的官方 CLI。宿主需要 Linux Landlock ABI 3 或以上。应用层热更无法增加第二个容器，升级到 0.4.0 时需要同步安装 Compose 文件及匹配的镜像。
+Compose 运行 `proxy` 与 `runtime` 两个容器。只有代理开放服务端口。运行容器的启动进程通过私有 Unix socket 接收启动请求，交互和 SDK 入口共用镜像内的官方 CLI。宿主需要 Linux Landlock ABI 3 或以上（内核 6.2 或更新）和 Docker Compose 2.23.2 或以上，管理脚本在替换容器前检查这两项。应用层热更无法增加第二个容器，升级到 0.4.0 时需要同步安装 Compose 文件及匹配的镜像；0.4.0 起服务端只在服务器上用 `manage.sh upgrade` 升级。
 
 `deploy/install.sh` 检查 Docker 与 Compose（缺少时只给出安装命令），单独运行时还会从发布页下载并校验最新的程序包；镜像优先拉取 GitHub 上预构建的同版本镜像 `ghcr.io/lyy0709/cc-desk-tunnel:X.Y.Z`（x86_64 与 arm64），拉取不到时在服务器上构建；`deploy/manage.sh` 负责初始化、构建、启动、升级、更换证书与凭据、备份恢复和卸载。`npm run package:server` 生成不含秘密、携带同版本 Web 前端构建的源码包；运行镜像不需要 Electron 或 Vite。也可以只用镜像，配合不含构建步骤的 `deploy/compose.yml` 自行管理。镜像不包含桌面安装包，同版本的 Windows 安装包由服务启动后自己下载到数据目录。
 

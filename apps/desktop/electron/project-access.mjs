@@ -9,6 +9,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { findGitBash } from './git-bash.mjs';
 import { ProcessSupervisor } from './process-supervisor.mjs';
+import { PROJECT_COMMAND_SECONDS } from '@cc-desk-tunnel/protocol';
 const imagePath = /\.(png|jpe?g|gif|webp)$/i;
 
 function files(executable, root, input, signal) {
@@ -44,6 +45,7 @@ export class ProjectAccess {
     powershell,
     scriptDirectory,
     environment,
+    commandLimitMs = PROJECT_COMMAND_SECONDS * 1000,
   }) {
     mkdirSync(dirname(database), { recursive: true, mode: 0o700 });
     this.db = new DatabaseSync(database);
@@ -58,6 +60,7 @@ export class ProjectAccess {
       powershell,
       scriptDirectory,
       environment,
+      commandLimitMs,
     });
     this.sessions = new Map();
     this.grants = new Map();
@@ -69,11 +72,18 @@ export class ProjectAccess {
   async bind(folder) {
     const path = await realpath(folder);
     const { text: identity } = await files(this.helper, path, { op: 'bind' });
+    const known = this.byPath(path);
+    // A path chosen again keeps its project, and so its sessions, also when the directory there is another one by
+    // now: a volume whose device number changes with every mount, a folder restored from a copy. The user has just
+    // named it. What an earlier choice allowed to run there is taken back.
     this.db
       .prepare(
-        'INSERT INTO projects VALUES(?,?,?,?) ON CONFLICT(service,path) DO UPDATE SET id=excluded.id, identity=excluded.identity WHERE projects.identity<>excluded.identity',
+        'INSERT INTO projects VALUES(?,?,?,?) ON CONFLICT(service,path) DO UPDATE SET identity=excluded.identity',
       )
       .run(this.service, path, 'project:' + randomUUID(), identity);
+    if (known && known.identity !== identity)
+      for (const [sessionId, project] of [...this.grants])
+        if (project === known.id) this.revokeCommands(sessionId);
     return this.byPath(path).id;
   }
   byPath(path) {
@@ -189,9 +199,14 @@ export class ProjectAccess {
           operation.shell,
           this.environment,
           controller.signal,
+          this.commandLimitMs,
         );
         if (controller.signal.aborted) throw new Error('命令已中断，结果未知。');
-        this.outputs.set(sessionId, { id: requestId, ...result });
+        // The later pages of a command stay readable while a few newer ones finish, as with commands run side by side.
+        const held = this.outputs.get(sessionId) ?? new Map();
+        held.set(requestId, result);
+        while (held.size > 8) held.delete(held.keys().next().value);
+        this.outputs.set(sessionId, held);
         return this.output(sessionId, requestId, 0);
       }
       if (operation.op === 'output') return this.output(sessionId, operation.id, operation.offset);
@@ -227,8 +242,8 @@ export class ProjectAccess {
     }
   }
   output(session, id, offset) {
-    const held = this.outputs.get(session);
-    if (!held || held.id !== id) throw new Error('此命令的输出已释放。');
+    const held = this.outputs.get(session)?.get(id);
+    if (!held) throw new Error('此命令的输出已释放。');
     const end = Math.min(offset + 10000, held.output.length);
     return JSON.stringify({
       id,
@@ -237,6 +252,8 @@ export class ProjectAccess {
       code: held.code,
       signal: held.signal,
       truncated: held.truncated,
+      // Stopped at the limit, not ended by itself: what it had begun may be half done.
+      timedOut: held.timedOut || undefined,
     });
   }
   close() {
@@ -249,7 +266,16 @@ export class ProjectAccess {
   }
 }
 
-async function runCommand(cwd, script, powershell, scriptDirectory, shell, environment, signal) {
+async function runCommand(
+  cwd,
+  script,
+  powershell,
+  scriptDirectory,
+  shell,
+  environment,
+  signal,
+  limit,
+) {
   const windows = process.platform === 'win32';
   const supervisor = new ProcessSupervisor();
   const binary = windows ? (powershell ?? 'pwsh.exe') : await resolvePosixShell({ signal });
@@ -296,7 +322,11 @@ async function runCommand(cwd, script, powershell, scriptDirectory, shell, envir
     if (windows) child.kill();
     else void supervisor.close();
   };
-  const timer = setTimeout(stop, 120000);
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    stop();
+  }, limit);
   signal.addEventListener('abort', stop, { once: true });
   try {
     return await new Promise((ok, fail) => {
@@ -316,7 +346,7 @@ async function runCommand(cwd, script, powershell, scriptDirectory, shell, envir
       child.stderr.on('data', collect);
       child.once('error', () => fail(new Error('本机命令进程无法启动。')));
       child.once('close', (code, reason) =>
-        ok({ output: Buffer.concat(chunks).toString(), code, signal: reason, truncated }),
+        ok({ output: Buffer.concat(chunks).toString(), code, signal: reason, truncated, timedOut }),
       );
     });
   } finally {

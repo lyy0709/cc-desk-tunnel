@@ -49,6 +49,7 @@ type DataMessage = Extract<
       | 'approval.detail'
       | 'settings.state'
       | 'compaction.state'
+      | 'tools.state'
       | 'instructions.state'
       | 'web.settings.state'
       | 'web.totp.setup'
@@ -67,6 +68,8 @@ type Replies = {
   'settings.update': 'settings.state';
   'compaction.get': 'compaction.state';
   'compaction.update': 'compaction.state';
+  'tools.get': 'tools.state';
+  'tools.update': 'tools.state';
   'instructions.get': 'instructions.state';
   'instructions.update': 'instructions.state';
   'web.settings.get': 'web.settings.state';
@@ -104,6 +107,7 @@ export class RequestInterruptedError extends Error {
       'session.stats',
       'settings.get',
       'compaction.get',
+      'tools.get',
       'instructions.get',
       'web.settings.get',
       'web.certificate.get',
@@ -603,6 +607,10 @@ export class ProxyClient {
         if (message.requestId && this.pending.has(message.requestId))
           this.results.set(message.requestId, message);
         this.update({ compaction: message.values });
+      } else if (message.type === 'tools.state') {
+        // Told to every connection when it changes; only the one that asked is waiting for it.
+        if (message.requestId && this.pending.has(message.requestId))
+          this.results.set(message.requestId, message);
       } else if (message.type === 'service.update') {
         const { type: _type, ...update } = message;
         this.update(

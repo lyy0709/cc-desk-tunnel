@@ -60,6 +60,7 @@ export function environmentConfig(env: NodeJS.ProcessEnv, defaultDataDir: string
       ? {
           executable: '/usr/local/bin/ccdt-runtime',
           model: env.CLAUDE_MODEL,
+          providerPath: env.CLAUDE_SETTINGS_PATH,
           contextRetentionDays: retention,
         }
       : undefined,

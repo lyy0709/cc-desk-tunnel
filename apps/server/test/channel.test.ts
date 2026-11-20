@@ -30,7 +30,7 @@ import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js'
 import { defaultCertificate } from './fixtures/web-certificates.ts';
 import { runClaude } from '../src/claude.ts';
 import { NativeInput } from '../src/native-input.ts';
-import { projectPrompt } from '../src/project-tools.ts';
+import { projectBuiltinTools, projectPrompt } from '../src/project-tools.ts';
 // @ts-expect-error The native bridge is a bundled ESM module.
 import { openProxyBridge } from '../../desktop/electron/proxy-bridge.mjs';
 // @ts-expect-error Packaging helper used to exercise the same binary users receive.
@@ -97,8 +97,6 @@ test(
       new URL('../src/server.ts?project-fixture', import.meta.url).href
     );
     const fake = join(temp, 'fixture-cli.mjs');
-    const owner = join(temp, 'terminal-owner');
-    writeFileSync(owner, 'org-a');
     writeFileSync(
       fake,
       `#!${process.execPath}
@@ -106,15 +104,13 @@ import {Client} from ${JSON.stringify(import.meta.resolve('@modelcontextprotocol
 import {StdioClientTransport} from ${JSON.stringify(import.meta.resolve('@modelcontextprotocol/sdk/client/stdio.js'))};
 import {readFileSync} from 'node:fs';
 import {execFileSync} from 'node:child_process';
-const org = readFileSync(${JSON.stringify(owner)}, 'utf8');
 if (process.argv.slice(2).join(' ') === 'auth status --json') {
-  const personal = process.env.CCDT_ACCOUNT_PROFILE === 'terminal';
-  console.log(JSON.stringify(personal ? {loggedIn:true,authMethod:'claude.ai',email:'alice@example.test',orgId:org}
-                                      : {loggedIn:true,authMethod:'api_key'}));
+  if (process.env.CCDT_ACCOUNT_PROFILE !== 'personal') process.exit(2);
+  console.log(JSON.stringify({loggedIn:true,authMethod:'claude.ai',email:'alice@example.test',orgId:'org-A'}));
   process.exit(0);
 }
 if (process.argv.slice(2).join(' ') === 'auth login') {
-  if (process.env.CCDT_ACCOUNT_PROFILE !== 'terminal' || process.env.CCDT_RUNTIME_SESSION) process.exit(2);
+  if (process.env.CCDT_ACCOUNT_PROFILE !== 'personal' || process.env.CCDT_RUNTIME_SESSION) process.exit(2);
   console.log('FIXTURE-AUTH-URL');
   const {createInterface}=await import('node:readline');
   for await (const line of createInterface({input:process.stdin})) process.exit(line==='fixture-reply' ? 0 : 3);
@@ -124,7 +120,7 @@ const client=new Client({name:'fixture-pty',version:'1'});await client.connect(n
 if (!(await client.listTools()).tools.some(tool=>tool.name==='command')) throw new Error('missing initial session grant');
 const result=await client.callTool({name:'read',arguments:{path:'index.ts'}});
 const session=process.argv[process.argv.includes('--resume') ? process.argv.indexOf('--resume')+1 : process.argv.indexOf('--session-id')+1];
-const record={attributes:Object.entries({'event.name':'api_request','session.id':session,'user.email':'alice@example.test','organization.id':org,model:'fixture'}).map(([key,stringValue])=>({key,value:{stringValue}}))};
+const record={attributes:Object.entries({'event.name':'api_request','session.id':session,'user.email':'alice@example.test','organization.id':'org-A',model:'fixture'}).map(([key,stringValue])=>({key,value:{stringValue}}))};
 const res=await fetch(process.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({resourceLogs:[{scopeLogs:[{logRecords:[record]}]}]})});
 if (!res.ok) throw new Error('fixture telemetry rejected');
 const {statusLine}=JSON.parse(readFileSync(process.argv[process.argv.indexOf('--settings')+1],'utf8'));
@@ -383,16 +379,14 @@ console.log('PTY-FIXTURE',result.content[0].text);await client.close();
       assert.equal(server.store.get(sessionId).session.device?.name, `设备 ${device.slice(0, 8)}`);
       assert.match(printed, /PTY-FIXTURE.*external edited/);
       assert.ok(!printed.includes(project));
-      const summary = await terminal.request({ type: 'usage.summary', profile: 'terminal' });
+      // The quota the terminal's status line showed is the account's, as a chat run's would be.
+      const summary = await terminal.request({ type: 'usage.summary' });
       assert.deepEqual(
         summary.windows.map((w: { utilization: number }) => w.utilization),
         [0, 5],
       );
       assert.equal(summary.windows[1].requests, 1);
-      assert.deepEqual((await terminal.request({ type: 'usage.summary' })).windows, []);
-      writeFileSync(owner, 'org-b');
-      const switched = await terminal.request({ type: 'usage.summary', profile: 'terminal' });
-      assert.deepEqual(switched.windows, []);
+      assert.equal(server.store.lastQuota(sessionId)?.windows[1]?.utilization, 5);
       const previous = server.store.list(true).map((session: Session) => session.id);
       const keys = new PassThrough(),
         screen = new PassThrough();
@@ -478,6 +472,7 @@ for await (const line of createInterface({input: process.stdin})) {
           sessionId,
           nativeRoot: sessionId,
           projectTools,
+          subagents: ack === 'true',
           permissionMode: 'default',
           input,
           resume: false,
@@ -508,7 +503,15 @@ for await (const line of createInterface({input: process.stdin})) {
       assert.deepEqual(servers, { project: projectTools });
       assert.equal(prompt, projectPrompt);
       assert.doesNotMatch(prompt, /\b(?:ssh|scp|sftp)\b/i);
-      assert.ok(argv.includes('--tools=AskUserQuestion,EnterPlanMode,ExitPlanMode'));
+      const tools = projectBuiltinTools({ subagents: ack === 'true' });
+      assert.ok(argv.includes(`--tools=${tools.join(',')}`));
+      // Subagents come only with the service's setting. Nothing that works on this host's files or runs its
+      // commands is among the tools either way.
+      assert.equal(tools.includes('Agent'), ack === 'true');
+      for (const name of ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'NotebookEdit'])
+        assert.ok(!tools.includes(name), name);
+      for (const name of ['WebSearch', 'WebFetch', 'TodoWrite'])
+        assert.ok(tools.includes(name), name);
       assert.ok(argv.includes('--strict-mcp-config'));
       assert.ok(!argv.join(' ').includes('ssh device'));
       assert.ok(!argv.includes('--mcp-config'));

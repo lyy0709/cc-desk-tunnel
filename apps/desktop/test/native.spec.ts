@@ -130,7 +130,10 @@ test('configured provider: account metrics, Windows execution, running input, na
 
     await page.getByRole('button', { name: '设置与账号', exact: true }).click();
     await page.getByRole('menuitem', { name: /^账号/ }).click();
-    await expect(page.locator('.account-identity')).toContainText('GUI 模型服务已登录');
+    // The one sign-in the native runs use, as the official CLI reports it: signed in.
+    await expect(
+      page.getByRole('region', { name: '账号信息' }).locator('.setting-value').first(),
+    ).toHaveText(/^(?!未读取$|未登录$).+/);
     await page.screenshot({ path: resolve('.local/screenshots/subscription-account.png') });
     await page.getByRole('button', { name: '会话', exact: true }).click();
 

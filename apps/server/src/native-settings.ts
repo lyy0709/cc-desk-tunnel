@@ -1,13 +1,39 @@
-import { readFileSync, renameSync, writeFileSync, mkdirSync } from 'node:fs';
+import {
+  readFileSync,
+  renameSync,
+  writeFileSync,
+  mkdirSync,
+  lstatSync,
+  mkdtempSync,
+  linkSync,
+  copyFileSync,
+  rmSync,
+} from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { nativeSettingsSchema } from '@cc-desk-tunnel/protocol';
 import type { NativeSettings } from '@cc-desk-tunnel/protocol';
 
+// The Claude Code that every chat run and terminal of this service starts: its configuration directory and the file
+// of its own state, which holds the sign-in's account and first-run marks. In the image the service's own
+// CLAUDE_CONFIG_DIR is its transcript store, so the deployment names the personal home (CCDT_PERSONAL_HOME), whose CLI
+// runs without CLAUDE_CONFIG_DIR. Elsewhere it is the CLI this process would start itself.
+export function personalConfig(env = process.env) {
+  if (env.CCDT_PERSONAL_HOME)
+    return {
+      directory: join(env.CCDT_PERSONAL_HOME, '.claude'),
+      state: join(env.CCDT_PERSONAL_HOME, '.claude.json'),
+    };
+  return {
+    directory: env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'),
+    state: join(env.CLAUDE_CONFIG_DIR ?? homedir(), '.claude.json'),
+  };
+}
+
 // The official CLI's user settings file. The proxy edits only the keys in the protocol schema and keeps every
 // other key as it found it; a new CLI process reads the file when it starts, so changes apply from the next run.
-export function settingsPath(configDirectory = process.env.CLAUDE_CONFIG_DIR) {
-  return join(configDirectory ?? join(homedir(), '.claude'), 'settings.json');
+export function settingsPath(configDirectory = personalConfig().directory) {
+  return join(configDirectory, 'settings.json');
 }
 
 // Settings the CLI takes as environment variables, which the file holds under `env` as text.
@@ -91,4 +117,45 @@ export function updateNativeSettings(values: Partial<NativeSettings>, path = set
   }
   writeSettingsFile(file, path);
   return readNativeSettings(path);
+}
+
+// 0.4.0 stored GUI preferences separately. Import only settings managed by CCDT, never credentials,
+// environment overrides or hooks. A hard link installs each complete file only if its destination is still free.
+export function migratePersonalSettings(previous: string, personal: string) {
+  const marker = join(previous, '.personal-settings-migrated');
+  if (
+    previous === personal ||
+    !lstatSync(previous, { throwIfNoEntry: false })?.isDirectory() ||
+    lstatSync(marker, { throwIfNoEntry: false })
+  )
+    return;
+  mkdirSync(personal, { recursive: true, mode: 0o700 });
+  const staged = mkdtempSync(join(personal, '.ccdt-settings-'));
+  try {
+    for (const name of ['settings.json', 'CLAUDE.md']) {
+      const source = join(previous, name),
+        target = join(personal, name),
+        temp = join(staged, name);
+      if (!lstatSync(source, { throwIfNoEntry: false })?.isFile()) continue;
+      if (lstatSync(target, { throwIfNoEntry: false })) {
+        console.warn(`保留个人目录中的 ${name}；此前的桌面文件保存在 ${source}。`);
+        continue;
+      }
+      if (name === 'settings.json') {
+        const values = Object.fromEntries(
+          Object.entries(readNativeSettings(source)).filter(([, v]) => v != null),
+        );
+        if (!Object.keys(values).length) continue;
+        updateNativeSettings(values, temp);
+      } else copyFileSync(source, temp);
+      try {
+        linkSync(temp, target);
+      } catch (e) {
+        if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
+      }
+    }
+    writeFileSync(marker, '', { mode: 0o600 });
+  } finally {
+    rmSync(staged, { recursive: true, force: true });
+  }
 }

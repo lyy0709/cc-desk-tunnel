@@ -1,10 +1,24 @@
-import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react';
-import { ChevronDown, GitBranch, MoreHorizontal, RefreshCw, WrapText, X } from 'lucide-react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { diffWordsWithSpace, parsePatch, type Change } from 'diff';
+import {
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Folder,
+  FolderTree,
+  Maximize2,
+  Minimize2,
+  GitBranch,
+  MoreHorizontal,
+  RefreshCw,
+  WrapText,
+  X,
+} from 'lucide-react';
 import { IconButton, Menu, Modal } from './ui.tsx';
 import type { MenuItem, MenuPosition } from './ui.tsx';
 import type { TurnReview } from './turnChanges.ts';
 
-export type GitScope = 'unstaged' | 'staged';
+export type GitScope = 'uncommitted' | 'unstaged' | 'staged';
 export type ChangedFile = {
   path: string;
   absolutePath: string;
@@ -27,7 +41,7 @@ export type Changes = {
   root: string;
   branch: string | null;
   rawContent?: boolean;
-  counts?: Record<GitScope, number>;
+  counts?: Record<'unstaged' | 'staged', number>;
   baselineAt?: string;
   notice?: string;
   finished?: boolean;
@@ -59,66 +73,236 @@ const unavailable: Record<Exclude<FileDiff['kind'], 'text'>, string> = {
   unsupported: '此文件类型无法预览。',
 };
 
+type DiffLayout = 'auto' | 'unified' | 'split';
+type DiffLine = {
+  kind: 'added' | 'removed' | 'context';
+  text: string;
+  before?: number;
+  after?: number;
+  noNewline?: boolean;
+  words?: Change[];
+};
+
+function parseDiff(patch: string) {
+  const sections = parsePatch(patch);
+  const changes = sections.reduce(
+    (total, section) =>
+      total +
+      section.hunks.reduce(
+        (sum, hunk) => sum + hunk.lines.filter((line) => line[0] === '+' || line[0] === '-').length,
+        0,
+      ),
+    0,
+  );
+  const wordDiffDeadline = Date.now() + 32;
+  return sections.map(({ oldMode, newMode, hunks }) => {
+    let nextOld = 1;
+    let nextNew = 1;
+    return {
+      modeChanged: oldMode && newMode && oldMode !== newMode ? `${oldMode} → ${newMode}` : null,
+      hunks: hunks.map((hunk) => {
+        let oldLine = hunk.oldStart;
+        let newLine = hunk.newStart;
+        const skipped = Math.max(0, Math.min(oldLine - nextOld, newLine - nextNew));
+        const lines: DiffLine[] = [];
+        const pairs: [DiffLine | undefined, DiffLine | undefined][] = [];
+        let removed: DiffLine[] = [];
+        let added: DiffLine[] = [];
+        // Keep unchanged lines aligned and pair replacements within each change block.
+        function flush() {
+          for (let i = 0; i < Math.max(removed.length, added.length); i++) {
+            const before = removed[i];
+            const after = added[i];
+            const timeout = wordDiffDeadline - Date.now();
+            if (
+              before &&
+              after &&
+              changes <= 2000 &&
+              timeout > 0 &&
+              Math.max(before.text.length, after.text.length) <= 1000
+            ) {
+              const words = diffWordsWithSpace(before.text, after.text, { timeout });
+              if (words?.some((part) => !part.added && !part.removed && part.value.trim())) {
+                before.words = words.filter((part) => !part.added);
+                after.words = words.filter((part) => !part.removed);
+              }
+            }
+            pairs.push([before, after]);
+          }
+          removed = [];
+          added = [];
+        }
+        for (const raw of hunk.lines) {
+          if (raw.startsWith('\\')) {
+            const previous = lines.at(-1);
+            if (previous) previous.noNewline = true;
+            continue;
+          }
+          const kind = raw[0] === '+' ? 'added' : raw[0] === '-' ? 'removed' : 'context';
+          const line: DiffLine = {
+            kind,
+            text: raw.slice(1),
+            before: kind === 'added' ? undefined : oldLine++,
+            after: kind === 'removed' ? undefined : newLine++,
+          };
+          lines.push(line);
+          if (kind === 'removed') removed.push(line);
+          else if (kind === 'added') added.push(line);
+          else {
+            flush();
+            pairs.push([line, line]);
+          }
+        }
+        flush();
+        nextOld = oldLine;
+        nextNew = newLine;
+        return { hunk, lines, pairs, skipped };
+      }),
+    };
+  });
+}
+
 function DiffContent({
   diff,
+  split,
+  wrap,
   open,
   locateLines,
 }: {
   diff: FileDiff;
-  open: (line?: number) => void;
+  split: boolean;
+  wrap: boolean;
+  open?: (line?: number) => void;
   locateLines: boolean;
 }) {
+  const sections = useMemo(() => {
+    try {
+      return diff.kind === 'text' ? parseDiff(diff.patch) : [];
+    } catch {
+      return null;
+    }
+  }, [diff.kind, diff.patch]);
   if (diff.kind !== 'text')
     return <p className="changes-note">{diff.message ?? unavailable[diff.kind]}</p>;
-  if (!diff.patch) return <p className="changes-note">没有文本差异。</p>;
-  let oldLine = 0;
-  let newLine = 0;
-  let hunk = false;
-  const rows = diff.patch
-    .replace(/\n$/, '')
-    .split('\n')
-    .map((text, index) => {
-      const header = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(text);
-      if (header) {
-        oldLine = Number(header[1]);
-        newLine = Number(header[2]);
-        hunk = true;
-        return (
-          <div className="diff-hunk" key={index}>
-            {text}
+  if (!sections)
+    return (
+      <p className="changes-note error-text" role="alert">
+        补丁格式有误，无法预览。
+      </p>
+    );
+  if (!sections.some((section) => section.hunks.length || section.modeChanged))
+    return <p className="changes-note">没有文本差异。</p>;
+
+  function renderLine(line: DiffLine | undefined, side?: 'old' | 'new', key?: number) {
+    if (!line) return <div className="diff-line diff-empty" aria-hidden="true" key={key} />;
+    const { kind, text, before, after, noNewline, words } = line;
+    const jump = locateLines ? after : undefined;
+    const label = jump ? `在编辑器中打开第 ${jump} 行` : '在编辑器中打开文件';
+    return (
+      <div className={`diff-line ${kind}`} key={key}>
+        {side !== 'new' && <span className="diff-number">{before}</span>}
+        {side !== 'old' &&
+          (after && open ? (
+            <button
+              className="diff-number"
+              type="button"
+              title={label}
+              aria-label={label}
+              onClick={() => open(jump)}
+            >
+              {after}
+            </button>
+          ) : (
+            <span className="diff-number">{after}</span>
+          ))}
+        <span className="diff-sign" aria-hidden="true">
+          {kind === 'added' ? '+' : kind === 'removed' ? '−' : ''}
+        </span>
+        <code>
+          {words?.map(({ value, added, removed }, index) =>
+            added || removed ? <mark key={index}>{value}</mark> : value,
+          ) ?? text}
+          {noNewline && (
+            <span className="diff-eol" title="文件末尾无换行" aria-label="文件末尾无换行">
+              ↵
+            </span>
+          )}
+        </code>
+      </div>
+    );
+  }
+
+  const renderSections = (side?: 'old' | 'new') =>
+    sections.map(({ hunks, modeChanged }, section) => (
+      <div className="diff-section" key={section}>
+        {modeChanged && <div className="diff-hunk">文件权限 {modeChanged}</div>}
+        {hunks.map(({ hunk, lines, pairs, skipped }, index) => (
+          <div className="diff-section" key={index}>
+            <div className="diff-hunk">
+              <span>
+                原 {hunk.oldLines ? hunk.oldStart : '—'} · 新 {hunk.newLines ? hunk.newStart : '—'}
+              </span>
+              {skipped > 0 && <span>折叠 {skipped} 行上下文</span>}
+            </div>
+            {split
+              ? pairs.map(([before, after], i) =>
+                  side ? (
+                    renderLine(side === 'old' ? before : after, side, i)
+                  ) : (
+                    <div className="diff-pair" key={i}>
+                      {renderLine(before, 'old')}
+                      {renderLine(after, 'new')}
+                    </div>
+                  ),
+                )
+              : lines.map((line, i) => renderLine(line, undefined, i))}
           </div>
-        );
-      }
-      const kind =
-        hunk && text[0] === '+'
-          ? 'added'
-          : hunk && text[0] === '-'
-            ? 'removed'
-            : hunk && text[0] === ' '
-              ? 'context'
-              : 'meta';
-      const before = kind === 'removed' || kind === 'context' ? oldLine++ : undefined;
-      const after = kind === 'added' || kind === 'context' ? newLine++ : undefined;
-      return (
-        <div className={`diff-line ${kind}`} key={index}>
-          <span className="diff-number">{before}</span>
-          <button
-            type="button"
-            className="diff-number"
-            disabled={kind === 'meta'}
-            aria-label={
-              after && locateLines ? `在编辑器中打开第 ${after} 行` : '在编辑器中打开文件'
-            }
-            title={after && locateLines ? `在编辑器中打开第 ${after} 行` : '在编辑器中打开文件'}
-            onClick={() => open(locateLines ? after : undefined)}
-          >
-            {after ?? (before ? '−' : '')}
-          </button>
-          <code>{text || ' '}</code>
-        </div>
-      );
-    });
-  return <div className="diff-lines">{rows}</div>;
+        ))}
+      </div>
+    ));
+
+  if (split && !wrap)
+    return (
+      <div className="diff-panes">
+        {(['old', 'new'] as const).map((side) => {
+          const title = side === 'old' ? '修改前' : '修改后';
+          return (
+            <div
+              className="diff-scroll"
+              role="region"
+              aria-label={title + '代码'}
+              tabIndex={0}
+              key={side}
+            >
+              <div className="diff-lines diff-pane">
+                <div className="diff-sides">
+                  <span>{title}</span>
+                </div>
+                {renderSections(side)}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    );
+
+  return (
+    <div
+      className="diff-scroll"
+      tabIndex={wrap ? undefined : 0}
+      aria-label={wrap ? undefined : '代码差异'}
+    >
+      <div className={`diff-lines ${split ? 'split' : 'unified'}${wrap ? ' wrap' : ''}`}>
+        {split && (
+          <div className="diff-sides">
+            <span>修改前</span>
+            <span>修改后</span>
+          </div>
+        )}
+        {renderSections()}
+      </div>
+    </div>
+  );
 }
 
 function FileChange({
@@ -130,6 +314,8 @@ function FileChange({
   local,
   expanded,
   toggle,
+  split,
+  wrap,
 }: {
   file: ChangedFile;
   directory: string;
@@ -139,10 +325,13 @@ function FileChange({
   local: boolean;
   expanded: boolean;
   toggle: () => void;
+  split: boolean;
+  wrap: boolean;
 }) {
   const [diff, setDiff] = useState<FileDiff | null>(null);
   const [failure, setFailure] = useState('');
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
+  const [moreContext, setMoreContext] = useState(false);
   const [menu, setMenu] = useState<(MenuPosition & { items: MenuItem[] }) | null>(null);
   useEffect(() => {
     if (!expanded) return;
@@ -154,11 +343,13 @@ function FileChange({
       ? api.turnDiff(turnId, file.path)
       : local
         ? api.projectDiff(directory, file.path)
-        : api.gitDiff(directory, scope, file.path);
+        : api.gitDiff(directory, scope, file.path, moreContext);
     request
       .then(
         (value) => {
-          if (current) setDiff(value);
+          if (!current) return;
+          if (moreContext && value.kind === 'too_large') setFailure('额外上下文超出预览限制。');
+          else setDiff(value);
         },
         (error: Error) => {
           if (current) setFailure(error.message);
@@ -170,7 +361,7 @@ function FileChange({
     return () => {
       current = false;
     };
-  }, [directory, scope, file.path, revision, expanded, local, turnId]);
+  }, [directory, scope, file.path, revision, local, turnId, moreContext, expanded]);
   async function open(line?: number) {
     try {
       const info = await window.desktop!.inspectPath(file.absolutePath);
@@ -195,6 +386,7 @@ function FileChange({
       setMenu({
         ...position,
         items: [
+          ...(info.kind === 'missing' ? [] : [{ label: '在本机打开文件', run: () => void open() }]),
           ...info.editors.map((editor) => ({
             label: `在 ${editor.name} 中打开`,
             run: () => {
@@ -220,26 +412,29 @@ function FileChange({
       setFailure(error instanceof Error ? error.message : '无法读取编辑器列表。');
     }
   }
+  const slash = file.path.lastIndexOf('/');
+  const canExpandContext =
+    !local &&
+    !turnId &&
+    (moreContext ||
+      (['M', 'R', 'C'].includes(file.status) &&
+        file.kind === 'file' &&
+        diff?.kind === 'text' &&
+        /^@@ /m.test(diff.patch)));
   return (
-    <section className="change-file" aria-label={file.path}>
+    <section className="change-file" aria-label={file.path} data-path={file.path}>
       <header>
-        <button
-          type="button"
-          className="change-expand"
-          aria-label={`${expanded ? '收起' : '展开'} ${file.path}`}
-          aria-expanded={expanded}
-          onClick={toggle}
-        >
-          <ChevronDown />
-        </button>
         <button
           type="button"
           className="change-path"
           title={file.previousPath ? `${file.previousPath} → ${file.path}` : file.absolutePath}
-          disabled={file.status === 'D'}
-          onClick={() => void open()}
+          aria-expanded={expanded}
+          aria-label={`${expanded ? '收起' : '展开'} ${file.path}`}
+          onClick={toggle}
         >
-          {file.path}
+          <ChevronDown aria-hidden="true" />
+          <strong>{file.path.slice(slash + 1)}</strong>
+          {slash !== -1 && <small>{file.path.slice(0, slash)}</small>}
         </button>
         <span className="change-kind">{statusNames[file.status] ?? file.status}</span>
         {file.added !== null && file.removed !== null && (
@@ -247,6 +442,18 @@ function FileChange({
             <ins>+{file.added}</ins>
             <del>−{file.removed}</del>
           </span>
+        )}
+        {expanded && canExpandContext && (
+          <button
+            type="button"
+            className="change-context"
+            disabled={loading}
+            aria-pressed={moreContext}
+            title="切换每处改动前后最多 20 行的上下文"
+            onClick={() => setMoreContext(!moreContext)}
+          >
+            更多上下文
+          </button>
         )}
         <IconButton
           title={`文件操作 ${file.path}`}
@@ -260,16 +467,10 @@ function FileChange({
       </header>
       {expanded && (
         <div aria-busy={loading}>
-          {file.previousPath && <p className="changes-note">原路径：{file.previousPath}</p>}
-          {file.kind === 'symlink' && <p className="changes-note">符号链接 · 仅展示链接本身</p>}
+          {file.previousPath && <p className="changes-note">原路径 {file.previousPath}</p>}
+          {file.kind === 'symlink' && <p className="changes-note">符号链接 · 显示链接目标路径</p>}
           {file.workingTreeChanged && (
             <p className="changes-note">存在未暂存修改，点击行号仅打开文件。</p>
-          )}
-          {file.status === 'D' && <p className="changes-note">文件已删除，无法在编辑器中打开。</p>}
-          {loading && !diff && (
-            <p className="changes-note" role="status">
-              正在读取改动…
-            </p>
           )}
           {failure && (
             <p className="changes-note error-text" role="alert">
@@ -277,13 +478,18 @@ function FileChange({
               {diff && ' 当前显示上次读取的内容。'}
             </p>
           )}
+          {loading && !diff && (
+            <p className="changes-note" role="status">
+              正在读取改动…
+            </p>
+          )}
           {diff && (
             <DiffContent
               diff={diff}
+              split={split}
+              wrap={wrap}
               locateLines={!file.workingTreeChanged}
-              open={(line) => {
-                if (file.status !== 'D') void open(line);
-              }}
+              open={file.status === 'D' ? undefined : (line) => void open(line)}
             />
           )}
         </div>
@@ -313,9 +519,34 @@ function ChangesView({
   const [failure, setFailure] = useState('');
   const [loading, setLoading] = useState(false);
   const [revision, setRevision] = useState(0);
+  const [selectedPath, selectPath] = useState<string | null>(null);
   const [expanded, setExpanded] = useState<Set<string> | null>(null);
+  const [showIndex, setShowIndex] = useState(false);
+  const [jump, setJump] = useState<string | null>(null);
+  const [layout, setLayout] = useState<DiffLayout>('auto');
   const [wrap, setWrap] = useState(true);
+  const [wide, setWide] = useState(false);
+  const scroll = useRef<HTMLDivElement>(null);
   const generation = useRef(0);
+  useLayoutEffect(() => {
+    const node = scroll.current!;
+    const observer = new ResizeObserver(() => setWide(node.clientWidth >= 620));
+    observer.observe(node);
+    return () => observer.disconnect();
+  }, []);
+  useLayoutEffect(() => {
+    if (scroll.current) scroll.current.scrollTop = 0;
+  }, [scope]);
+  useLayoutEffect(() => {
+    if (jump === null) return;
+    const pane = scroll.current!;
+    const section = pane.querySelector<HTMLElement>(`[data-path="${CSS.escape(jump)}"]`);
+    if (section) {
+      section.querySelector<HTMLButtonElement>('.change-path')?.focus({ preventScroll: true });
+      pane.scrollTop += section.getBoundingClientRect().top - pane.getBoundingClientRect().top;
+    }
+    setJump(null);
+  }, [jump]);
   const refresh = useCallback(
     async (reset = false) => {
       const request = ++generation.current;
@@ -327,14 +558,18 @@ function ChangesView({
           : await window.desktop!.projectChanges(directory, scope, reset);
         if (request !== generation.current) return;
         setLoaded({ scope, changes: result });
-        setExpanded(
-          (previous) =>
-            new Set(
-              previous === null
-                ? result.files.slice(0, 1).map((file) => file.path)
-                : result.files.filter((file) => previous.has(file.path)).map((file) => file.path),
-            ),
+        selectPath((previous) =>
+          result.files.some((file) => file.path === previous)
+            ? previous
+            : (result.files[0]?.path ?? null),
         );
+        setExpanded((previous) => {
+          if (!result.files.length) return null;
+          if (!previous) return new Set([result.files[0].path]);
+          return new Set(
+            result.files.filter((file) => previous.has(file.path)).map((file) => file.path),
+          );
+        });
         setRevision((value) => value + 1);
       } catch (error) {
         if (request === generation.current)
@@ -374,7 +609,29 @@ function ChangesView({
     wasRunning.current = running;
   }, [running, refresh]);
   const local = !!data?.baselineAt;
-  const totals = data?.files.reduce(
+  const files = data?.files ?? [];
+  const selectedIndex = files.findIndex((file) => file.path === selectedPath);
+  // Keep the number of mounted sections bounded on repositories with many changed paths.
+  const singleFile = files.length > 100;
+  const visibleFiles = singleFile ? files.slice(selectedIndex, selectedIndex + 1) : files;
+  const groups = useMemo(() => {
+    const directories = new Map<string, ChangedFile[]>();
+    if (showIndex)
+      for (const file of files) {
+        const slash = file.path.lastIndexOf('/');
+        const dir = slash < 0 ? '' : file.path.slice(0, slash);
+        const group = directories.get(dir);
+        if (group) group.push(file);
+        else directories.set(dir, [file]);
+      }
+    return [...directories].sort(([first], [second]) => first.localeCompare(second));
+  }, [files, showIndex]);
+  function visit(path: string) {
+    selectPath(path);
+    setExpanded((current) => new Set(current).add(path));
+    setJump(path);
+  }
+  const totals = files.reduce(
     (sum, file) => ({
       added: sum.added + (file.added ?? 0),
       removed: sum.removed + (file.removed ?? 0),
@@ -392,17 +649,19 @@ function ChangesView({
                 aria-label="改动范围"
                 value={scope}
                 onChange={(event) => {
+                  selectPath(null);
                   setExpanded(null);
                   changeScope(event.target.value as GitScope);
                 }}
               >
+                <option value="uncommitted">未提交</option>
                 <option value="unstaged">未暂存 ({counts.unstaged})</option>
                 <option value="staged">已暂存 ({counts.staged})</option>
               </select>
             ) : (
               <span>{turn ? '本轮' : '项目累计'}</span>
             )}
-            {totals && (
+            {data && (
               <span className="tool-diff" aria-label="增删行数">
                 <ins>+{totals.added}</ins>
                 <del>−{totals.removed}</del>
@@ -410,13 +669,28 @@ function ChangesView({
             )}
           </div>
         )}
-        {loaded?.changes.branch && (
-          <span className="changes-branch" title={loaded.changes.branch}>
-            <GitBranch />
-            <span>{loaded.changes.branch}</span>
-          </span>
-        )}
+        <button
+          type="button"
+          className="changes-index-toggle"
+          aria-label="改动文件列表"
+          aria-expanded={showIndex && files.length > 0}
+          disabled={!files.length}
+          onClick={() => setShowIndex(!showIndex)}
+        >
+          <FolderTree aria-hidden="true" />
+          {files.length} 个文件
+        </button>
         <span className="toolbar-space" />
+        <select
+          className="changes-layout"
+          aria-label="对比视图"
+          value={layout}
+          onChange={(event) => setLayout(event.target.value as DiffLayout)}
+        >
+          <option value="auto">自动布局</option>
+          <option value="unified">行内对比</option>
+          <option value="split">并排对比</option>
+        </select>
         <button
           type="button"
           className={`icon-button${wrap ? ' active' : ''}`}
@@ -432,19 +706,14 @@ function ChangesView({
           </IconButton>
         )}
       </div>
-      <p className="changes-root" title={root}>
-        {root}
-      </p>
-      {(local || !!totals?.uncounted) && (
+      {local && (
         <div className="changes-origin">
-          {local && (
-            <span>
-              {turn && '本轮运行期间的项目目录变化 · '}
-              {turn?.joined ? '从接入时开始统计 ' : '起点 '}
-              {new Date(data.baselineAt!).toLocaleString('zh-CN', { hour12: false })}
-            </span>
-          )}
-          {local && !turn && (
+          <span>
+            {turn && '本轮运行期间的项目目录变化 · '}
+            {turn?.joined ? '从接入时开始统计 ' : '起点 '}
+            {new Date(data.baselineAt!).toLocaleString('zh-CN', { hour12: false })}
+          </span>
+          {!turn && (
             <button
               type="button"
               className="button secondary"
@@ -456,53 +725,130 @@ function ChangesView({
               重设起点
             </button>
           )}
-          {!!totals?.uncounted && <span>{totals.uncounted} 个文件未计行数</span>}
         </div>
       )}
-      <div className={`changes-files${wrap ? ' wrap' : ''}`} role="region" aria-label="改动文件">
-        {data?.rawContent && (
-          <p className="changes-note">按原始内容比较，未运行 Git 内容过滤器。</p>
+      {singleFile && (
+        <div className="changes-page">
+          <span>
+            逐文件审阅 · {selectedIndex + 1} / {files.length}
+          </span>
+          <IconButton
+            title="上一个文件"
+            disabled={selectedIndex <= 0}
+            onClick={() => visit(files[selectedIndex - 1].path)}
+          >
+            <ChevronLeft />
+          </IconButton>
+          <IconButton
+            title="下一个文件"
+            disabled={selectedIndex >= files.length - 1}
+            onClick={() => visit(files[selectedIndex + 1].path)}
+          >
+            <ChevronRight />
+          </IconButton>
+        </div>
+      )}
+      <div className="changes-body">
+        {showIndex && files.length > 0 && (
+          <nav className="changes-index" aria-label="改动文件目录">
+            {groups.map(([dir, items]) => (
+              <div key={dir} className={dir ? 'change-directory' : undefined}>
+                {dir && (
+                  <strong title={dir}>
+                    <Folder aria-hidden="true" /> <span>{dir}</span>
+                  </strong>
+                )}
+                {items.map((item) => (
+                  <button
+                    key={item.path}
+                    type="button"
+                    title={item.path}
+                    aria-label={`定位 ${item.path}`}
+                    aria-current={selectedPath === item.path ? 'location' : undefined}
+                    onClick={() => visit(item.path)}
+                  >
+                    <span>{item.path.slice(dir ? dir.length + 1 : 0)}</span>
+                    <small aria-label={statusNames[item.status]}>{item.status}</small>
+                  </button>
+                ))}
+              </div>
+            ))}
+          </nav>
         )}
-        {(failure || data?.notice) && (
-          <p className="changes-note error-text" role="alert">
-            {failure || data?.notice}
-            {data && ' 当前显示上次读取的内容。'}
-          </p>
-        )}
-        {loading && !data && (
-          <p className="changes-note" role="status">
-            正在读取项目改动…
-          </p>
-        )}
-        {data && !data.notice && !data.files.length && (
-          <p className="changes-note">
-            {local
-              ? '与起点相比没有改动。'
-              : scope === 'unstaged'
-                ? '没有未暂存的改动。'
-                : '没有已暂存的改动。'}
-          </p>
-        )}
-        {data?.files.map((file) => (
-          <FileChange
-            key={file.path}
-            file={file}
-            directory={local ? data.root : directory}
-            turnId={turn?.id}
-            local={local}
-            scope={scope}
-            revision={revision}
-            expanded={expanded?.has(file.path) ?? false}
-            toggle={() =>
-              setExpanded((current) => {
-                const next = new Set(current);
-                next.has(file.path) ? next.delete(file.path) : next.add(file.path);
-                return next;
-              })
-            }
-          />
-        ))}
+        <div
+          ref={scroll}
+          className="changes-files"
+          role="region"
+          aria-label="改动文件"
+          onFocusCapture={(event) => {
+            const section = event.target.closest<HTMLElement>('.change-file');
+            if (section?.dataset.path) selectPath(section.dataset.path);
+          }}
+        >
+          {data?.rawContent && (
+            <p className="changes-note">按原始内容比较，未运行 Git 内容过滤器。</p>
+          )}
+          {(failure || data?.notice) && (
+            <p className="changes-note error-text" role="alert">
+              {failure || data?.notice}
+              {data && ' 当前显示上次读取的内容。'}
+            </p>
+          )}
+          {loading && !data && (
+            <p className="changes-note" role="status">
+              正在读取项目改动…
+            </p>
+          )}
+          {data && !data.notice && !files.length && (
+            <p className="changes-note">
+              {local
+                ? '与起点相比没有改动。'
+                : scope === 'unstaged'
+                  ? '没有未暂存的改动。'
+                  : scope === 'staged'
+                    ? '没有已暂存的改动。'
+                    : '没有未提交的改动。'}
+            </p>
+          )}
+          {visibleFiles.map((file) => (
+            <FileChange
+              key={`${scope}:${file.path}`}
+              file={file}
+              directory={local ? root : directory}
+              turnId={turn?.id}
+              local={local}
+              scope={scope}
+              revision={revision}
+              expanded={expanded?.has(file.path) ?? false}
+              toggle={() => {
+                selectPath(file.path);
+                setExpanded((previous) => {
+                  const next = new Set(previous);
+                  if (next.has(file.path)) next.delete(file.path);
+                  else next.add(file.path);
+                  return next;
+                });
+              }}
+              split={
+                layout === 'split' || (layout === 'auto' && wide && !!file.added && !!file.removed)
+              }
+              wrap={wrap}
+            />
+          ))}
+        </div>
       </div>
+      <footer className="changes-location">
+        {loaded?.changes.branch && (
+          <span className="changes-branch" title={loaded.changes.branch}>
+            <GitBranch />
+            <span>{loaded.changes.branch}</span>
+          </span>
+        )}
+        <span className="changes-root" title={root}>
+          {root}
+        </span>
+        {!!totals.uncounted && <span>{totals.uncounted} 个文件未计行数</span>}
+      </footer>
     </>
   );
 }
@@ -520,7 +866,8 @@ export default function ChangesPanel({
   running: boolean;
   close: () => void;
 }) {
-  const [scope, setScope] = useState<GitScope>('unstaged');
+  const [scope, setScope] = useState<GitScope>('uncommitted');
+  const [enlarged, setEnlarged] = useState(false);
   const [compact, setCompact] = useState(() => workspace.clientWidth < 900);
   useLayoutEffect(() => {
     const observer = new ResizeObserver(() => setCompact(workspace.clientWidth < 900));
@@ -562,9 +909,16 @@ export default function ChangesPanel({
       <div className="changes-dialog">{body}</div>
     </Modal>
   ) : (
-    <aside className="changes-panel" aria-label={title}>
+    <aside className={`changes-panel${enlarged ? ' enlarged' : ''}`} aria-label={title}>
       <header className="changes-heading">
         <strong>{title}</strong>
+        <span className="toolbar-space" />
+        <IconButton
+          title={enlarged ? '恢复面板宽度' : '加宽改动面板'}
+          onClick={() => setEnlarged(!enlarged)}
+        >
+          {enlarged ? <Minimize2 /> : <Maximize2 />}
+        </IconButton>
         <IconButton title="关闭改动面板" onClick={close}>
           <X />
         </IconButton>

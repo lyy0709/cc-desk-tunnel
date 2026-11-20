@@ -473,6 +473,7 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
   const config = new Config({ cli: join(root, 'cli'), desktop: join(root, 'desktop') });
   const remote = {
     compaction: { enabled: false, afterMinutes: 50, minTokens: 100_000 },
+    tools: { subagents: false },
     cli: { autoCompactEnabled: null, autoCompactWindow: 250_000, fallbackModel: ['sonnet'] },
     web: { enabled: true, url: 'https://work.example.com/desk/' },
   };
@@ -488,6 +489,7 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
   assert.equal(shown(named('connection.ready')), '45 秒（默认）');
   assert.equal(shown(named('compaction.enabled')), '关闭');
   assert.equal(shown(named('compaction.minTokens')), '100K tokens');
+  assert.equal(shown(named('tools.subagents')), '关闭');
   assert.equal(shown(named('web.enabled')), '开启');
   assert.equal(shown(named('cli.autoCompactEnabled')), '默认');
   // A value set by hand that is not among the choices is still one of them.
@@ -503,6 +505,8 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
   assert.equal(parse(named('cli.autoCompactEnabled'), '关闭'), false);
   assert.equal(parse(named('cli.autoCompactEnabled'), 'default'), null);
   assert.equal(parse(named('compaction.afterMinutes'), '45'), 45);
+  assert.equal(parse(named('tools.subagents'), '开启'), true);
+  assert.throws(() => parse(named('tools.subagents'), 'default'), /on 或 off/);
   assert.equal(parse(named('connection.connect'), '30'), 30);
   assert.deepEqual(parse(named('cli.fallbackModel'), 'sonnet， haiku'), ['sonnet', 'haiku']);
   assert.throws(() => parse(named('compaction.enabled'), 'default'), /on 或 off/);
@@ -517,10 +521,12 @@ test('ccdt’s settings: its own waits, the service’s and Claude Code’s with
   await save(named('connection.ready'), 90, { config, service });
   assert.deepEqual(JSON.parse(readFileSync(config.path, 'utf8')).waits, { ready: 90 });
   await save(named('compaction.afterMinutes'), 45, { config, service });
+  await save(named('tools.subagents'), true, { config, service });
   await save(named('web.enabled'), false, { config, service });
   await save(named('cli.autoCompactEnabled'), null, { config, service });
   assert.deepEqual(requests, [
     { type: 'compaction.update', values: { afterMinutes: 45 } },
+    { type: 'tools.update', values: { subagents: true } },
     { type: 'web.settings.update', values: { enabled: false } },
     { type: 'settings.update', values: { autoCompactEnabled: null } },
   ]);

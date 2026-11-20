@@ -10,7 +10,7 @@ import type { SDKMessage, SDKResultMessage } from '@anthropic-ai/claude-agent-sd
 import type { EventPayload } from '@cc-desk-tunnel/protocol';
 import { messageText } from '@cc-desk-tunnel/protocol';
 import { NativeInput } from '../src/native-input.ts';
-import { runtimeEnvironment } from '../src/native-account.ts';
+import { runtimeEnvironment } from '../src/runtime-environment.ts';
 
 test(
   'native runs declare only scheduled tasks, while user additions and compact keep their original inputs',

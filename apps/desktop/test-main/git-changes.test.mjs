@@ -47,8 +47,52 @@ test('staged and unstaged changes use different bases, including a first commit'
   assert.match((await gitDiff(root, 'staged', 'code.txt')).patch, /\+first/);
   assert.match((await gitDiff(root, 'unstaged', 'code.txt')).patch, /-first\n\+second/);
   assert.match((await gitDiff(root, 'unstaged', 'new.txt')).patch, /\+new/);
+  const uncommitted = await gitChanges(root, 'uncommitted');
+  assert.deepEqual(
+    uncommitted.files.map(({ path, added, removed }) => [path, added, removed]),
+    [
+      ['code.txt', 1, 0],
+      ['new.txt', 1, 0],
+    ],
+  );
+  assert.match((await gitDiff(root, 'uncommitted', 'code.txt')).patch, /\n\+second\n/);
+  assert.doesNotMatch((await gitDiff(root, 'uncommitted', 'code.txt')).patch, /first/);
   assert.deepEqual(readFileSync(join(root, '.git/index')), index);
   assert.equal(readFileSync(join(root, 'code.txt'), 'utf8'), 'second\n');
+});
+
+test('uncommitted compares final worktree content once and can request more context', async (t) => {
+  const { root, git, write, commit } = repository(t);
+  const source = Array.from({ length: 45 }, (_, i) => `const key${i} = ${i};\n`).join('');
+  write('code.txt', source);
+  write('restored.txt', 'base\n');
+  write('recreated.txt', 'old\n');
+  write('identical.txt', 'same\n');
+  commit();
+  write('code.txt', source.replace('key20 = 20', 'key20 = 100'));
+  write('restored.txt', 'staging only\n');
+  git('add', 'code.txt', 'restored.txt');
+  write('code.txt', source.replace('key20 = 20', 'key20 = 200'));
+  write('restored.txt', 'base\n');
+  git('rm', '--cached', 'recreated.txt', 'identical.txt');
+  write('recreated.txt', 'new\n');
+  const index = readFileSync(join(root, '.git/index'));
+
+  const { files } = await gitChanges(root, 'uncommitted');
+  assert.deepEqual(
+    files.map(({ path, status, added, removed }) => [path, status, added, removed]),
+    [
+      ['code.txt', 'M', 1, 1],
+      ['recreated.txt', 'M', 1, 1],
+    ],
+  );
+  const compact = (await gitDiff(root, 'uncommitted', 'code.txt')).patch;
+  const expanded = (await gitDiff(root, 'uncommitted', 'code.txt', true)).patch;
+  assert.match(compact, /-const key20 = 20;\n\+const key20 = 200;/);
+  assert.doesNotMatch(compact, /key5 = 5;/);
+  assert.match(expanded, /^ const key5 = 5;$/m);
+  assert.match((await gitDiff(root, 'uncommitted', 'recreated.txt')).patch, /-old\n\+new/);
+  assert.deepEqual(readFileSync(join(root, '.git/index')), index);
 });
 
 test('repository-wide discovery handles renames, deletions and literal special paths', async (t) => {
@@ -71,6 +115,12 @@ test('repository-wide discovery handles renames, deletions and literal special p
   const unstaged = await gitChanges(root, 'unstaged');
   assert.equal(unstaged.files.find((file) => file.path === 'delete.txt').status, 'D');
   assert.match((await gitDiff(root, 'unstaged', name)).patch, /-before\n\+after/);
+  const uncommitted = await gitChanges(root, 'uncommitted');
+  assert.equal(
+    uncommitted.files.find((file) => file.path === 'renamed.txt').previousPath,
+    'old.txt',
+  );
+  assert.equal(uncommitted.files.find((file) => file.path === name).added, 1);
   await assert.rejects(gitDiff(root, 'unstaged', '../outside'), /已变化/);
   await assert.rejects(gitChanges(root, 'other'), /未知/);
 });

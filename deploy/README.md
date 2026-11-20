@@ -1,6 +1,6 @@
 # Linux Docker 部署
 
-Ubuntu amd64 优先；arm64 为实验性支持：镜像构建、部署自测和服务端测试在 arm64 上自动运行通过，还没有人在 arm64 服务器上用真实账号跑过会话。官方 Claude Code、Agent SDK、PTY 同容器；不改 Claude 本体、不加入执行 MCP。容器有可写层和较完整工具环境，不是只读沙箱；以 uid 1000 普通用户运行，无宿主 Docker socket、特权模式或宿主项目挂载。
+Ubuntu amd64 优先；arm64 为实验性支持：镜像构建、部署自测和服务端测试在 arm64 上自动运行通过，还没有人在 arm64 服务器上用真实账号跑过会话。代理与官方 Claude Code 分别运行在 `proxy` 和 `runtime` 两个容器里；不改 Claude 本体。宿主机需要内核 6.2 或更新（Landlock ABI 3）和 Docker Compose 2.23.2 或更新。容器有可写层和较完整工具环境，不是只读沙箱；代理以 uid 1000 普通用户运行，运行容器的启动进程把每个 CLI 降为 uid 1000 并用 Landlock 限制它能访问的文件；无宿主 Docker socket、特权模式或宿主项目挂载。
 
 ## 准备
 
@@ -114,22 +114,32 @@ nginx 的配置步骤、检查方法和常见问题见[用 nginx 反代](nginx.m
 
 ## 模型与可写空间
 
-在服务器数据目录的 `config/provider.json` 中配置自己的模型凭据，例如 `{"env":{"ANTHROPIC_API_KEY":"<your-console-key>"}}`。受支持云提供方使用相应的官方环境变量。文件应仅对部署账户可读；不要在桌面、聊天或 issue 中填写凭据。
+在客户端「设置 → 账号与额度」登录 Claude 账号，或在 `ccdt` 里运行 `ccdt auth login`；两者都运行官方 `claude auth login`，图形客户端与 ccdt 共用这一个登录。要改用 API key 或受支持的云提供方，写进服务器数据目录的 `config/provider.json`，例如 `{"env":{"ANTHROPIC_API_KEY":"<your-console-key>"}}`，对两者都生效；其他设置不会传入，账号页会列出它们的名字。文件应仅对部署账户可读；不要在桌面、聊天或 issue 中填写凭据。
 
-从 0.3.x 升级时，0.4 管理脚本会在替换容器前记录旧环境。如果升级前要备份或停机，先用 0.4 管理脚本对仍在线的原部署运行 `manage.sh hardware`，再运行 `manage.sh backup`。旧版的备份命令会停启容器，Docker 可能在此时重新分配动态 MAC。同步升级 Compose 文件、proxy/runtime 镜像及客户端后，两容器都应报告 healthy。新环境保留原有 home，只导入项目历史，命令授权需在设备上重新给予。回退使用旧镜像、旧 Compose 和升级前备份。
+从 0.3.x 升级：
 
-**保留服务端硬件环境。** 在同一个 Docker Engine、同一份部署配置上用 `manage.sh upgrade` 升级或指定旧版包回退。首次升级请保持 0.3.x 服务在线，让 Docker 能返回原容器的主机名及各项目网络的实际 MAC。Docker 在容器停止或删除后可能已经清空动态 MAC，此时管理脚本会停止升级。已记录的部署可以从停止状态重建。需要支持按网络设置 MAC 的 Docker Compose 2.23.2 或更新版本。
+1. 确认宿主机内核为 6.2 或更新（`uname -r`），Docker Compose 为 2.23.2 或更新（`docker compose version`）。Ubuntu 22.04 的默认内核是 5.15，可以安装 HWE 内核；Ubuntu 24.04 默认满足。需要升级内核时先升级并重启，0.3.x 在此期间照常运行。管理脚本在替换容器前检查这两项，不满足时停止，原服务不受影响。
+2. 保持 0.3.x 服务在线。它自带的 `cc-desk-tunnel upgrade` 读取上游仓库的发布页，取不到这一版：从本仓库的发布页下载 `cc-desk-tunnel-server-0.4.0.tar.gz` 和 `SHA256SUMS`，用 `sha256sum -c --ignore-missing SHA256SUMS` 校验。
+3. 执行 `sudo cc-desk-tunnel upgrade --from cc-desk-tunnel-server-0.4.0.tar.gz`。
+4. 升级客户端和 `ccdt`。原来的 Claude 登录、用户设置和全局说明继续使用。
+
+0.4 管理脚本会在替换容器前记录旧环境。如果升级前要备份或停机，先完成内核升级，再用 0.4 管理脚本对仍在线的原部署运行 `manage.sh hardware`，然后运行 `manage.sh backup`。旧版的备份命令会停启容器，Docker 可能在此时重新分配动态 MAC。同步升级 Compose 文件、proxy/runtime 镜像及客户端后，两容器都应报告 healthy。新环境保留原有 home，只导入项目历史，命令授权需在设备上重新给予。回退使用旧镜像、旧 Compose 和升级前备份。
+
+**保留服务端硬件环境。** 在同一个 Docker Engine、同一份部署配置上用 `manage.sh upgrade` 升级或指定旧版包回退。首次升级请保持 0.3.x 服务在线，让 Docker 能返回原容器的主机名及各项目网络的实际 MAC。Docker 在容器停止或删除后可能已经清空动态 MAC，此时管理脚本会停止升级，并提示先用 `docker start` 启动原容器。已记录的部署可以从停止状态重建。需要支持按网络设置 MAC 的 Docker Compose 2.23.2 或更新版本。
+
+宿主机内核升级或调整配置后，总内存和 CPU 特性列表会与记录不同，管理脚本只作提示，不阻止启动。Docker Engine、架构或 CPU 数量变化时会停止。确认要在当前环境继续运行时，执行 `manage.sh hardware --reset` 重新记录：部署有容器时按它当前的主机名、MAC 和配额重新采集，容器需在运行；原容器已被删除时，下次启动后记录 Docker 新分配的值。
 
 管理脚本将真实架构、CPU 能力和配额、亲和性、内存、交换区、共享内存及网络配置保存在宿主机部署配置旁的 `.hardware/` 目录。0.4 的运行容器与代理共享网络，0.3 的代理使用同一组参数。启动后会在运行容器内核对主机名和 MAC。请保留部署配置及这个目录。Docker 重建会分配新的容器 ID。部署配置与客户端的设备编号分别保存在各自机器上。迁移到另一台服务器时使用备份还原流程和新服务器自己的硬件环境。
 
 持久数据位于指定 `--data`：
 
-- `home/`：原生 Claude 账号 / 配置 / 上下文、用户安装工具及缓存。
+- `home/`：云端 Claude Code 的登录、用户设置和全局说明（图形客户端与 ccdt 共用），用户安装工具及缓存。
+- `app-home/`：全部会话的原生记录。
 - `state/`：代理 SQLite / WAL、原生工作目录、每次运行的项目工具 socket。
-- `workspace/`：Linux 辅助工作空间。
+- `workspace/`：代理容器的工作目录，在服务端执行的会话看不到它。
 - `config/`、`tls/`：服务秘密、模型配置和两套 TLS 身份。
 
-预装 Git / SSH / rsync、Node / npm、Python / pip / venv、GCC / make、curl / wget、jq / rg、文本编辑器、压缩工具、SQLite、网络与进程工具。普通用户可往 `home` / `workspace` / `/tmp` 写入、建 venv 或用户级安装 npm 包；不能直接 apt 安装系统软件。需要更多系统组件时扩展 Dockerfile。容器 root 文件层也并非全盘只读，但升级重建会丢弃其中临时修改；重要工具和记忆须存 `/data`。设备项目的文件与命令由所在设备经 MCP 执行。
+预装 Git / SSH / rsync、Node / npm、Python / pip / venv、GCC / make、curl / wget、jq / rg、文本编辑器、压缩工具、SQLite、网络与进程工具。在服务端执行的会话运行在运行容器里，可写的位置是会话自己的工作目录、它的 home 和 `/tmp`；工作目录和 home 里不能创建符号链接，所以 `npm install` 和建 venv 要放在 `/tmp` 下进行。不能直接 apt 安装系统软件。需要更多系统组件时扩展 Dockerfile。容器 root 文件层也并非全盘只读，但升级重建会丢弃其中临时修改；重要工具和记忆须存 `/data`。设备项目的文件与命令由所在设备经 MCP 执行。
 
 ## 运维
 

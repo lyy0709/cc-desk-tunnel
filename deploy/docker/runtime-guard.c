@@ -52,6 +52,17 @@ int main(int argc, char **argv) {
   const char *system[] = {"/bin","/usr","/lib","/lib64","/etc","/opt/runtime","/app","/proc/self",
     "/proc/stat","/proc/cpuinfo","/proc/meminfo","/proc/sys/kernel/osrelease",NULL};
   for (int i=0; system[i]; ++i) allow(rules, system[i], read_access, 1);
+  const char *base = strrchr(argv[0], '/');
+  if (!strcmp(base ? base + 1 : argv[0], "ccdt-project-mcp")) {
+    // Stack a read-only policy before loading Node or any MCP dependency. Keep only stdio and the
+    // session socket (access to that socket is controlled by the worker-assigned Unix group).
+    allow(rules, "/dev/null", LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_WRITE_FILE, 0);
+    if (syscall(SYS_landlock_restrict_self, rules, 0)) fail("project MCP isolation");
+    close(rules);
+    char *const env[] = {"PATH=/opt/runtime/node/bin:/usr/bin:/bin", "LANG=C.UTF-8", NULL};
+    execve("/opt/runtime/node/bin/node", argv, env);
+    fail("project MCP executable");
+  }
   allow(rules, argv[1], read_access, 0);
   allow(rules, "/tmp", all, 0);
   allow(rules, "/dev", read_access | LANDLOCK_ACCESS_FS_WRITE_FILE, 0);

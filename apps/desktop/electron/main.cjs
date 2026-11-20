@@ -352,7 +352,9 @@ handle('changes:release', (_event, id) => {
   record.pinned = false;
   if (record.finished) turnReviews.delete(id);
 });
-handle('git:diff', (_event, directory, scope, file) => gitDiff(directory, scope, file));
+handle('git:diff', (_event, directory, scope, file, moreContext) =>
+  gitDiff(directory, scope, file, moreContext),
+);
 handle('clipboard:write', (_event, text) => {
   if (typeof text !== 'string') throw new Error('Expected clipboard text');
   clipboard.writeText(text);

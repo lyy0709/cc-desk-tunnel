@@ -48,6 +48,14 @@ test('explicit native TLS mode is required', () => {
     /RETENTION/,
   );
 });
+test('the provider file is named to the service, which reads only the names in it', () => {
+  const { options } = environmentConfig(
+    { ...native, CLAUDE_SETTINGS_PATH: '/private/provider.json' },
+    '/state',
+  );
+  assert.equal(options.claude?.providerPath, '/private/provider.json');
+  assert.equal(environmentConfig(native, '/state').options.claude?.providerPath, undefined);
+});
 test('service settings are removed from the environment inherited by the native CLI, leaving everything else', () => {
   const env = {
     ...native,

@@ -19,6 +19,7 @@ import {
   Smartphone,
   SquareTerminal,
   UserRound,
+  Wrench,
 } from 'lucide-react';
 import type { ConnectedDevice, ProxyClient } from './client.ts';
 import WebAccessSettings from './WebAccessSettings.tsx';
@@ -34,6 +35,7 @@ import { barText, inBar, sampleSession, sessionFields } from './sessionStats.ts'
 import { GithubMark, openProject, project } from './project.tsx';
 import GlobalInstructions from './GlobalInstructions.tsx';
 import IdleCompactionSettings from './IdleCompactionSettings.tsx';
+import SessionToolSettings from './SessionToolSettings.tsx';
 import SettingsPanel from './SettingsPanel.tsx';
 import { useShared } from './shared.ts';
 import type { Account } from './shared.ts';
@@ -49,6 +51,7 @@ export type Section =
   | 'notifications'
   | 'shortcuts'
   | 'context'
+  | 'tools'
   | 'shell'
   | 'web'
   | 'account'
@@ -116,6 +119,13 @@ export const sections: {
     group: '服务端',
     icon: SquareTerminal,
     words: 'PowerShell Git Bash 命令 脚本 终端 偏好',
+  },
+  {
+    id: 'tools',
+    name: '项目工具',
+    group: '服务端',
+    icon: Wrench,
+    words: '子代理 subagent Agent 委派 内置工具 网页搜索 网页读取 待办',
   },
   {
     id: 'web',
@@ -976,9 +986,10 @@ export default function SettingsPage({
         (item.id !== 'connection' || window.desktop) &&
         (item.id !== 'install' ||
           (browser && /Android.*Mobile|iPhone|iPod/i.test(navigator.userAgent))) &&
-        (!browser || !['context', 'claude', 'instructions'].includes(item.id)) &&
+        (!browser || !['context', 'tools', 'claude', 'instructions'].includes(item.id)) &&
         (item.id !== 'account' || native || !browser) &&
         (item.id !== 'context' || native) &&
+        (item.id !== 'tools' || native) &&
         (item.id !== 'shell' || (native && !browser && !!here && platformOf(here) === 'win32')) &&
         (item.id !== 'web' || native || browser) &&
         `${item.name} ${item.words}`.toLowerCase().includes(term),
@@ -1054,6 +1065,10 @@ export default function SettingsPage({
         ) : section === 'context' ? (
           <Page title="上下文与缓存" intro={everyDevice}>
             <IdleCompactionSettings client={client} />
+          </Page>
+        ) : section === 'tools' ? (
+          <Page title="项目工具" intro={everyDevice}>
+            <SessionToolSettings client={client} />
           </Page>
         ) : section === 'shell' && here ? (
           <Page title="Shell" intro={thisDevice}>

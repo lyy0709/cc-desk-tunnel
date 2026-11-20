@@ -18,7 +18,7 @@ Linux 上的代理服务：认证客户端、管理会话、驱动官方 Claude 
 
 ## 原生连接
 
-服务器通过 `config/provider.json` 配置 API key 或受支持的云提供方。双容器部署、目录授权、首次继续旧会话及凭据迁移见[原生运行时](../../docs/native-runtime.md)。服务端和客户端需使用相同协议版本。
+服务器上的 Claude Code 只有一个登录，图形客户端的运行与 ccdt 的终端共用：桌面账号页由服务端运行官方 `claude auth login`，交回授权页给出的代码（`src/native-login.ts`），ccdt 在终端里运行同一条命令；也可以在 `config/provider.json` 配置 API key 或受支持的云提供方。双容器部署、目录授权、首次继续旧会话及凭据迁移见[原生运行时](../../docs/native-runtime.md)。服务端和客户端需使用相同协议版本。
 
 - `project-tools.ts` 为每次运行分配工具端点。GUI SDK 与原生 CLI 通过 `project-mcp.ts` 转接工具请求。
 - `runtime-worker.ts` 在独立容器接收运行请求，分配进程身份并启动官方 CLI。`runtime-relay.mjs` 负责 SDK 字节流、PTY 输入输出、尺寸和进程结束通知。
@@ -27,7 +27,7 @@ Linux 上的代理服务：认证客户端、管理会话、驱动官方 Claude 
 - 工具进度来自原生 `tool_progress`；Bash 输出按原生工具结果展示，不承诺每行 stdout 实时接出。
 - 原生 session ID / resume / abort 均由官方组件管理。改名 / 删除已有原生会话先调用官方 renameSession / deleteSession，再更新代理索引；原生更新失败保留代理记录，运行中禁止管理。
 - 默认请求原生 auto，可选 default / plan / acceptEdits；回传 requested / actual 模式，不自建 AI 审批。原生 canUseTool 仍转发需要用户的请求。
-- `src/native-controls.ts` 从官方 SDK 的结构化用量接口和公开的 `rate_limit_event` 字段读取模型服务额度，仅用这些读数决定自动任务是否等待。个人订阅面板只读展示当前登录对应的原版终端状态栏数据，按模型的完整明细可在官方用量页或终端 `/usage` 查看。SDK 与每个个人账号和组织分别统计其周期调用。
+- `src/native-controls.ts` 从官方 SDK 的结构化用量接口和公开的 `rate_limit_event` 字段读取订阅额度，并用这些读数决定自动任务是否等待。ccdt 终端状态栏里的五小时和每周读数记入同一组额度周期（`usage.ts`），图形客户端与终端的调用合并统计；按模型的完整明细可在官方用量页或终端 `/usage` 查看。
 - 会话 model / effort 偏好在下轮传给 SDK，实际值仅按原生报告展示。主动压缩发送原生 `/compact`，转接真实 compact boundary，不自行总结上下文。命令目录带说明、参数提示与别名传给客户端，去掉 CLI 标为只用于其终端的命令，并随 `commands_changed` 更新；`/context`、`/usage` 这类本地命令的输出（`local_command_output`）作为一条回复显示。
 - 原生持久化开启；恢复前官方 getSessionInfo 验证上下文存在，不存在则明确失败，不用 GUI 历史重建。每轮回传原生保存状态。
 - 不改 CLI 或注入代码；已安装可执行文件与官方同版本 Linux 包 SHA256 一致，实际进程 / 环境核对见[原生运行](../../docs/native-runtime.md)。

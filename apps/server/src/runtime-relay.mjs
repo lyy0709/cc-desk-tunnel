@@ -3,7 +3,7 @@
 import { createConnection } from 'node:net';
 import { createInterface } from 'node:readline';
 import { once } from 'node:events';
-import { runtimeEnvironment } from './native-account.ts';
+import { runtimeEnvironment } from './runtime-environment.ts';
 
 const socket = createConnection(process.env.CCDT_RUNTIME_SOCKET ?? '/data/cc-runner/launch.sock');
 const send = (frame) => socket.write(JSON.stringify(frame) + '\n');

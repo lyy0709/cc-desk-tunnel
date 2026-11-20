@@ -8,7 +8,7 @@
 
 ## 连接与消息
 
-- `account.login` 的 `method` 可选 `browser`（省略时默认）或 `setup-token`，分别启动官方普通登录或令牌生成；两者共用 `account.code/cancel`，`account.state.login.method` 标出进行中的方式。`account.token` 直接保存已有的非空单行 token。生成与粘贴均写官方用户设置；`account.logout` 清除两种登录，状态不回传令牌。生成后另以 `account.token.created` 只向发起连接发送一次 `{token,saved,error?}`，不缓存或广播；保存失败也提供该结果及具体错误。账号变更沿用运行 / 终端互斥，只允许桌面连接；浏览器工作台无此权限。
+- 服务端只有一个 Claude Code 登录，图形客户端的运行和 ccdt 的终端共用。`account.login` 由服务端运行官方 `claude auth login`，`account.state.login.url` 给出它打印的授权链接；客户端以 `account.code` 把授权页显示的代码原样交回同一命令，`account.cancel` 中止。代码的兑换和凭据保存都由 CLI 完成，状态不回传凭据。`account.logout` 运行官方 `claude auth logout`，并移除早期版本保存在用户设置里的 setup token。`account.terminal` 在独立终端里运行同一条登录命令，供 ccdt 使用，屏幕与按键按终端帧传输。登录和退出需先结束运行与终端，只允许桌面连接与 ccdt；浏览器工作台只能读取状态。
 - WebSocket `/ws` 建立后，首帧必须是 `auth`：协议版本、代理服务 token、设备名称。5 秒内不认证则关闭；token 不进入会话事件。服务回传 `ready`、连接 ID 和会话目录。
 - `requestId`、会话/运行/消息/审批 ID 为 UUID；工具 ID 保留原生 opaque ID。请求收到 `response` 只表示接纳/拒绝，不表示运行完成。
 - 请求包括 `session.create/delete/rename/move/subscribe/history/configure/compact/status`、`message.send`、`run.cancel`、`approval.reply`；`instructions.get/update` 读写云端 CLI 的用户级 `CLAUDE.md`，以 `instructions.state` 回复，更新带上读取时的版本，文件已变则拒绝。`message.send.scenario` 是模拟器专用场景选择，原生适配不据此构造虚假能力。

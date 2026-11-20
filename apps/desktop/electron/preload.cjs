@@ -45,7 +45,8 @@ contextBridge.exposeInMainWorld('desktop', {
     ipcRenderer.on('changes:updated', listener);
     return () => ipcRenderer.removeListener('changes:updated', listener);
   },
-  gitDiff: (directory, scope, file) => ipcRenderer.invoke('git:diff', directory, scope, file),
+  gitDiff: (directory, scope, file, moreContext) =>
+    ipcRenderer.invoke('git:diff', directory, scope, file, moreContext),
   copyText: (text) => ipcRenderer.invoke('clipboard:write', text),
   openExternal: (url) => ipcRenderer.invoke('external:open', url),
   openWeb: (url) => ipcRenderer.invoke('web:open', url),

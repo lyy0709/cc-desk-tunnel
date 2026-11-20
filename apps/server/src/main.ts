@@ -3,6 +3,7 @@ import { fileURLToPath } from 'node:url';
 import { createProxyServer } from './server.ts';
 import { rmSync } from 'node:fs';
 import { clearServiceVariables, environmentConfig } from './config.ts';
+import { migratePersonalSettings, personalConfig } from './native-settings.ts';
 import { removeFrpLeftovers } from './legacy.ts';
 
 const { options, native, port } = environmentConfig(
@@ -10,7 +11,11 @@ const { options, native, port } = environmentConfig(
   fileURLToPath(new URL('../../../.local/sessions', import.meta.url)),
 );
 const programDir = process.env.PROXY_PROGRAM_DIR;
-if (native) removeFrpLeftovers();
+if (native) {
+  removeFrpLeftovers();
+  if (process.env.CCDT_PERSONAL_HOME && process.env.CLAUDE_CONFIG_DIR)
+    migratePersonalSettings(process.env.CLAUDE_CONFIG_DIR, personalConfig().directory);
+}
 clearServiceVariables(process.env);
 // The CLI is the version this release was built and tested with (see scripts/install-linux.sh). Left to itself, an
 // interactive CLI in a terminal tells of a newer one and tries to install it over the pinned copy; every CLI the service

@@ -53,6 +53,21 @@ test('quota controls accept only a boolean preference or explicit refresh', () =
   assert.equal(commandSchema.safeParse({ ...watch, interval: 1 }).success, false);
 });
 
+test('the subagent setting of device sessions is a boolean, read and changed by name', () => {
+  const update = { type: 'tools.update', requestId: randomUUID(), values: { subagents: true } };
+  assert.equal(
+    commandSchema.safeParse({ type: 'tools.get', requestId: randomUUID() }).success,
+    true,
+  );
+  assert.equal(commandSchema.safeParse(update).success, true);
+  assert.equal(commandSchema.safeParse({ ...update, values: {} }).success, true);
+  assert.equal(commandSchema.safeParse({ ...update, values: { subagents: 'on' } }).success, false);
+  assert.equal(commandSchema.safeParse({ ...update, values: { agents: true } }).success, false);
+  const state = { type: 'tools.state', values: { subagents: false } };
+  assert.equal(serverMessageSchema.safeParse(state).success, true);
+  assert.equal(serverMessageSchema.safeParse({ ...state, values: {} }).success, false);
+});
+
 test('manual message priority is bounded and does not change scheduled provenance', () => {
   const message = {
     type: 'message.send',
@@ -99,28 +114,31 @@ test('retired SSH channel frames are rejected and previous clients can negotiate
   );
 });
 
-test('credential mediation is absent from both wire directions', () => {
-  const terminal = {
-    type: 'account.login',
-    requestId: randomUUID(),
-    sessionId: randomUUID(),
-    cols: 80,
-    rows: 24,
-  };
-  assert.equal(commandSchema.safeParse(terminal).success, true);
-  assert.equal(commandSchema.safeParse({ ...terminal, method: 'setup-token' }).success, false);
-  for (const [type, fields] of [
-    ['account.login', {}],
-    ['account.code', { code: 'test' }],
-    ['account.token', { token: 'test' }],
-  ])
-    assert.equal(
-      commandSchema.safeParse({ type, requestId: randomUUID(), ...Object(fields) }).success,
-      false,
-    );
+test('the official sign-in shows its link and takes back the page code; no token is taken or handed out', () => {
+  const command = (type: string, fields: object = {}) =>
+    commandSchema.safeParse({ type, requestId: randomUUID(), ...fields }).success;
+  // The GUI's sign-in: the service runs `claude auth login`, the client shows its link and passes back the code.
+  for (const type of ['account.login', 'account.cancel', 'account.logout', 'account.status'])
+    assert.equal(command(type), true, type);
+  assert.equal(command('account.code', { code: 'fixture#state' }), true);
+  assert.equal(command('account.code', { code: 'two words' }), false);
+  // ccdt's: the same command in a terminal of its own.
+  assert.equal(command('account.terminal', { sessionId: randomUUID(), cols: 80, rows: 24 }), true);
+  // No setup token is taken from the client or generated for it.
+  assert.equal(command('account.login', { method: 'setup-token' }), false);
+  assert.equal(command('account.token', { token: 'test' }), false);
   assert.equal(
     serverMessageSchema.safeParse({ type: 'account.token.created', token: 'test', saved: true })
       .success,
+    false,
+  );
+  // The state names the link while the command waits for the code, and nothing of the sign-in it stores.
+  const state = { type: 'account.state', loggedIn: false };
+  const link = { url: 'https://claude.ai/oauth/authorize?fixture=1' };
+  assert.equal(serverMessageSchema.safeParse({ ...state, login: link }).success, true);
+  assert.equal(serverMessageSchema.safeParse({ ...state, login: null }).success, true);
+  assert.equal(
+    serverMessageSchema.safeParse({ ...state, login: { url: 'not a url' } }).success,
     false,
   );
 });

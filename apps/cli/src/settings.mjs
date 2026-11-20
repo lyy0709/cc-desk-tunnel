@@ -2,6 +2,7 @@ import {
   cliSettingGroups,
   connectionWaits,
   idleCompactionFields,
+  sessionToolFields,
   shellField,
   waitFields,
   waitRange,
@@ -26,18 +27,19 @@ export async function readRemote(service) {
       return { error: error.message };
     }
   };
-  const [compaction, cli, web] = await Promise.all([
+  const [compaction, tools, cli, web] = await Promise.all([
     read('compaction.get'),
+    read('tools.get'),
     read('settings.get'),
     read('web.settings.get'),
   ]);
   // This computer as the service lists it, with its shells.
   const here = service.devices?.find((device) => device.id === service.deviceId);
-  return { compaction, cli, web, here };
+  return { compaction, tools, cli, web, here };
 }
 
 // Every setting with its current value. `waits` are ccdt's own, in seconds, a missing one taking the default.
-export function entries({ waits = {}, compaction, cli, web, here } = {}) {
+export function entries({ waits = {}, compaction, tools, cli, web, here } = {}) {
   const list = waitFields.map(({ step, title, detail }) => ({
     name: `connection.${step}`,
     group: '本机',
@@ -92,6 +94,14 @@ export function entries({ waits = {}, compaction, cli, web, here } = {}) {
         };
       }),
     );
+  if (usable(tools))
+    list.push({
+      name: 'tools.subagents',
+      group: '服务端',
+      ...sessionToolFields.subagents,
+      kind: 'switch',
+      value: tools.subagents,
+    });
   if (usable(web))
     list.push({
       name: 'web.enabled',
@@ -225,6 +235,7 @@ export async function save(entry, value, { config, service }) {
   }
   const type = {
     compaction: 'compaction.update',
+    tools: 'tools.update',
     web: 'web.settings.update',
     cli: 'settings.update',
   }[scope];

@@ -30,10 +30,13 @@ cat > "$TEMP/bin/docker" <<'MOCK'
 echo "$*" >> "$MOCK_LOG"
 case "$1 $2" in
   'info --format') echo "fixture-engine linux x86_64 2 2147483648"; exit ;;
+  'compose version') echo "${MOCK_COMPOSE_VERSION:-2.29.7}"; exit ;;
   'ps -aq')
     for arg in "$@"; do
       if [[ "$arg" = label=com.docker.compose.project=* ]]; then echo "${arg#label=com.docker.compose.project=}" > "$MOCK_LOG.project"; fi
     done
+    # A deployment whose containers were removed has one again once Compose has started it.
+    if [[ "${MOCK_NO_CONTAINER:-0}" = 1 ]] && ! grep -q ' up -d' "$MOCK_LOG"; then exit; fi
     echo fixture-runtime; exit ;;
   'ps -a') printf 'proxy\nruntime\n'; exit ;;
   'network ls') echo fixture_default; exit ;;
@@ -64,6 +67,8 @@ case "$1 $2" in
     exit ;;
 esac
 case " $* " in
+  *ccdt-guard*)
+    if [[ "${MOCK_NO_LANDLOCK:-0}" = 1 ]]; then echo 'CC runtime requires Linux Landlock ABI 3 or newer.' >&2; exit 126; fi ;;
   *' build '*) [[ "${FAIL_BUILD:-0}" != 1 ]]; exit ;;
   *' exec -T proxy node '*) echo "${MOCK_ACTIVE_VERSION:-$MOCK_IMAGE_VERSION}" ;;
   *' ps --status running '*) [[ "${MOCK_STOPPED:-0}" = 1 ]] || echo mock-container ;;
@@ -117,6 +122,48 @@ test ! -d "$PROXY_DEPLOY_CONFIG.hardware"
 if MAC_OCCUPIED=1 manage up > "$TEMP/occupied" 2>&1; then exit 1; fi
 grep -q 'in use by another container' "$TEMP/occupied"
 ! grep -q ' up -d' "$MOCK_LOG"
+grep -q 'docker start' "$TEMP/no-mac"
+
+# What the target image needs of the host is asked before any container is replaced.
+if MOCK_NO_LANDLOCK=1 manage up > "$TEMP/no-landlock" 2>&1; then exit 1; fi
+grep -q 'Landlock ABI 3' "$TEMP/no-landlock"
+if MOCK_COMPOSE_VERSION=2.20.3 manage up > "$TEMP/old-compose" 2>&1; then exit 1; fi
+grep -q 'Compose 2.23.2' "$TEMP/old-compose"
+! grep -q ' up -d' "$MOCK_LOG"
+
+# A host whose kernel changed reports other memory and CPU flags, and the service goes on. Another machine is
+# refused until its record is made again.
+record="$PROXY_DEPLOY_CONFIG.hardware"
+echo 'fixture-engine linux x86_64 2 1073741824' > "$record/engine"
+echo 'flags : other' > "$record/cpu"
+manage up > "$TEMP/moved" 2>&1
+grep -q '总内存' "$TEMP/moved"
+grep -q 'CPU 特性' "$TEMP/moved"
+grep -q ' up -d' "$MOCK_LOG"
+echo 'another-engine linux x86_64 2 2147483648' > "$record/engine"
+if manage up > "$TEMP/other-engine" 2>&1; then exit 1; fi
+grep -q 'hardware --reset' "$TEMP/other-engine"
+manage hardware --reset > /dev/null
+grep -qx 'fixture-engine linux x86_64 2 2147483648' "$record/engine"
+grep -qx 'model name : test cpu' "$record/cpu"
+grep -Fxq "COMPOSE='$record/legacy.yml'" "$PROXY_DEPLOY_CONFIG"
+manage up > "$TEMP/recorded" 2>&1
+! grep -q '注意' "$TEMP/recorded"
+# A record removed by hand leaves the commands working, and the next start makes it again.
+rm -rf "$record"
+manage status > /dev/null
+# With the previous container gone, a start is refused until the administrator accepts what Docker assigns.
+touch "$TEMP/data/state/sessions.sqlite"
+: > "$MOCK_LOG"
+if MOCK_NO_CONTAINER=1 manage up > "$TEMP/gone" 2>&1; then exit 1; fi
+grep -q 'hardware --reset' "$TEMP/gone"
+! grep -q ' up -d' "$MOCK_LOG"
+MOCK_NO_CONTAINER=1 manage hardware --reset > /dev/null
+test -e "$PROXY_DEPLOY_CONFIG.hardware-reset"
+MOCK_NO_CONTAINER=1 manage up > /dev/null 2>&1
+test -d "$record" && test ! -e "$PROXY_DEPLOY_CONFIG.hardware-reset"
+test "$(grep -c ' up -d' "$MOCK_LOG")" = 2
+rm -f "$TEMP/data/state/sessions.sqlite"
 
 # A previous manager must receive this installation's image source and platform on archive handoff.
 program "$TEMP/rollback" 0.3.23

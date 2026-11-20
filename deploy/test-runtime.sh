@@ -30,23 +30,25 @@ test ! -r /data/cc-runner/launch.sock
 denied() {
   node -e 'const fs=require("node:fs");try{fs.closeSync(fs.openSync(process.argv[1],process.argv[2]));process.exit(2)}catch(e){if(e.code!=="EACCES")throw e}' "$1" "$2"
 }
+# Every launch is the same Claude Code: the personal home, its one sign-in, and the provider the deployment names.
+test "$HOME" = /data/home
+test -z "${CLAUDE_CONFIG_DIR:-}"
 if [ "$1" = auth ]; then
-  if [ "$2" = login ]; then
-    test "$HOME" = /data/home
-    test -z "${CCDT_HISTORY:-}${CCDT_TERMINAL:-}${ANTHROPIC_API_KEY:-}"
-    printf 'fixture authorization URL https://example.invalid/authorize\n'
-    read -r reply
-    test "$reply" = fixture-reply
-    printf 'ok\n' > "$HOME/fixture-signed-in"
-    printf 'terminal completed\n'; exit 0
-  fi
-  test "$2" = status
-  if [ "$HOME" = /data/home ]; then
-    test -z "${CLAUDE_CONFIG_DIR:-}"
-    test -z "${ANTHROPIC_API_KEY:-}"
-    if [ -e "$HOME/fixture-signed-in" ]; then printf '{"loggedIn":true}\n'; exit 0; fi
-  elif [ "${ANTHROPIC_API_KEY:-}" = fixture-only ]; then printf '{"loggedIn":true,"authMethod":"api_key"}\n'; exit 0; fi
-  printf '{"loggedIn":false,"authMethod":"none"}\n'; exit 1
+  test -z "${CCDT_HISTORY:-}${CCDT_TERMINAL:-}"
+  case "$2" in
+    login)
+      printf 'fixture authorization URL https://example.invalid/authorize\n'
+      read -r reply
+      test "$reply" = fixture-reply
+      printf 'ok\n' > "$HOME/fixture-signed-in"
+      printf 'terminal completed\n'; exit 0 ;;
+    logout) rm -f "$HOME/fixture-signed-in"; exit 0 ;;
+    status)
+      if [ -e "$HOME/fixture-signed-in" ]; then printf '{"loggedIn":true,"authMethod":"claude.ai"}\n'; exit 0; fi
+      if [ "${ANTHROPIC_API_KEY:-}" = fixture-only ]; then printf '{"loggedIn":true,"authMethod":"api_key"}\n'; exit 0; fi
+      printf '{"loggedIn":false,"authMethod":"none"}\n'; exit 1 ;;
+  esac
+  exit 9
 fi
 test "$ENABLE_CLAUDEAI_MCP_SERVERS" = false
 if [ "$1" = fixture-status-read ]; then
@@ -58,8 +60,7 @@ if [ "$1" = --settings ]; then
   cat "$2" >/dev/null
   denied "$2" r+
   touch "$CCDT_TERMINAL/events/own-event"
-  test -z "${ANTHROPIC_API_KEY:-}"
-  test "$HOME" = /data/home
+  test "${ANTHROPIC_API_KEY:-}" = fixture-only
   denied "$3/fixture-record" r
   cat "$CCDT_HISTORY/fixture-record" >/dev/null
   test -e "$HOME/fixture-signed-in"
@@ -67,8 +68,15 @@ if [ "$1" = --settings ]; then
 fi
 denied "$2" r
 test "$CLAUDE_CODE_SDK_READS_SESSION_STATE" = 1
-if [ -z "${ANTHROPIC_API_KEY:-}" ]; then printf 'fixture reports signed out\n'; exit 1; fi
-test "$ANTHROPIC_API_KEY" = fixture-only
+if [ ! -e "$HOME/fixture-signed-in" ] && [ "${ANTHROPIC_API_KEY:-}" != fixture-only ]; then
+  printf 'fixture reports signed out\n'; exit 1
+fi
+# The bundled tool process can still use its socket, but does not inherit provider keys or the CLI's private files.
+if [ -f "$HOME/fixture-signed-in" ]; then
+  /opt/runtime/bin/ccdt-project-mcp -e 'const fs=require("node:fs"); if(process.env.ANTHROPIC_API_KEY)process.exit(2);
+    try {fs.readFileSync("/data/home/fixture-signed-in");process.exit(3)}catch(e){if(e.code!=="EACCES")throw e}
+    const s=require("node:net").connect(process.argv[1]);s.resume();' "$1"
+fi
 printf 'record\n' > "$CCDT_HISTORY/fixture-record"
 node -e 'const s=require("net").connect(process.argv[1]);s.on("data",b=>process.stdout.write(b))' "$1"
 printf 'fixture at %s: ' "$PWD"
@@ -90,7 +98,7 @@ docker volume create "$name-sockets" >/dev/null
   -v "$work/native:/data/state/native" -v "$work/config/provider.json:/data/provider.json:ro" --tmpfs /opt/runtime:exec -v "$work/fixture:/fixture:ro" \
   --tmpfs /data/home --tmpfs /data/home/.claude/projects:mode=0711 --tmpfs /data/app-home \
   -e HOME=/data/app-home -e CLAUDE_CONFIG_DIR=/data/app-home/.claude "$image" sh -ec \
-  'mkdir -p /opt/runtime/cli/bin; cp /fixture /opt/runtime/cli/bin/claude; exec node /app/runtime-worker.ts' >/dev/null
+  'mkdir -p /opt/runtime/cli/bin /opt/runtime/node/bin /opt/runtime/bin; cp /usr/local/bin/ccdt-guard /opt/runtime/bin/ccdt-project-mcp; chmod 755 /opt/runtime/bin/ccdt-project-mcp; ln -s /usr/local/bin/node /opt/runtime/node/bin/node; cp /fixture /opt/runtime/cli/bin/claude; exec node /app/runtime-worker.ts' >/dev/null
 for _ in $(seq 1 40); do docker exec "$name" test -S /data/cc-runner/launch.sock && break; sleep .2; done
 docker exec "$name" test -S /data/cc-runner/launch.sock
 docker exec "$name" sh -ec 'mkdir -p "$1/events"; touch "$1/settings.json"; chown -R 1000:1000 "$1"' sh "/data/state/terminals/$terminal"
@@ -103,11 +111,14 @@ broker=("${docker_cmd[@]}" -i --user 1000:1000 --cap-drop ALL -v "$name:/data/cc
 relay=(node /app/runtime-relay.mjs)
 status() {
   local output actual=0
-  output=$("${broker[@]}" -e "CCDT_ACCOUNT_PROFILE=$1" "$image" "${relay[@]}" auth status --json) || actual=$?
-  test "$actual" = "$2" && test "$output" = "$3"
+  output=$("${broker[@]}" -e CCDT_ACCOUNT_PROFILE=personal "$image" "${relay[@]}" auth status --json) || actual=$?
+  test "$actual" = "$1" && test "$output" = "$2"
 }
-status terminal 1 '{"loggedIn":false,"authMethod":"none"}'
-status sdk 0 '{"loggedIn":true,"authMethod":"api_key"}'
+# The deployment names an API key: every launch has it, a chat run's and a terminal's alike.
+status 0 '{"loggedIn":true,"authMethod":"api_key"}'
+# A launch about the sign-in takes only those commands, and only under the one profile.
+if "${broker[@]}" -e CCDT_ACCOUNT_PROFILE=personal "$image" "${relay[@]}" fixture-status-read >/dev/null 2>&1; then exit 1; fi
+if "${broker[@]}" -e CCDT_ACCOUNT_PROFILE=sdk "$image" "${relay[@]}" auth status --json >/dev/null 2>&1; then exit 1; fi
 response=$("${broker[@]}" -e CCDT_RUNTIME_SESSION="$first" -e CLAUDE_CODE_DISABLE_DEFERRED_TOOL_RESUME=1 \
   -w "/data/state/native/$first" "$image" "${relay[@]}" fixture-status-read)
 test "$response" = 'status only'
@@ -127,7 +138,7 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import {createInterface} from 'node:readline';
 const [first,other,settings]=process.argv.slice(2);
-for (const launch of [{profile:'terminal',cwd:'/tmp',args:['auth','login']},
+for (const launch of [{profile:'personal',cwd:'/tmp',args:['auth','login']},
   {session:first,cwd:'/data/state/native/'+first,args:['--settings',settings,'/data/app-home/.claude/projects/-data-state-native-'+other]}]) {
   const socket=net.connect('/data/cc-runner/launch.sock');
   const send=frame=>socket.write(JSON.stringify(frame)+'\n');
@@ -142,12 +153,21 @@ for (const launch of [{profile:'terminal',cwd:'/tmp',args:['auth','login']},
   assert.equal(exit,0,text);assert.match(text,/terminal completed/);assert.equal(sent,!!launch.profile);
 }
 JS
+# Without a provider, Claude Code's own sign-in serves a chat run as it does the terminal.
 printf '{}\n' > "$work/config/provider.json"
-status sdk 1 '{"loggedIn":false,"authMethod":"none"}'
-status terminal 0 '{"loggedIn":true}'
+status 0 '{"loggedIn":true,"authMethod":"claude.ai"}'
+docker exec "$name" chown 1000:1000 "$socket"
+code=0
+response=$(printf 'signed-in input\n' | "${broker[@]}" -e CCDT_RUNTIME_SESSION="$first" -e CCDT_PROJECT_SOCKET="$socket" \
+  -e CLAUDE_CODE_SDK_READS_SESSION_STATE=1 -w "/data/state/native/$first" "$image" "${relay[@]}" "$socket" "$settings") || code=$?
+test "$code" = 7
+test "$response" = "own tool; fixture at /data/state/native/$first: signed-in input"
+# Signed out, nothing has a sign-in left.
+"${broker[@]}" -e CCDT_ACCOUNT_PROFILE=personal "$image" "${relay[@]}" auth logout </dev/null
+status 1 '{"loggedIn":false,"authMethod":"none"}'
 code=0
 response=$("${broker[@]}" -e CCDT_RUNTIME_SESSION="$first" -e CLAUDE_CODE_SDK_READS_SESSION_STATE=1 \
   -w "/data/state/native/$first" "$image" "${relay[@]}" unused "$settings") || code=$?
 test "$code" = 1
 test "$response" = 'fixture reports signed out'
-echo 'Fixture passed: native login and auth status, provider isolation, project history, settings, MCP controls and relay I/O.'
+echo 'Fixture passed: one Claude Code home and sign-in for every launch, provider settings, sign-in and sign-out, project history, settings, MCP controls and relay I/O.'

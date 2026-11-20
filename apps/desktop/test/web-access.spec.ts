@@ -238,13 +238,14 @@ test('browser history resumes from IndexedDB after a reload', async ({ page }) =
 
 test('Web quota primes with a normal status read and refreshes explicitly', async ({ page }) => {
   const fixture = await browserFixture(page, true, true, { quota: true });
-  const entry = page.getByRole('button', { name: '查看用量', exact: true });
+  const entry = page.getByRole('button', { name: '查看订阅用量', exact: true });
   await expect(entry).toContainText('37%');
   expect(
     fixture.commands.find((command) => command.type === 'session.status')?.quota,
   ).toBeUndefined();
   await entry.click();
-  await page.getByRole('button', { name: '模型服务', exact: true }).click();
+  // The one subscription quota: no second source to choose.
+  await expect(page.getByRole('button', { name: '模型服务', exact: true })).toHaveCount(0);
   await expect(page.getByRole('region', { name: '订阅用量' })).toContainText('37%');
   await page.getByRole('button', { name: '刷新订阅用量', exact: true }).click();
   await expect

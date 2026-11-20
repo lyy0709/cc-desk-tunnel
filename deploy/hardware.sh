@@ -54,7 +54,7 @@ capture_hardware() (
   networks="$(docker inspect --format '{{range $key,$net := .NetworkSettings.Networks}}{{printf "%s|%s\n" $key $net.MacAddress}}{{end}}' "$owner")"
   while IFS='|' read -r network mac; do
     [[ -n "$network" && "$mac" =~ ^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$ && "$mac" != 00:00:00:00:00:00 ]] \
-      || fail "Docker has no verifiable MAC for the previous container. Keep the original running endpoint for the first upgrade."
+      || fail "Docker has no verifiable MAC for the previous container; it reports one only while the container runs. If the container is stopped, start it with: docker start ${owner:0:12} — then repeat this command."
     fields="$(docker network inspect --format '{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.network"}}' "$network")"
     IFS='|' read -r label_project label <<< "$fields"
     [[ "$label_project" = "$PROJECT_NAME" && "$label" =~ ^[a-zA-Z0-9_.-]+$ && "$seen" != *" $label "* ]] \
@@ -72,19 +72,27 @@ capture_hardware() (
   fi
 )
 retain_hardware() {
-  local dir="$CONFIG.hardware" host owner runner temp network mac endpoints used other names
+  local dir="$CONFIG.hardware" host saved owner runner temp network mac endpoints used other names
   host="$(docker info --format '{{.ID}} {{.OSType}} {{.Architecture}} {{.NCPU}} {{.MemTotal}}')"
   [[ "$host" =~ ^[^[:space:]]+[[:space:]]linux[[:space:]][^[:space:]]+[[:space:]][1-9][0-9]*[[:space:]][1-9][0-9]*$ ]] || fail "Cannot identify the Docker Engine and its CPU/memory allocation."
   owner="$(project_container proxy)"
   if [[ ! -d "$dir" ]]; then
     if [[ -z "$owner" ]]; then
-      [[ "${1:-}" != existing && ( "$command" = restore || ! -f "$DATA_DIR/state/sessions.sqlite" ) ]] || fail "The previous container is required to verify this installation's hardware."
+      [[ "${1:-}" != existing && ( "$command" = restore || ! -f "$DATA_DIR/state/sessions.sqlite" || -e "$dir-reset" ) ]] \
+        || fail "The previous container is required to verify this installation's hardware. If it was removed and cannot be started again, run: $(self) hardware --reset"
       return
     fi
     runner="$(project_container runtime)"
     capture_hardware "$dir" "$host" "$owner" "${runner:-$owner}"
+    rm -f -- "$dir-reset"
   fi
-  [[ "$host" = "$(cat "$dir/engine")" ]] || fail "Docker Engine, CPU count, architecture or total memory changed. The running service was not replaced."
+  saved="$(cat "$dir/engine")"
+  # The Engine, its system, architecture and CPU count say which machine this is. Its total memory, the last field,
+  # also moves with the host kernel: a difference there is reported and the service goes on.
+  [[ "${host% *}" = "${saved% *}" ]] \
+    || fail "Docker Engine, CPU count or architecture changed. The running service was not replaced. To go on with this machine as it is now, run: $(self) hardware --reset"
+  [[ "$host" = "$saved" ]] \
+    || echo "注意：宿主机总内存与保存的硬件记录不同（内核升级或调整配置后常见），服务照常继续。运行 $(self) hardware --reset 可按当前环境重新记录。" >&2
   names="$(docker network ls --format '{{.Name}}')"
   while read -r network mac; do
     if grep -Fxq -- "$network" <<< "$names"; then
@@ -111,4 +119,32 @@ verify_runtime_hardware() {
     done')"
   expected="$(cat "$CONFIG.hardware/hostname"; cut -d' ' -f2 "$CONFIG.hardware/endpoints")"
   [[ "$(LC_ALL=C sort <<< "$actual")" = "$(LC_ALL=C sort <<< "$expected")" ]] || fail "The running container's hostname or interface MAC does not match the retained deployment."
+}
+# Records the machine as it is now: after the host's kernel, size or Docker Engine changed, or when the previous
+# container is gone. A container of this deployment is captured again, and has to be running for its MAC to be read;
+# with none, the next start takes the hostname and MAC Docker assigns and records those. The record replaced is kept
+# until the new one is made.
+reset_hardware() {
+  local dir="$CONFIG.hardware" aside temp
+  aside="$(mktemp -d "$dir.replaced.XXXXXXXX")"
+  cp -p -- "$CONFIG" "$aside/config"
+  if [[ -d "$dir" ]]; then mv -- "$dir" "$aside/record"; fi
+  # Without its record the deployment configuration names the Compose file it had before.
+  temp="$(mktemp "$CONFIG.XXXXXXXX")"
+  { grep -Fxv "COMPOSE='$dir/legacy.yml'" "$aside/config" || true; } > "$temp"
+  mv -- "$temp" "$CONFIG"
+  rm -f -- "$dir-reset"
+  if [[ -n "$(project_container proxy)" ]]; then
+    if ! PROXY_DEPLOY_CONFIG="$CONFIG" PROXY_COMPOSE_FILE="$COMPOSE" bash "$ROOT/deploy/manage.sh" hardware; then
+      rm -rf -- "$dir"
+      if [[ -d "$aside/record" ]]; then mv -- "$aside/record" "$dir"; fi
+      mv -- "$aside/config" "$CONFIG"
+      rm -rf -- "$aside"
+      fail "The server hardware record was left as it was."
+    fi
+  else
+    : > "$dir-reset"
+    echo "No container of this deployment exists. The next start takes the hostname and MAC Docker assigns and records them."
+  fi
+  rm -rf -- "$aside"
 }

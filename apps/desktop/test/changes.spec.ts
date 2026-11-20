@@ -151,27 +151,34 @@ async function open(
             root: directory,
             branch: 'main',
             counts: { unstaged: 3, staged: 1 },
-            files:
-              scope === 'staged'
-                ? [{ ...file(directory, 'staged.ts', 'A'), workingTreeChanged: true }]
+            files: (window as any).fileCount
+              ? Array.from({ length: (window as any).fileCount }, (_, i) =>
+                  file(directory, `src/file-${i}.ts`),
+                )
+              : scope === 'staged'
+                ? [{ ...file(directory, 'staged.ts'), workingTreeChanged: true }]
                 : [
                     file(directory, 'src/中文 文件.ts'),
-                    file(directory, 'removed.ts', 'D'),
+                    { ...file(directory, 'removed.ts', 'D'), added: 0 },
                     { ...file(directory, 'image.png'), kind: 'binary', added: null, removed: null },
                   ],
           };
         },
         projectDiff: async () => ({ kind: 'text', patch: '@@ -1,1 +1,1 @@\n-before\n+after\n' }),
-        gitDiff: async (directory: string, scope: string, name: string) => {
+        gitDiff: async (directory: string, scope: string, name: string, moreContext?: boolean) => {
           calls.push(['diff', directory, scope, name]);
           if ((window as any).holdDiff)
             return new Promise((resolve) => {
               (window as any).finishDiff = resolve;
             });
           if (name === 'image.png') return { kind: 'binary', patch: '' };
+          if (name === 'removed.ts')
+            return { kind: 'text', patch: '@@ -1 +0,0 @@\n-export const obsolete = true;\n' };
+          const extra = moreContext ? ' export const preview = "expanded-context";\n' : '';
+          const lines = moreContext ? 4 : 3;
           return {
             kind: 'text',
-            patch: `@@ -1,2 +1,2 @@\n-old\n+LOCAL_ONLY_${directory}\n context\n${Array.from({ length: 55 }, (_, i) => `+line ${i} ${'value '.repeat(16)}`).join('\n')}\n`,
+            patch: `@@ -1,${lines} +1,${lines} @@\n-const route = "previous";\n+const route = "LOCAL_ONLY_${directory}";\n export const label = '审阅改动';\n \n${extra}@@ -10,2 +10,3 @@\n const entries = [\n+  { permission: 'review', flags: ['allowInlineReview', 'showChangedFiles'] },\n ];\n`,
           };
         },
         inspectPath: async () => ({
@@ -343,9 +350,9 @@ test('local changes are readable, stay local, preserve conversation scroll, and 
   const panel = page.getByRole('complementary', { name: '项目改动' });
   await expect(panel).toContainText('LOCAL_ONLY_/fixtures/项目');
   const scope = panel.getByRole('combobox', { name: '改动范围' });
-  await expect(scope).toHaveValue('unstaged');
+  await expect(scope).toHaveValue('uncommitted');
   const summary = panel.locator('.changes-comparison');
-  await expect(summary.locator('ins')).toHaveText('+4');
+  await expect(summary.locator('ins')).toHaveText('+2');
   await expect(summary.locator('del')).toHaveText('−2');
   await panel.getByRole('button', { name: '在编辑器中打开第 1 行', exact: true }).first().click();
   await expect
@@ -355,10 +362,51 @@ test('local changes are readable, stay local, preserve conversation scroll, and 
     .toEqual([
       ['open', 'editor', '/fixtures/项目/src/中文 文件.ts', { line: 1, editor: 'vscode' }],
     ]);
-  await panel.getByRole('button', { name: '展开 image.png', exact: true }).click();
+  await expect(panel.locator('.change-file')).toHaveCount(3);
+  await expect(panel.getByRole('button', { name: '展开 image.png' })).toHaveAttribute(
+    'aria-expanded',
+    'false',
+  );
+  expect(
+    await page.evaluate(() =>
+      (window as any).localCalls.filter((c: string[]) => c[0] === 'diff' && c[3] === 'image.png'),
+    ),
+  ).toHaveLength(0);
+  await panel.getByRole('button', { name: '改动文件列表' }).click();
+  const index = panel.getByRole('navigation', { name: '改动文件目录' });
+  await index.getByRole('button', { name: '定位 image.png' }).click();
   await expect(panel).toContainText('二进制或非 UTF-8');
   await panel.getByRole('button', { name: '刷新改动', exact: true }).click();
-  await expect(panel.getByRole('button', { name: '收起 image.png', exact: true })).toBeVisible();
+  await expect(panel.getByRole('button', { name: '收起 image.png' })).toHaveAttribute(
+    'aria-expanded',
+    'true',
+  );
+  await index.getByRole('button', { name: '定位 removed.ts' }).click();
+  const deleted = panel.getByRole('region', { name: 'removed.ts', exact: true });
+  await expect(deleted).toContainText('export const obsolete');
+  await expect(deleted.locator('.diff-line button')).toHaveCount(0);
+  await index.getByRole('button', { name: '定位 src/中文 文件.ts' }).click();
+  await panel.getByRole('button', { name: '收起 image.png' }).click();
+  await expect(panel.getByRole('button', { name: '展开 image.png' })).toHaveAttribute(
+    'aria-expanded',
+    'false',
+  );
+  await page.setViewportSize({ width: 1640, height: 900 });
+  await panel.getByRole('button', { name: '加宽改动面板' }).click();
+  await expect
+    .poll(async () => {
+      const list = await index.boundingBox();
+      const body = await panel.locator('.changes-files').boundingBox();
+      return !!list && !!body && list.x + list.width <= body.x + 1;
+    })
+    .toBe(true);
+  await panel.getByRole('combobox', { name: '对比视图' }).selectOption('split');
+  const pair = panel.locator('.diff-pair').first();
+  await expect(pair.locator('.removed mark')).toHaveText('previous');
+  await expect(pair.locator('.added mark')).toContainText('LOCAL_ONLY_');
+  await expect(panel).toContainText('折叠 6 行上下文');
+  await panel.getByRole('button', { name: '更多上下文' }).click();
+  await expect(panel).toContainText('expanded-context');
   await expect
     .poll(() => page.locator('.conversation').evaluate((node) => node.scrollTop))
     .toBe(before);
@@ -394,12 +442,62 @@ test('narrow review uses the existing dialog and long lines stay inside it', asy
   await page.getByRole('button', { name: '查看改动', exact: true }).click();
   const dialog = page.getByRole('dialog', { name: '项目改动' });
   await expect(dialog).toContainText('LOCAL_ONLY');
+  await expect(dialog.locator('.diff-lines')).toHaveClass(/unified/);
+  await dialog.getByRole('button', { name: '改动文件列表' }).click();
+  const nav = dialog.getByRole('navigation', { name: '改动文件目录' });
+  const review = dialog.getByRole('region', { name: '改动文件', exact: true });
+  const directoryBounds = (await nav.boundingBox())!;
+  const reviewBounds = (await review.boundingBox())!;
+  expect(directoryBounds.y + directoryBounds.height).toBeLessThanOrEqual(reviewBounds.y + 1);
+  await dialog.getByRole('button', { name: '改动文件列表' }).click();
+  await dialog.getByRole('combobox', { name: '对比视图' }).selectOption('split');
+  await dialog.getByRole('button', { name: '长行换行' }).click();
+  const before = dialog.getByRole('region', { name: '修改前代码' });
+  const after = dialog.getByRole('region', { name: '修改后代码' });
+  await expect(before).toBeInViewport();
+  await expect(after).toBeInViewport();
+  await expect.poll(() => after.evaluate((node) => node.scrollWidth > node.clientWidth)).toBe(true);
+  const beforeRow = await before.locator('.diff-line.removed').boundingBox();
+  const afterRow = await after.locator('.diff-line.added').first().boundingBox();
+  expect(beforeRow?.y).toBe(afterRow?.y);
   expect(await dialog.evaluate((node) => node.scrollWidth <= node.clientWidth)).toBe(true);
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: resolve(screenshots, 'changes-narrow.png') });
   await page.keyboard.press('Escape');
   await expect(dialog).toHaveCount(0);
   await expect(page.locator('.changes-trigger')).toBeFocused();
+});
+
+test('large reviews page through files without mounting every preview', async ({ page }) => {
+  await open(page);
+  await page.evaluate(() => ((window as any).fileCount = 100));
+  await page.getByRole('button', { name: '查看改动', exact: true }).click();
+  const panel = page.getByRole('complementary', { name: '项目改动' });
+  await expect(panel.locator('.change-file')).toHaveCount(100);
+  await panel.getByRole('button', { name: '改动文件列表' }).click();
+  await panel.getByRole('button', { name: '定位 src/file-98.ts', exact: true }).click();
+  await expect(
+    panel.getByRole('button', { name: '收起 src/file-98.ts', exact: true }),
+  ).toBeInViewport();
+  await expect
+    .poll(() => panel.locator('.changes-files').evaluate((node) => node.scrollTop))
+    .toBeGreaterThan(0);
+  await page.evaluate(() => ((window as any).fileCount = 101));
+  await panel.getByRole('button', { name: '刷新改动' }).click();
+  await expect(panel.locator('.change-file')).toHaveCount(1);
+  await expect(panel.getByRole('region', { name: 'src/file-98.ts', exact: true })).toContainText(
+    'LOCAL_ONLY',
+  );
+  await panel.getByRole('button', { name: '定位 src/file-0.ts', exact: true }).click();
+  await expect(panel.getByRole('button', { name: '上一个文件' })).toBeDisabled();
+  await panel.getByRole('button', { name: '下一个文件' }).click();
+  await expect(panel.getByRole('region', { name: 'src/file-1.ts', exact: true })).toContainText(
+    'LOCAL_ONLY',
+  );
+  await panel.getByRole('button', { name: '上一个文件' }).click();
+  await expect(panel.getByRole('region', { name: 'src/file-0.ts', exact: true })).toContainText(
+    'LOCAL_ONLY',
+  );
 });
 
 test('late diffs cannot cross project or scope boundaries and read failures are visible', async ({
@@ -586,7 +684,6 @@ test('turn pill follows net lines while an open panel keeps its completed turn',
   fixture.send({ type: 'session.updated', session: { ...fixture.session, activeRun: null } });
   await expect(pill).toHaveCount(0);
   await expect(panel.getByRole('button', { name: '刷新改动' })).toHaveCount(0);
-  await panel.getByRole('button', { name: '展开 live.ts' }).click();
   await expect(panel).toContainText('+turn-lines-1');
   const previous = await page.evaluate(() => (window as any).latestTurn);
   fixture.send({

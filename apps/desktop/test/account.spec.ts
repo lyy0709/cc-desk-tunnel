@@ -2,23 +2,31 @@ import { test, expect } from '@playwright/test';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { PROTOCOL_VERSION, commandSchema } from '@cc-desk-tunnel/protocol';
+import { join } from 'node:path';
 import { UsageLog } from '../../server/src/usage.ts';
+import { screenshots } from './helpers.ts';
 
-test('ordinary login opens the native terminal and refreshes only the reported account', async ({
+test('ordinary login shows the official link, takes back the code and shows the one account', async ({
   page,
 }) => {
-  let terminalOpen = false;
-  await page.exposeFunction(
-    'fixtureOpenCcdt',
-    (request: { login?: boolean; sessionId?: string }) => {
-      expect(request.login).toBe(true);
-      expect(request.sessionId).toBeUndefined();
-      terminalOpen = true;
-      return { status: 'opened' };
-    },
-  );
+  const codes: string[] = [];
+  let waiting = false;
+  let signedIn = false;
   await page.routeWebSocket('ws://127.0.0.1:18921/ws', (route) => {
     const reply = (value: unknown) => route.send(JSON.stringify(value));
+    const state = () =>
+      reply({
+        type: 'account.state',
+        ...(signedIn
+          ? {
+              loggedIn: true,
+              authMethod: 'claude.ai',
+              email: 'operator@example.test',
+              subscriptionType: 'max',
+            }
+          : { loggedIn: false, authMethod: 'none' }),
+        login: waiting ? { url: 'https://claude.ai/oauth/authorize?fixture=1' } : null,
+      });
     route.onMessage((raw) => {
       const message = JSON.parse(String(raw));
       if (message.type === 'device') return;
@@ -26,20 +34,33 @@ test('ordinary login opens the native terminal and refreshes only the reported a
         reply({
           type: 'ready',
           protocolVersion: PROTOCOL_VERSION,
-          version: '0.3.14',
+          version: '0.4.0',
           connectionId: randomUUID(),
           adapter: 'claude-code',
           sessions: [],
         });
         return;
       }
-      if (message.type === 'account.status')
+      if (message.type === 'account.status') state();
+      if (message.type === 'account.login') {
+        waiting = true;
+        state();
+      }
+      if (message.type === 'account.code') {
+        codes.push(message.code);
+        if (message.code === 'fixture#state') {
+          waiting = false;
+          signedIn = true;
+        }
+        state();
+      }
+      if (message.type === 'usage.summary')
         reply({
-          type: 'account.state',
-          loggedIn: false,
-          terminal: terminalOpen
-            ? { loggedIn: true, authMethod: 'claude.ai', email: 'operator@example.test' }
-            : { loggedIn: false, authMethod: 'none' },
+          type: 'usage.summary',
+          requestId: message.requestId,
+          retentionDays: 35,
+          firstRecordAt: null,
+          windows: [],
         });
       expect(message.type).not.toBe('server.session.create');
       reply({ type: 'response', requestId: message.requestId, ok: true });
@@ -49,33 +70,29 @@ test('ordinary login opens the native terminal and refreshes only the reported a
   await page.getByLabel('服务地址', { exact: true }).fill('ws://127.0.0.1:18921/ws');
   await page.getByLabel('服务凭据', { exact: true }).fill('test-only-account-connection-token');
   await page.getByRole('button', { name: '连接', exact: true }).click();
-  await expect(page.getByRole('button', { name: '设置与账号', exact: true })).toBeVisible();
-  await page.evaluate(() => {
-    Object.defineProperty(window, 'desktop', {
-      configurable: true,
-      value: {
-        openInCcdt: Reflect.get(window, 'fixtureOpenCcdt'),
-        saveDrafts: async () => {},
-        windowSettings: async () => ({ closeToTray: false }),
-        onNotifyClicked: () => () => {},
-        onSharedChanged: () => () => {},
-      },
-    });
-  });
   await page.getByRole('button', { name: '设置与账号', exact: true }).click();
   await page.getByRole('menuitem', { name: '设置', exact: true }).click();
   await page
     .getByRole('navigation', { name: '设置分类' })
     .getByRole('button', { name: '账号与额度', exact: true })
     .click();
-  await expect(page.getByText(/服务器配置自己的 Console API key/)).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'GUI 模型服务尚未登录' })).toBeVisible();
+  await expect(page.getByText(/图形客户端与 ccdt 共用这一个登录/)).toBeVisible();
+  await expect(page.getByRole('heading', { name: '尚未登录' })).toBeVisible();
+  // One sign-in and one quota: no token entry, no second quota to choose.
   await expect(page.getByRole('button', { name: /setup token/i })).toHaveCount(0);
-  await page.getByRole('button', { name: '普通登录（ccdt）' }).click();
-  await expect.poll(() => terminalOpen).toBe(true);
-  await page.getByRole('button', { name: '刷新账号信息' }).click();
-  await expect(page.getByText('operator@example.test')).toBeVisible();
-  await expect(page.getByRole('heading', { name: 'GUI 模型服务尚未登录' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '模型服务', exact: true })).toHaveCount(0);
+  await page.getByRole('button', { name: '普通登录', exact: true }).click();
+  const form = page.getByRole('form', { name: '登录 Claude 账号' });
+  await expect(form.getByRole('button', { name: '打开授权页' })).toBeVisible();
+  await expect(form.getByRole('button', { name: '复制链接' })).toBeVisible();
+  await page.screenshot({ path: join(screenshots, 'account-login.png') });
+  await form.getByLabel('授权码').fill(' fixture#state ');
+  await form.getByRole('button', { name: '完成登录' }).click();
+  await expect(page.getByRole('heading', { name: 'operator@example.test' })).toBeVisible();
+  await expect(page.getByText('浏览器授权', { exact: true })).toBeVisible();
+  await expect(form).toHaveCount(0);
+  expect(codes).toEqual(['fixture#state']);
+  await page.screenshot({ path: join(screenshots, 'account-signed-in.png') });
 });
 
 for (const timezoneId of ['America/New_York', 'Asia/Kathmandu']) {
@@ -116,7 +133,7 @@ for (const timezoneId of ['America/New_York', 'Asia/Kathmandu']) {
                 sessions: [],
               });
             if (msg.type === 'usage.summary')
-              reply({ type: 'usage.summary', requestId, ...log.summary(now) });
+              reply({ type: 'usage.summary', requestId, ...log.summary(now, null) });
             if (msg.type === 'usage.query') {
               seen.push(msg);
               const cmd = commandSchema.parse({ requestId, ...msg });

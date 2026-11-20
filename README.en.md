@@ -48,13 +48,13 @@ This repository publishes all of its own client, server, build and deployment so
 | **Native controls** | Model, reasoning effort, approval mode, context usage and manual compaction, common Claude Code settings; one click opens the session in the terminal client `ccdt` when you need it |
 | **Terminal client** | `ccdt` opens the official Claude Code in your own terminal, sharing sessions, context and usage statistics with the desktop client |
 | **Account and usage** | Sign the server's Claude account in or out from the client; see quota, reset times and usage statistics |
-| **Scheduled tasks** | Send a prepared prompt to a session, or a new one, at a set time; Claude can set these up for you |
+| **Scheduled tasks** | Send a prepared prompt to a session, or a new one, at a set time |
 | **Convenience** | Runs in the tray, remembers the sign-in, keeps unsent text per session |
-| **One-click upgrades** | The service follows the release page; upgrade service and client from the client, without logging in to the server |
+| **Upgrades** | The service follows the release page and the client tells you of a new version; the service is upgraded with one command on the server, the client then upgrades itself in the app |
 
 ## Quick start
 
-You need a Linux server with a public IP or domain name (x86_64, or arm64 as experimental support; Ubuntu recommended, Docker installed) and a Windows 10 / 11 x64 PC. The desktop client and `ccdt` also run on macOS and Linux, as experimental support.
+You need a Linux server with a public IP or domain name (x86_64, or arm64 as experimental support; Ubuntu recommended, kernel 6.2 or newer, Docker with Compose 2.23.2 or newer installed) and a Windows 10 / 11 x64 PC. The desktop client and `ccdt` also run on macOS and Linux, as experimental support.
 
 **The server can be small.** Builds, tests and development tools all run on your Windows PC; the server only hosts Claude Code and a lightweight proxy service, so an entry-level machine with 2 vCPUs and 1 GB of memory is enough. Size it for heavier work only if you plan to have Claude build or run demanding tasks on the server itself.
 
@@ -84,7 +84,7 @@ sudo cc-desk-tunnel upgrade   # upgrade to the newest release; data, accounts an
 sudo cc-desk-tunnel help      # every command: new token, backup and restore, certificates
 ```
 
-Usually you do not need the server for upgrades: the client's Settings → About and updates upgrades the service too. Manual installation, the three certificate modes, backup and restore are covered in the [deployment manual](deploy/README.md); if you already run nginx with a domain, see [reverse proxying with nginx](deploy/nginx.md).
+The client's Settings → About and updates tells you when the service has a new version; upgrade the service with the `upgrade` command above, and the client then upgrades itself on the same page. Manual installation, the three certificate modes, backup and restore are covered in the [deployment manual](deploy/README.md); if you already run nginx with a domain, see [reverse proxying with nginx](deploy/nginx.md).
 
 ### 2. Install a client
 
@@ -119,9 +119,9 @@ curl -fsSL https://raw.githubusercontent.com/lyy0709/cc-desk-tunnel/main/deploy/
 
 The script downloads the newest release, checks it against `SHA256SUMS`, installs it for the current user and puts `ccdt` on the PATH; no administrator rights are needed. Then run `ccdt login`. If the service is not on the newest release, install the same version as the service; see [Terminal client](docs/cli.md#安装) (in Chinese).
 
-### 3. Configure the model provider
+### 3. Sign in to Claude and choose a project
 
-For GUI requests, configure your own Console API key or supported cloud provider on the server in `config/provider.json`. The ccdt terminal uses the server user’s native Claude Code login. Open its authorization URL in your browser and paste a code back into the same terminal if prompted. Select the project folder on the desktop. To enable commands for one session, use the desktop session permission control or start `ccdt --allow-commands` in the project directory.
+Open Settings → Account and quota and choose normal sign-in: open the official authorization page in your browser, then paste back the code it shows, as with the official `claude auth login`. In `ccdt` you can run `ccdt auth login` instead. The desktop client and `ccdt` share this one sign-in and its subscription quota. To use an API key or a supported cloud provider instead, put it in `config/provider.json` in the server's data directory. Select the project folder on the desktop. To enable commands for one session, use the desktop session permission control or start `ccdt --allow-commands` in the project directory.
 
 ## Security
 
@@ -129,7 +129,7 @@ The [connection and privacy notes](SECURITY.md#连接与隐私) describe which p
 
 Use a server you control. Protect the service credential and backups. Selected file contents and command output travel through the server to the model provider. A local command grant lets project scripts run with your OS account privileges. The desktop requires outbound WSS only.
 
-Hosting and authentication are subject to [Anthropic’s Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance). Eligibility also depends on the user's physical location and applicable entity criteria under [Anthropic’s supported regions policy](https://www.anthropic.com/legal/supported-regions).
+Hosting and authentication are subject to [Anthropic’s Claude Code terms](https://code.claude.com/docs/en/legal-and-compliance), including their limits on third-party products offering Claude.ai sign-in or using subscription quota on someone else's behalf; keep your account to yourself, and when unsure use an API key. Eligibility also depends on the user's physical location and applicable entity criteria under [Anthropic’s supported regions policy](https://www.anthropic.com/legal/supported-regions).
 
 ## Antivirus and SmartScreen
 

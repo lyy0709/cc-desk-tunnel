@@ -59,13 +59,11 @@ export default function UsagePanel({
   client,
   summary,
   initial,
-  profile,
   back,
 }: {
   client: ProxyClient;
   summary: UsageSummary | null;
   initial: string;
-  profile: 'sdk' | 'terminal';
   back: () => void;
 }) {
   const [preset, setPreset] = useState(initial);
@@ -102,8 +100,8 @@ export default function UsagePanel({
     void client
       .fetch({
         type: 'usage.query',
+        ...(quotaStart && { accountPeriod: true as const }),
         range: requested,
-        ...(quotaStart && { profile }),
         ...(model && { model }),
         offset: paging.index * pageSize,
         limit: pageSize,
@@ -125,7 +123,7 @@ export default function UsagePanel({
     return () => {
       current = false;
     };
-  }, [client, model, range, paging, quotaStart, profile]);
+  }, [client, model, range, paging, quotaStart]);
   const turnPage = (index: number) => {
     if (page) setPaging({ index, range: { from: page.from, to: page.to } });
   };

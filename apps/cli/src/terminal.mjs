@@ -67,7 +67,7 @@ export async function relay(
   input.resume();
   try {
     await service.request({
-      type: shown.login ? 'account.login' : 'terminal.open',
+      type: shown.login ? 'account.terminal' : 'terminal.open',
       sessionId,
       ...size(output),
     });

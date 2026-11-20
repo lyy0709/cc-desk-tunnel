@@ -7,6 +7,8 @@ services:
     environment:
       HOME: /data/app-home
       CLAUDE_CONFIG_DIR: /data/app-home/.claude
+      # The Claude Code every run and terminal uses; its sign-in, settings and CLAUDE.md are managed from here.
+      CCDT_PERSONAL_HOME: /data/home
     restart: unless-stopped
     stop_grace_period: 30s
     ports:

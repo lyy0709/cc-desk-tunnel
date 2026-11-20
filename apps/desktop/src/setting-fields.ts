@@ -31,6 +31,14 @@ export const idleCompactionFields = {
   },
 };
 
+// The service's choice of optional built-in tools for a session whose project is on a device.
+export const sessionToolFields = {
+  subagents: {
+    title: '启用子代理',
+    detail: '只对项目在设备上的会话生效，从下一次运行或打开终端起；子代理的请求计入同一份用量',
+  },
+};
+
 // The shell Claude is told the user prefers for scripts on a Windows computer. The choice is kept by the service for
 // this computer alone; Git Bash is offered once the computer has it.
 export const shellField = {
@@ -160,7 +168,7 @@ export const cliSettingGroups = (
         key: 'autoContinueAtUsageLimit',
         kind: 'toggle',
         title: '额度用尽后自动继续',
-        detail: '模型服务额度触顶时等待重置并自动接着做，适合长任务',
+        detail: '订阅额度触顶时等待重置并自动接着做，适合长任务',
       },
       {
         key: 'switchModelsOnFlag',
