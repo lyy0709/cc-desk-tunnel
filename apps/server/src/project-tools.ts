@@ -57,7 +57,7 @@ export function ownFile(input: unknown, directories: string[], stored = director
     typeof path !== 'string' ||
     !isAbsolute(path) ||
     path.includes('\0') ||
-    path.split(sep).includes('..')
+    path.split(/[\\/]/).includes('..')
   )
     return false;
   const target = resolve(path);

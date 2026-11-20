@@ -10,17 +10,20 @@ import { buildProjectFiles } from '../../../scripts/build-project-files.mjs';
 
 test('a bound project gives its sessions files and commands, each its own attachments, and nothing outside it', async (t) => {
   const temp = await mkdtemp(join(tmpdir(), 'ccdt-files-'));
-  t.after(() => rm(temp, { recursive: true, force: true }));
+  let access;
+  t.after(async () => {
+    access?.close();
+    await rm(temp, { recursive: true, force: true });
+  });
   const root = join(temp, 'project');
   await mkdir(root);
-  const access = new ProjectAccess({
+  access = new ProjectAccess({
     service: 'fixture',
     environment: { HOME: temp, ZDOTDIR: temp },
     database: join(temp, 'local.sqlite'),
     helper: buildProjectFiles(temp),
     chooseRoot: async () => false,
   });
-  t.after(() => access.close());
   const project = await access.bind(root);
   const a = randomUUID(),
     b = randomUUID(),
@@ -102,18 +105,20 @@ test('a bound project gives its sessions files and commands, each its own attach
 
 test('a command stopped at its limit says so, and commands run side by side keep their own output', async (t) => {
   const temp = await mkdtemp(join(tmpdir(), 'ccdt-commands-'));
-  t.after(() => rm(temp, { recursive: true, force: true }));
+  let access;
+  t.after(async () => {
+    access?.close();
+    await rm(temp, { recursive: true, force: true });
+  });
   const root = join(temp, 'project');
   await mkdir(root);
-  const access = new ProjectAccess({
+  access = new ProjectAccess({
     service: 'fixture',
     environment: { HOME: temp, ZDOTDIR: temp },
     database: join(temp, 'local.sqlite'),
     helper: buildProjectFiles(temp),
     chooseRoot: async () => false,
-    commandLimitMs: 1500,
   });
-  t.after(() => access.close());
   const project = await access.bind(root);
   const session = randomUUID();
   access.session({ id: session, projectPath: project });
@@ -128,11 +133,13 @@ test('a command stopped at its limit says so, and commands run side by side keep
     return { requestId, result: JSON.parse(text) };
   };
   const windows = process.platform === 'win32';
-  const [first, second, slow] = await Promise.all([
+  const [first, second] = await Promise.all([
     run(windows ? 'Write-Output first' : 'echo first'),
     run(windows ? 'Write-Output second' : 'echo second'),
-    run(windows ? 'Start-Sleep -Seconds 20' : 'sleep 20'),
   ]);
+  // Only the intentionally slow command uses the shortened deadline; cold PowerShell startup is part of a real command.
+  access.commandLimitMs = 1500;
+  const slow = await run(windows ? 'Start-Sleep -Seconds 20' : 'sleep 20');
   assert.equal(first.result.timedOut, undefined);
   assert.equal(slow.result.timedOut, true);
   // Each is still read by its own ID after the others have finished.
@@ -154,17 +161,20 @@ test('a command stopped at its limit says so, and commands run side by side keep
 
 test('a path chosen again keeps its project, and its sessions go on in the directory that is there now', async (t) => {
   const temp = await mkdtemp(join(tmpdir(), 'ccdt-rebind-'));
-  t.after(() => rm(temp, { recursive: true, force: true }));
+  let access;
+  t.after(async () => {
+    access?.close();
+    await rm(temp, { recursive: true, force: true });
+  });
   const root = join(temp, 'project');
   await mkdir(root);
-  const access = new ProjectAccess({
+  access = new ProjectAccess({
     service: 'fixture',
     environment: { HOME: temp, ZDOTDIR: temp },
     database: join(temp, 'local.sqlite'),
     helper: buildProjectFiles(temp),
     chooseRoot: async () => false,
   });
-  t.after(() => access.close());
   const project = await access.bind(root);
   const session = randomUUID();
   access.session({ id: session, projectPath: project });
